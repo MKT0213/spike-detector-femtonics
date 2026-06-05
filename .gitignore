@@ -1,0 +1,34 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.venv/
+.venv-*/
+venv/
+env/
+
+# Local editor settings
+.vscode/
+.idea/
+
+# Build artifacts
+build/
+dist/
+*.spec
+
+# App/user outputs and local data
+exports/
+export/
+*_export/
+spike_session.json
+*.xlsx
+*.xls
+*.csv
+*.png
+*.pdf
+
+# OS files
+.DS_Store
+Thumbs.db

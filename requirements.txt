@@ -1,0 +1,10 @@
+numpy
+pandas
+scipy
+openpyxl
+matplotlib
+PySide6
+pyqtgraph
+PyWavelets
+scikit-learn
+kneed
