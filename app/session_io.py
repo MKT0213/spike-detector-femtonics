@@ -22,6 +22,10 @@ def _spike_from_dict(data: Dict[str, object]) -> SpikeRecord:
         snr=float(data.get("snr", 0.0)),
         detection_threshold_used=float(data.get("detection_threshold_used", 0.0)),
         fwhm_ms=float(data.get("fwhm_ms", 0.0)),
+        delta_f_over_f0=float(data.get("delta_f_over_f0", float("nan"))),
+        rise_time_ms=float(data.get("rise_time_ms", float("nan"))),
+        return_to_baseline_time_ms=float(data.get("return_to_baseline_time_ms", float("nan"))),
+        post_spike_level=float(data.get("post_spike_level", float("nan"))),
         status=str(data.get("status", "pending")),
         source=str(data.get("source", "auto")),
         spike_type=str(data.get("spike_type", "single")),
@@ -73,7 +77,6 @@ def save_session(
     for trace_name, trace_state in traces.items():
         session.trace_states[trace_name] = {
             "spikes": [s.to_dict() for s in trace_state.spikes],
-            "deleted_spikes": [s.to_dict() for s in trace_state.deleted_spikes],
             "bursts": [b.to_dict() for b in trace_state.bursts],
             "deleted_bursts": [b.to_dict() for b in trace_state.deleted_bursts],
         }
@@ -103,13 +106,10 @@ def load_session(path: str) -> AppSession:
     if isinstance(raw_states, dict):
         for trace_name, state in raw_states.items():
             spikes_data: List[Dict[str, object]] = []
-            deleted_spikes_data: List[Dict[str, object]] = []
             if isinstance(state, dict):
                 spikes_data = _normalize_spike_payload(state.get("spikes", []))
-                deleted_spikes_data = _normalize_spike_payload(state.get("deleted_spikes", []))
             app_session.trace_states[trace_name] = {
                 "spikes": spikes_data,
-                "deleted_spikes": deleted_spikes_data,
             }
 
     return app_session
@@ -121,8 +121,6 @@ def apply_session_to_traces(app_session: AppSession, traces: Dict[str, TraceCura
         if not state:
             continue
         spikes_data = _normalize_spike_payload(state.get("spikes", []))
-        deleted_spikes_data = _normalize_spike_payload(state.get("deleted_spikes", []))
         trace_state.spikes = [_spike_from_dict(item) for item in spikes_data]
-        trace_state.deleted_spikes = [_spike_from_dict(item) for item in deleted_spikes_data]
+        trace_state.deleted_spikes = []
         trace_state.sort_spikes()
-        trace_state.deleted_spikes.sort(key=lambda spike: spike.spike_index)

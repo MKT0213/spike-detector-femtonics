@@ -8,15 +8,16 @@ import pandas as pd
 
 SpikeStatus = Literal["pending", "accepted", "rejected", "manual", "deleted"]
 BurstStatus = Literal["pending", "accepted", "rejected", "manual", "deleted"]
+AnalysisStatus = Literal["pending", "running", "done", "error"]
 
 
 @dataclass
 class DetectionParams:
     # Spike detector strategy selected in the UI.
     detection_mode: str = "mad"
-    # Startup exclusion window (ms) — excludes first N ms from all analysis and viewer.
+    # Startup exclusion window (ms), excluding first N ms from all analysis and viewer.
     startup_exclusion_ms: float = 50.0
-    # Plateau median filter window (ms) — centered rolling median for plateau proxy/detection.
+    # Plateau median filter window (ms), used for centered rolling median plateau detection.
     plateau_median_window_ms: float = 25.0
     # Long-plateau detector controls. Drift correction is detector-only; the
     # final correction baseline still uses rolling percentile + plateau interpolation.
@@ -41,7 +42,7 @@ class DetectionParams:
     spike_noise_k: float = 5.0
     # find_peaks prominence multiplier for MAD/STD spike threshold modes.
     spike_prominence_k: float = 3.0
-    # (removed) peak_window_ms previously controlled local peak search window.
+    # Retained smoothing setting for older saved configurations.
     gaussian_sigma_frames: float = 1.0
     min_separation_ms: float = 25.0
     # Half-width of zoom window used for spike-focused plots (UI/export), in ms.
@@ -52,13 +53,36 @@ class DetectionParams:
     high_activity_window_ms: float = 120.0
     high_activity_peak_count: int = 3
 
-    # Config-only controls (not surfaced in GUI).
+    # State-guided denoising: Gonzalez adaptive wavelet on bridged low-state
+    # samples, TV for plateau cores, raw corrected samples around boundaries.
+    low_state_denoiser: str = "gonzalez_adaptive_wavelet"
+    gonzalez_threshold_sd: float = 2.0
+    gonzalez_max_clusters: int = 20
+    gonzalez_attenuation_min: float = 0.5
+    gonzalez_attenuation_max: float = 1.0
+    gonzalez_enable_noise_cluster_rejection: bool = False
+    gonzalez_enable_event_template_rejection: bool = False
+    plateau_tv_weight: float = 2.0
+    low_state_boundary_protect_ms: float = 20.0
+    enable_low_state_safety_gate: bool = True
+    min_event_peak_preservation: float = 0.80
+    min_local_max_ratio: float = 0.80
+    min_reliable_low_state_fraction: float = 0.10
+    min_reliable_low_state_samples: int = 20
+    plateau_tv_min_duration_ms: float = 5.0
+    plateau_tv_max_weight_factor: float = 0.25
+
+    # Optional preprocessing before baseline/plateau/spike computation.
+    use_highpass_filter: bool = False
     highpass_cutoff_hz: float = 1.0
     highpass_order: int = 3
 
     # Local baseline/noise estimation windows remain editable for tuning.
+    baseline_mode: str = "percentile"
     baseline_rolling_window_ms: float = 300.0
     baseline_rolling_percentile: float = 10.0
+    baseline_savgol_window_ms: float = 300.0
+    baseline_savgol_polyorder: int = 3
     # Legacy field kept for backward compatibility.
     plateau_sd_k: float = 2.0
     baseline_second_pass_percentile: float = 50.0  # legacy no-op; kept for backward compatibility
@@ -95,9 +119,35 @@ class DetectionParams:
                 normalized_key = "spike_prominence_k"
             elif normalized_key == f"{interim_prefix}_prominence_k":
                 normalized_key = "spike_prominence_k"
+            elif normalized_key == f"{interim_prefix}_threshold_sd":
+                normalized_key = "gonzalez_threshold_sd"
+            elif normalized_key == f"{interim_prefix}_plateau_protect_ms":
+                normalized_key = "low_state_boundary_protect_ms"
             if normalized_key == "detection_mode" and isinstance(value, str):
                 for prefix in (legacy_prefix, interim_prefix):
                     value = value.replace(f"{prefix}_", "")
+            if normalized_key == "low_state_denoiser" and isinstance(value, str):
+                mode = value.strip().lower()
+                if mode in {"hybrid", "legacy", "legacy_hybrid"}:
+                    value = "legacy_hybrid"
+                elif mode in {"none", "off", "disabled"}:
+                    value = "none"
+                else:
+                    value = "gonzalez_adaptive_wavelet"
+            if normalized_key in {
+                "gonzalez_enable_event_template_rejection",
+                "gonzalez_enable_noise_cluster_rejection",
+            }:
+                # Safety migration: older saved configs may have enabled
+                # Gonzalez cleanup steps that can suppress real spikes. Load
+                # them off by default; users can re-enable in the current UI.
+                value = False
+            if normalized_key == "baseline_mode" and isinstance(value, str):
+                mode = value.strip().lower()
+                if mode in {"savgol", "savitzky-golay", "savitzky_golay"}:
+                    value = "savgol"
+                elif mode != "percentile":
+                    value = "percentile"
             if hasattr(base, normalized_key):
                 setattr(base, normalized_key, value)
         return base
@@ -136,6 +186,10 @@ class SpikeRecord:
     snr: float
     detection_threshold_used: float
     fwhm_ms: float = 0.0  # Full Width at Half Maximum in milliseconds
+    delta_f_over_f0: float = float("nan")
+    rise_time_ms: float = float("nan")
+    return_to_baseline_time_ms: float = float("nan")
+    post_spike_level: float = float("nan")
     status: SpikeStatus = "pending"
     source: Literal["auto", "manual"] = "auto"
     spike_type: Literal["single", "burst"] = "single"
@@ -156,7 +210,10 @@ class SpikeRecord:
             "snr": float(self.snr),
             "detection_threshold_used": float(self.detection_threshold_used),
             "fwhm_ms": float(self.fwhm_ms),
-            "status": self.status,
+            "delta_f_over_f0": float(self.delta_f_over_f0),
+            "rise_time_ms": float(self.rise_time_ms),
+            "return_to_baseline_time_ms": float(self.return_to_baseline_time_ms),
+            "post_spike_level": float(self.post_spike_level),
             "source": self.source,
             "spike_type": self.spike_type,
             "notes": self.notes,
@@ -225,10 +282,12 @@ class TraceCuration:
     # Fluorescence-unit baseline subtracted before displaying corrected channels.
     correction_baseline: Optional[np.ndarray] = None
     smoothed: Optional[np.ndarray] = None
-    # Lazily computed Hybrid comparison overlay.
+    highpass_trace: Optional[np.ndarray] = None
+    # Lazily computed state-guided denoising overlay. Field names are retained
+    # for compatibility with older sessions and UI code paths.
     hybrid_denoised: Optional[np.ndarray] = None
-    hybrid_denoised_cache_key: Optional[Tuple[float, str]] = None
-    hybrid_denoised_pending_key: Optional[Tuple[float, str]] = None
+    hybrid_denoised_cache_key: Optional[Tuple[object, ...]] = None
+    hybrid_denoised_pending_key: Optional[Tuple[object, ...]] = None
     # Artifact mask from downward-artifact interpolation (True = interpolated region).
     artifact_mask: Optional[np.ndarray] = None
     # Combined plateau mask from long and short detectors (True = plateau region).
@@ -246,6 +305,9 @@ class TraceCuration:
     deleted_spikes: List[SpikeRecord] = field(default_factory=list)
     bursts: List[BurstRecord] = field(default_factory=list)
     deleted_bursts: List[BurstRecord] = field(default_factory=list)
+    analysis_status: AnalysisStatus = "done"
+    analysis_error: str = ""
+    analysis_generation: int = 0
 
     def sort_spikes(self) -> None:
         self.spikes.sort(key=lambda spike: spike.spike_index)
@@ -267,7 +329,10 @@ class TraceCuration:
                     "snr",
                     "detection_threshold_used",
                     "fwhm_ms",
-                    "status",
+                    "delta_f_over_f0",
+                    "rise_time_ms",
+                    "return_to_baseline_time_ms",
+                    "post_spike_level",
                     "source",
                     "notes",
                 ]
@@ -281,83 +346,6 @@ class AppSession:
     detection_params: DetectionParams = field(default_factory=DetectionParams)
     artifact_params: ArtifactParams = field(default_factory=ArtifactParams)
     trace_states: Dict[str, Dict[str, object]] = field(default_factory=dict)
-
-
-@dataclass
-class SpikeCluster:
-    cluster_id: int
-    spikes: List[SpikeRecord]
-    start_index: int
-    end_index: int
-    start_time: float
-    end_time: float
-    window_ms: float
-
-    def spike_count(self) -> int:
-        return len(self.spikes)
-
-
-def _time_is_ms(time: np.ndarray) -> bool:
-    """Return True if time values appear to be in milliseconds, False for seconds."""
-    if len(time) < 2:
-        return False
-    dt = np.diff(np.asarray(time, dtype=float))
-    dt = dt[np.isfinite(dt) & (dt > 0)]
-    if dt.size == 0:
-        return False
-    return bool(np.median(dt) >= 1e-3)
-
-
-def cluster_spikes(spikes: List[SpikeRecord], time: np.ndarray, single_window_ms: float = 500.0, multi_window_ms: float = 500.0, group_separation_ms: float = 150.0) -> List[SpikeCluster]:
-    """Group spikes into zoomed clusters based on temporal proximity.
-
-    Spikes within group_separation_ms of each other share a 500 ms window.
-    Isolated spikes also get their own 500 ms window.
-    """
-    if not spikes:
-        return []
-
-    time_is_ms = _time_is_ms(time)
-    sep_time = group_separation_ms if time_is_ms else (group_separation_ms / 1000.0)
-
-    sorted_spikes = sorted(spikes, key=lambda s: s.spike_index)
-    clusters: List[SpikeCluster] = []
-    cluster_id = 0
-
-    i = 0
-    while i < len(sorted_spikes):
-        group = [sorted_spikes[i]]
-        j = i + 1
-
-        while j < len(sorted_spikes):
-            prev_time = group[-1].spike_time
-            curr_time = sorted_spikes[j].spike_time
-            if curr_time - prev_time <= sep_time:
-                group.append(sorted_spikes[j])
-                j += 1
-            else:
-                break
-
-        n = len(group)
-        window_ms = single_window_ms
-
-        start_idx = group[0].spike_index
-        end_idx = group[-1].spike_index
-        clusters.append(
-            SpikeCluster(
-                cluster_id=cluster_id,
-                spikes=group,
-                start_index=start_idx,
-                end_index=end_idx,
-                start_time=float(time[start_idx]) if start_idx < len(time) else 0.0,
-                end_time=float(time[end_idx]) if end_idx < len(time) else 0.0,
-                window_ms=float(window_ms),
-            )
-        )
-        cluster_id += 1
-        i = j
-
-    return clusters
 
 
 @dataclass

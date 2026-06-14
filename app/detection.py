@@ -6,12 +6,12 @@ import math
 
 import numpy as np
 from scipy.ndimage import gaussian_filter1d, median_filter, percentile_filter
-from scipy.signal import butter, find_peaks, sosfiltfilt
+from scipy.signal import butter, find_peaks, sosfiltfilt, savgol_filter
 
 from .models import DetectionParams, DetectionResult, SpikeRecord
 
 
-DETECTOR_BUILD_TAG = "hybrid-detectors-2026-06-04"
+DETECTOR_BUILD_TAG = "state-guided-detectors-2026-06-11"
 
 
 @dataclass(frozen=True)
@@ -22,6 +22,21 @@ class BaselineConfig:
 
 
 BASELINE_CFG = BaselineConfig()
+_LAST_SHORT_PLATEAU_DEBUG: Dict[str, np.ndarray] = {}
+
+
+def _set_short_plateau_debug(n: int, **arrays: np.ndarray) -> None:
+    global _LAST_SHORT_PLATEAU_DEBUG
+    base = {
+        "short_floor_envelope": np.zeros(int(max(0, n)), dtype=float),
+        "short_step_up_score": np.zeros(int(max(0, n)), dtype=float),
+        "short_step_down_score": np.zeros(int(max(0, n)), dtype=float),
+        "short_support_mask": np.zeros(int(max(0, n)), dtype=bool),
+        "short_refined_onset_score": np.zeros(int(max(0, n)), dtype=float),
+        "short_refined_offset_score": np.zeros(int(max(0, n)), dtype=float),
+    }
+    base.update(arrays)
+    _LAST_SHORT_PLATEAU_DEBUG = base
 
 
 def _odd_geq(value: int, minimum: int = 5) -> int:
@@ -153,6 +168,46 @@ def _rolling_percentile(
         pct = pct[pad : -pad]
 
     return pct
+
+
+def _baseline_seed(
+    signal: np.ndarray,
+    fs: float,
+    excluded: np.ndarray,
+    mode: str,
+    rolling_window_ms: float,
+    rolling_percentile: float,
+    savgol_window_ms: float,
+    savgol_polyorder: int,
+) -> np.ndarray:
+    y = np.asarray(signal, dtype=float)
+    if y.size == 0:
+        return y.copy()
+    blocked = np.asarray(excluded, dtype=bool)
+    if blocked.size != y.size:
+        blocked = np.resize(blocked, y.size)
+    baseline_input = _interpolate_masked_series(
+        np.nan_to_num(y, nan=0.0),
+        mask=(blocked | ~np.isfinite(y)),
+    )
+    normalized_mode = str(mode or "percentile").strip().lower()
+    if normalized_mode in {"savgol", "savitzky-golay", "savitzky_golay"}:
+        if y.size < 3:
+            return baseline_input
+        window = _odd_geq(_to_samples(float(savgol_window_ms), fs, minimum=5), minimum=5)
+        window = min(window, y.size if y.size % 2 == 1 else y.size - 1)
+        window = max(3, int(window))
+        order = int(max(1, round(float(savgol_polyorder))))
+        order = min(order, max(1, window - 1))
+        return savgol_filter(baseline_input, window_length=window, polyorder=order, mode="nearest")
+
+    baseline_percentile = float(np.clip(float(rolling_percentile), 1.0, 50.0))
+    return _rolling_percentile(
+        baseline_input,
+        fs=fs,
+        window_ms=float(rolling_window_ms),
+        percentile=baseline_percentile,
+    )
 
 
 def _otsu_threshold(values: np.ndarray, bins: int = 256) -> float:
@@ -528,8 +583,11 @@ def _estimate_baseline_simple(
     fs: float,
     excluded_mask: np.ndarray | None = None,
     plateau_median_window_ms: float = 25.0,
+    baseline_mode: str = "percentile",
     baseline_rolling_window_ms: float = 300.0,
     baseline_rolling_percentile: float = 10.0,
+    baseline_savgol_window_ms: float = 300.0,
+    baseline_savgol_polyorder: int = 3,
     long_plateau_drift_window_ms: float = 2000.0,
     long_plateau_drift_percentile: float = 20.0,
     long_plateau_entry_noise_k: float = 5.0,
@@ -565,16 +623,15 @@ def _estimate_baseline_simple(
             excluded[:n_ex] = ex[:n_ex]
 
     baseline_window = _to_samples(float(baseline_rolling_window_ms), fs, minimum=5)
-    baseline_percentile = float(np.clip(float(baseline_rolling_percentile), 1.0, 50.0))
-    baseline_input = _interpolate_masked_series(
-        np.nan_to_num(y, nan=0.0),
-        mask=(excluded | ~np.isfinite(y)),
-    )
-    baseline_seed = _rolling_percentile(
-        baseline_input,
+    baseline_seed = _baseline_seed(
+        y,
         fs=fs,
-        window_ms=float(baseline_rolling_window_ms),
-        percentile=baseline_percentile,
+        excluded=excluded,
+        mode=baseline_mode,
+        rolling_window_ms=float(baseline_rolling_window_ms),
+        rolling_percentile=float(baseline_rolling_percentile),
+        savgol_window_ms=float(baseline_savgol_window_ms),
+        savgol_polyorder=int(baseline_savgol_polyorder),
     )
 
     # --- plateau proxy: centered median with configurable window ---
@@ -646,7 +703,7 @@ def _estimate_baseline_simple(
 
     plateau_mask = otsu_candidate_mask.copy()
     plateau_mask &= ~excluded
-    long_plateau_min_len = _to_samples(25.0, fs, minimum=1)
+    long_plateau_min_len = _to_samples(100.0, fs, minimum=1)
     plateau_mask = _filter_short_regions(plateau_mask, min_len=long_plateau_min_len)
 
     if not np.any(plateau_mask):
@@ -746,19 +803,127 @@ def _rolling_run_starts(mask: np.ndarray, run_len: int, min_fraction: float = 1.
     return out
 
 
+def _refine_short_plateau_edges(
+    *,
+    y: np.ndarray,
+    floor: np.ndarray,
+    support_mask: np.ndarray,
+    onset: int,
+    offset: int,
+    fs: float,
+    noise: float,
+    valid: np.ndarray,
+    blocked: np.ndarray,
+    long_mask: np.ndarray,
+) -> tuple[int, int, np.ndarray, np.ndarray]:
+    """Refine short-plateau boundaries with local robust changepoint scores."""
+    trace = np.asarray(y, dtype=float)
+    floor_arr = np.asarray(floor, dtype=float)
+    support = np.asarray(support_mask, dtype=bool)
+    good = np.asarray(valid, dtype=bool) & (~np.asarray(blocked, dtype=bool)) & (~np.asarray(long_mask, dtype=bool))
+    n = int(trace.size)
+    onset_scores = np.zeros(n, dtype=float)
+    offset_scores = np.zeros(n, dtype=float)
+    if n == 0:
+        return int(onset), int(offset), onset_scores, offset_scores
+
+    scale = max(float(noise), 1e-9)
+    onset_pre = _to_samples(8.0, fs, minimum=2)
+    onset_post = _to_samples(12.0, fs, minimum=2)
+    offset_pre = _to_samples(12.0, fs, minimum=2)
+    offset_post = _to_samples(12.0, fs, minimum=2)
+    support_len = _to_samples(10.0, fs, minimum=2)
+    support_probe = _to_samples(18.0, fs, minimum=support_len)
+    onset_lo = max(onset_pre, int(onset) - _to_samples(15.0, fs, minimum=1))
+    onset_hi = min(n - onset_post, int(onset) + _to_samples(10.0, fs, minimum=1))
+    offset_lo = max(offset_pre, int(offset) - _to_samples(15.0, fs, minimum=1))
+    offset_hi = min(n - offset_post, int(offset) + _to_samples(10.0, fs, minimum=1))
+
+    def _window_values(start: int, stop: int) -> np.ndarray:
+        if stop <= start:
+            return np.zeros(0, dtype=float)
+        m = good[start:stop] & np.isfinite(trace[start:stop])
+        return trace[start:stop][m]
+
+    def _support_fraction(start: int, stop: int, mask: np.ndarray) -> tuple[float, int]:
+        if stop <= start:
+            return 0.0, 0
+        values = mask[start:stop] & good[start:stop]
+        return float(np.mean(values)) if values.size else 0.0, _longest_true_run(values)
+
+    def _floor_support_survives(start: int, stop: int) -> bool:
+        probe_stop = min(stop, start + support_probe)
+        if probe_stop - start < support_len:
+            return False
+        elevated = (floor_arr[start:probe_stop] > (2.0 * scale)) & good[start:probe_stop]
+        fraction = float(np.mean(elevated)) if elevated.size else 0.0
+        return fraction >= 0.60 and _longest_true_run(elevated) >= support_len
+
+    best_onset = int(onset)
+    best_onset_score = -np.inf
+    for tau in range(onset_lo, onset_hi + 1):
+        if not good[tau]:
+            continue
+        pre_values = _window_values(tau - onset_pre, tau)
+        post_values = _window_values(tau, tau + onset_post)
+        if pre_values.size < max(2, onset_pre // 2) or post_values.size < max(2, onset_post // 2):
+            continue
+        pre_median = float(np.median(pre_values))
+        post_median = float(np.median(post_values))
+        if abs(pre_median) > (2.0 * scale) or post_median < (2.75 * scale):
+            continue
+        support_fraction, support_run = _support_fraction(tau, min(n, tau + support_probe), support)
+        if support_fraction < 0.55 or support_run < support_len:
+            continue
+        quiet_fraction = float(np.mean(np.abs(pre_values) <= (2.0 * scale)))
+        score = ((post_median - pre_median) / scale) + quiet_fraction + support_fraction
+        onset_scores[tau] = score
+        if score > best_onset_score:
+            best_onset_score = score
+            best_onset = tau
+
+    best_offset = int(offset)
+    best_offset_score = -np.inf
+    low_floor_mask = floor_arr <= (1.5 * scale)
+    for tau in range(offset_lo, offset_hi + 1):
+        if not good[tau]:
+            continue
+        pre_values = _window_values(tau - offset_pre, tau)
+        post_values = _window_values(tau, tau + offset_post)
+        if pre_values.size < max(2, offset_pre // 2) or post_values.size < max(2, offset_post // 2):
+            continue
+        pre_median = float(np.median(pre_values))
+        post_median = float(np.median(post_values))
+        drop = pre_median - post_median
+        if pre_median < (2.75 * scale) or drop < (2.75 * scale):
+            continue
+        if _floor_support_survives(tau, min(n, tau + support_probe)):
+            continue
+        support_fraction, support_run = _support_fraction(max(0, tau - support_probe), tau, support)
+        if support_fraction < 0.45 or support_run < max(2, support_len // 2):
+            continue
+        low_fraction, low_run = _support_fraction(tau, min(n, tau + support_probe), low_floor_mask)
+        score = (drop / scale) + support_fraction + low_fraction + min(1.0, low_run / max(float(support_len), 1.0))
+        offset_scores[tau] = score
+        if score > best_offset_score:
+            best_offset_score = score
+            best_offset = tau
+
+    best_onset = int(np.clip(best_onset, 0, n))
+    best_offset = int(np.clip(best_offset, best_onset + 1, n))
+    return best_onset, best_offset, onset_scores, offset_scores
+
+
 def _detect_short_plateaus_baseline_corrected(
     corrected_trace: np.ndarray,
     fs: float,
     excluded_mask: np.ndarray | None = None,
     long_plateau_mask: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Detect short plateau events on a denoised, baseline-corrected trace.
-
-    The signal itself decides whether the event remains above baseline. Slope is
-    used to place the onset, while offset requires a sustained return near zero.
-    """
+    """Detect brief raised-floor plateaus on a baseline-corrected trace."""
     y_in = np.asarray(corrected_trace, dtype=float)
     n = int(y_in.size)
+    _set_short_plateau_debug(n)
     if n <= 2:
         return np.zeros(n, dtype=bool), np.zeros((0, 6), dtype=float)
 
@@ -780,219 +945,277 @@ def _detect_short_plateaus_baseline_corrected(
         lm = np.asarray(long_plateau_mask, dtype=bool)
         long_mask[: min(n, lm.size)] = lm[: min(n, lm.size)]
 
-    valid = finite & (~blocked)
-    reference = y[valid & (~long_mask)]
+    valid = finite & (~blocked) & (~long_mask)
+    reference = y[valid]
     if reference.size < 16:
-        reference = y[valid]
+        reference = y[finite & (~blocked)]
     reference = reference[np.isfinite(reference)]
     if reference.size < 8:
         return np.zeros(n, dtype=bool), np.zeros((0, 6), dtype=float)
 
     ref_center = float(np.median(reference))
-    noise = float(np.median(np.abs(reference - ref_center)))
+    low_reference = reference[reference <= ref_center]
+    if low_reference.size >= 8:
+        noise_reference = low_reference
+    else:
+        noise_reference = reference
+    noise_center = float(np.median(noise_reference))
+    noise = float(np.median(np.abs(noise_reference - noise_center)))
     if (not np.isfinite(noise)) or noise <= 1e-12:
         noise = float(np.std(reference))
     if (not np.isfinite(noise)) or noise <= 1e-12:
         noise = 1e-9
+    noise = max(float(noise), 1e-9)
 
-    positive_ref = reference[reference > 0.0]
-    if positive_ref.size >= 8:
-        positive_scale = float(np.percentile(positive_ref, 90.0))
-    else:
-        positive_scale = float(np.percentile(np.abs(reference), 95.0))
-    if (not np.isfinite(positive_scale)) or positive_scale <= 0.0:
-        positive_scale = noise
+    median_window = _odd_geq(_to_samples(7.0, fs, minimum=3), minimum=3)
+    floor = _rolling_percentile(y, fs=fs, window_ms=12.0, percentile=20.0)
+    med = _rolling_median_centered(y, window=median_window)
 
-    close_thresh = max(1.5 * noise, 0.03 * positive_scale, 1e-9)
-    rise_thresh = max(3.0 * noise, 0.10 * positive_scale, close_thresh * 1.25)
-    min_height = max(4.0 * noise, 0.14 * positive_scale, rise_thresh)
+    before = _to_samples(8.0, fs, minimum=2)
+    after = _to_samples(10.0, fs, minimum=2)
+    step_up_score = np.zeros(n, dtype=float)
+    step_down_score = np.zeros(n, dtype=float)
+    for idx in range(n):
+        pre_start = max(0, idx - before)
+        pre = y[pre_start:idx]
+        post = y[idx : min(n, idx + after)]
+        if pre.size and post.size:
+            step_up_score[idx] = float(np.median(post) - np.median(pre))
+        post_down = y[idx + 1 : min(n, idx + 1 + after)]
+        if pre.size and post_down.size:
+            step_down_score[idx] = float(np.median(post_down) - np.median(pre))
 
-    lag = _to_samples(1.0, fs, minimum=1)
-    deriv = np.zeros(n, dtype=float)
-    if lag < n:
-        deriv[lag:] = y[lag:] - y[:-lag]
-    deriv_reference = deriv[valid & (~long_mask)]
-    deriv_reference = deriv_reference[np.isfinite(deriv_reference)]
-    if deriv_reference.size < 8:
-        deriv_reference = deriv[np.isfinite(deriv)]
-    d_center = float(np.median(deriv_reference)) if deriv_reference.size else 0.0
-    d_noise = float(np.median(np.abs(deriv_reference - d_center))) if deriv_reference.size else 0.0
-    if (not np.isfinite(d_noise)) or d_noise <= 1e-12:
-        d_noise = 1e-9
-    slope_thresh = max(3.0 * d_noise, 1e-9)
-
-    hard_min_duration_ms = 20.0
-    min_duration = _to_samples(hard_min_duration_ms, fs, minimum=3)
-    return_len = _to_samples(10.0, fs, minimum=3)
-    min_sustain = _to_samples(8.0, fs, minimum=2)
-    onset_back = _to_samples(25.0, fs, minimum=3)
-    onset_forward = _to_samples(8.0, fs, minimum=2)
-    max_onset_lead = _to_samples(12.0, fs, minimum=1)
-    min_high_run = _to_samples(3.0, fs, minimum=2)
-    pre_quiet_window = _to_samples(25.0, fs, minimum=3)
-    triangular_duration = _to_samples(90.0, fs, minimum=min_duration)
-    internal_edge = _to_samples(4.0, fs, minimum=1)
-
-    close_to_baseline = (y <= close_thresh) & valid
-    close_run_starts = _rolling_run_starts(close_to_baseline, return_len, min_fraction=0.80)
-    high = (y > rise_thresh) & valid & (~long_mask)
+    step_threshold = max(3.5 * noise, 1e-9)
+    elevated_threshold = max(3.0 * noise, 1e-9)
+    survival_threshold = max(2.0 * noise, 1e-9)
+    loss_threshold = max(1.25 * noise, 1e-9)
+    median_threshold = max(4.0 * noise, 1e-9)
+    pre_quiet_threshold = max(1.75 * noise, 1e-9)
+    pre_quiet_window = _to_samples(12.0, fs, minimum=3)
+    early_dwell = _to_samples(30.0, fs, minimum=4)
+    min_support = _to_samples(15.0, fs, minimum=2)
+    loss_len = _to_samples(7.0, fs, minimum=2)
+    survival_len = _to_samples(12.0, fs, minimum=2)
+    min_duration = _to_samples(25.0, fs, minimum=3)
+    min_step_gap = _to_samples(8.0, fs, minimum=1)
+    large_drop_threshold = max(3.0 * noise, 1e-9)
+    support_mask = (floor > elevated_threshold) & valid
+    loss_mask = (floor <= loss_threshold) & valid
+    refined_onset_score = np.zeros(n, dtype=float)
+    refined_offset_score = np.zeros(n, dtype=float)
+    _set_short_plateau_debug(
+        n,
+        short_floor_envelope=floor,
+        short_step_up_score=step_up_score,
+        short_step_down_score=step_down_score,
+        short_support_mask=support_mask,
+        short_refined_onset_score=refined_onset_score,
+        short_refined_offset_score=refined_offset_score,
+    )
 
     mask = np.zeros(n, dtype=bool)
     events: List[List[float]] = []
     next_available = 0
 
-    for high_start, high_end in _contiguous_regions(high):
-        if high_start < next_available:
-            continue
-        if high_start <= 0 or high_start >= n:
-            continue
-        if (high_end - high_start) < min_high_run:
-            continue
-        confirm_stop = min(n, high_start + min_sustain)
-        if confirm_stop <= high_start:
-            continue
-        if float(np.mean(y[high_start:confirm_stop] > close_thresh)) < 0.60:
-            continue
+    def _support_stats(mask_values: np.ndarray) -> tuple[float, int]:
+        if mask_values.size == 0:
+            return 0.0, 0
+        return float(np.mean(mask_values)), _longest_true_run(mask_values)
 
-        pre_lo = max(0, high_start - pre_quiet_window)
-        if not np.any(close_to_baseline[pre_lo:high_start]):
+    def _local_baseline_noise(start: int, stop: int) -> float:
+        window = _to_samples(25.0, fs, minimum=3)
+        pre_start = max(0, int(start) - window)
+        pre_stop = max(0, int(start))
+        post_start = min(n, int(stop))
+        post_stop = min(n, int(stop) + window)
+        local_valid = valid & (~blocked) & (~long_mask)
+        parts: List[np.ndarray] = []
+        if pre_stop > pre_start:
+            pre_mask = local_valid[pre_start:pre_stop] & np.isfinite(y[pre_start:pre_stop])
+            if np.any(pre_mask):
+                parts.append(y[pre_start:pre_stop][pre_mask])
+        if post_stop > post_start:
+            post_mask = local_valid[post_start:post_stop] & np.isfinite(y[post_start:post_stop])
+            if np.any(post_mask):
+                parts.append(y[post_start:post_stop][post_mask])
+        if not parts:
+            return 0.0
+        local_baseline = np.concatenate(parts)
+        if local_baseline.size < 3:
+            return 0.0
+        center = float(np.median(local_baseline))
+        local_noise = float(np.median(np.abs(local_baseline - center)))
+        if (not np.isfinite(local_noise)) or local_noise <= 1e-12:
+            local_noise = float(np.std(local_baseline))
+        return float(local_noise) if np.isfinite(local_noise) and local_noise > 0.0 else 0.0
+
+    def _post_event_level(start: int) -> tuple[float, int, bool]:
+        post_len = _to_samples(20.0, fs, minimum=3)
+        post_stop = min(n, int(start) + post_len)
+        post_valid = valid[start:post_stop] & np.isfinite(med[start:post_stop]) & np.isfinite(floor[start:post_stop])
+        valid_count = int(np.sum(post_valid))
+        truncated_by_end = (post_stop >= n) and (valid_count < max(3, post_len // 2))
+        if valid_count < max(3, post_len // 2):
+            return float("nan"), valid_count, truncated_by_end
+        post_median_level = float(np.median(med[start:post_stop][post_valid]))
+        post_floor_level = float(np.median(floor[start:post_stop][post_valid]))
+        return max(post_median_level, post_floor_level), valid_count, truncated_by_end
+
+    def _post_drop_support_survives(start: int, stop: int) -> bool:
+        dwell_stop = min(stop, start + survival_len)
+        if dwell_stop - start < max(2, min_support):
+            return False
+        dwell_support = (floor[start:dwell_stop] > survival_threshold) & valid[start:dwell_stop]
+        fraction, longest = _support_stats(dwell_support)
+        return fraction >= 0.60 and longest >= min_support
+
+    def _first_final_floor_loss(start: int, stop: int) -> int | None:
+        cursor = int(start)
+        while cursor < stop:
+            if blocked[cursor] or long_mask[cursor]:
+                return None
+            if step_down_score[cursor] <= -large_drop_threshold:
+                post_start = min(stop, cursor + max(1, after // 2))
+                if not _post_drop_support_survives(post_start, stop):
+                    return cursor
+                cursor += max(1, min_step_gap)
+                continue
+            loss_stop = min(stop, cursor + loss_len)
+            if loss_stop - cursor >= loss_len:
+                loss_fraction, _ = _support_stats(loss_mask[cursor:loss_stop])
+                if loss_fraction >= 0.80:
+                    return cursor
+            cursor += 1
+        return None
+
+    candidates = np.flatnonzero((step_up_score > step_threshold) & valid)
+    for onset in candidates:
+        onset = int(onset)
+        if onset < next_available or onset <= before or onset >= n - min_support:
             continue
-
-        search_lo = max(0, high_start - onset_back)
-        search_hi = min(n, high_start + onset_forward)
-        strong_window = (deriv[search_lo:search_hi] > slope_thresh) & valid[search_lo:search_hi]
-        strong_candidates = np.flatnonzero(strong_window)
-        if strong_candidates.size == 0:
-            continue
-
-        quiet_candidates = np.flatnonzero(close_to_baseline[search_lo : high_start + 1])
-        if quiet_candidates.size > 0:
-            baseline_exit = search_lo + int(quiet_candidates[-1]) + 1
-        else:
-            baseline_exit = high_start
-
-        strong_after_exit = np.flatnonzero(
-            (deriv[baseline_exit:search_hi] > slope_thresh) & valid[baseline_exit:search_hi]
-        )
-        if strong_after_exit.size > 0:
-            onset = baseline_exit + int(strong_after_exit[0])
-        else:
-            onset = search_lo + int(strong_candidates[0])
-        onset = max(onset, high_start - max_onset_lead)
-        onset = max(0, min(onset, n - 1))
         if blocked[onset] or long_mask[onset]:
             continue
+        pre_start = max(0, onset - pre_quiet_window)
+        pre_values = y[pre_start:onset]
+        pre_valid = valid[pre_start:onset]
+        if pre_values.size == 0 or int(np.sum(pre_valid)) < max(2, pre_values.size // 2):
+            continue
+        if float(np.median(np.abs(pre_values[pre_valid]))) > pre_quiet_threshold:
+            continue
 
-        offset_search = max(onset + 1, high_end)
-        if offset_search >= n:
+        search_stop = n
+        earliest_confirm_stop = min(search_stop, onset + max(min_support, min_duration))
+        if earliest_confirm_stop - onset < min_support:
             continue
-        close_offsets = np.flatnonzero(close_run_starts[offset_search:])
-        if close_offsets.size == 0:
+
+        early_stop = min(search_stop, onset + early_dwell)
+        early_support = support_mask[onset:early_stop]
+        if early_support.size < min_support:
             continue
-        offset = offset_search + int(close_offsets[0])
+        floor_support_fraction, longest_early_support = _support_stats(early_support)
+        if floor_support_fraction < 0.75:
+            continue
+        if longest_early_support < min_support:
+            continue
+        early_values = med[onset:early_stop][valid[onset:early_stop]]
+        if early_values.size == 0 or float(np.median(early_values)) < median_threshold:
+            continue
+        if np.any(blocked[onset:earliest_confirm_stop]) or np.any(long_mask[onset:earliest_confirm_stop]):
+            continue
+
+        offset = _first_final_floor_loss(onset + min_support, search_stop)
+        if offset is None:
+            continue
         offset = max(onset + 1, min(offset, n))
 
-        if offset - onset < min_duration:
+        duration = offset - onset
+        if duration < min_duration:
             continue
         if np.any(blocked[onset:offset]) or np.any(long_mask[onset:offset]):
             continue
 
-        seg = y[onset:offset]
-        seg = seg[np.isfinite(seg)]
-        if seg.size < min_duration:
-            continue
-
-        peak_search_stop = min(seg.size, max(min_sustain * 3, _to_samples(25.0, fs, minimum=3)))
-        if peak_search_stop >= 3:
-            early = seg[:peak_search_stop]
-            early_peaks, _ = find_peaks(
-                early,
-                height=rise_thresh,
-                prominence=max(noise, 1e-9),
-                distance=_to_samples(1.0, fs, minimum=1),
-            )
-            if early_peaks.size > 0:
-                first_peak_idx = int(early_peaks[0])
-                first_peak_value = float(seg[first_peak_idx])
-                if np.isfinite(first_peak_value) and first_peak_value > close_thresh:
-                    drop_threshold = max(3.0 * noise, 0.30 * (first_peak_value - close_thresh), 1e-9)
-                    post_peak = seg[first_peak_idx + 1 :]
-                    first_drop_offsets = np.flatnonzero(post_peak <= (first_peak_value - drop_threshold))
-                    if first_drop_offsets.size > 0:
-                        first_drop_idx = first_peak_idx + 1 + int(first_drop_offsets[0])
-                        return_check_len = max(return_len, _to_samples(3.0, fs, minimum=2))
-                        min_valid_in_return = max(1, int(math.ceil(0.70 * float(return_check_len))))
-                        post_drop_start = onset + first_drop_idx
-                        return_scan_horizon = max(6 * return_len, _to_samples(80.0, fs, minimum=return_check_len))
-                        check_stop = min(n, offset + return_check_len, post_drop_start + return_scan_horizon)
-                        baseline_like_return = False
-                        for win_start in range(post_drop_start, check_stop - return_check_len + 1):
-                            win_stop = win_start + return_check_len
-                            window = y[win_start:win_stop]
-                            window_valid = valid[win_start:win_stop] & (~long_mask[win_start:win_stop]) & np.isfinite(window)
-                            if int(np.sum(window_valid)) < min_valid_in_return:
-                                continue
-                            window_values = window[window_valid]
-                            close_fraction = float(np.mean(window_values <= close_thresh))
-                            median_level = float(np.median(window_values))
-                            p75_level = float(np.percentile(window_values, 75.0))
-                            level_score = 1.0 - float(
-                                np.clip((median_level - close_thresh) / max(close_thresh, 1e-9), 0.0, 1.0)
-                            )
-                            baseline_return_confidence = (0.70 * close_fraction) + (0.30 * level_score)
-                            if (
-                                baseline_return_confidence >= 0.80
-                                and close_fraction >= 0.70
-                                and p75_level <= (2.0 * close_thresh)
-                            ):
-                                baseline_like_return = True
-                                break
-                        if baseline_like_return:
-                            continue
-
-        above_close = seg > close_thresh
-        occupancy = float(np.mean(above_close)) if above_close.size else 0.0
-        if occupancy < 0.45:
-            continue
-        if _longest_true_run(above_close) < min_sustain:
-            continue
-
-        height_values = seg[above_close]
-        if height_values.size == 0:
-            continue
-        plateau_height = float(np.median(height_values))
-        peak = float(np.max(seg))
-        if (not np.isfinite(plateau_height)) or plateau_height < min_height or peak <= 0.0:
-            continue
-
-        height_ratio = plateau_height / max(peak, 1e-9)
-        if (offset - onset) <= triangular_duration and height_ratio < 0.28:
-            continue
-
-        inner_start = min(seg.size, internal_edge)
-        inner_stop = max(inner_start, seg.size - internal_edge)
-        inner = seg[inner_start:inner_stop]
-        internal_spikes = False
-        if inner.size >= 3:
-            peaks, _ = find_peaks(
-                inner,
-                height=plateau_height + (3.0 * noise),
-                prominence=max(3.0 * noise, 1e-9),
-                distance=_to_samples(2.0, fs, minimum=1),
-            )
-            internal_spikes = bool(peaks.size > 0)
-
-        duration_ms = float((offset - onset) * 1000.0 / max(float(fs), 1e-9))
-        if duration_ms < hard_min_duration_ms:
-            continue
-        snr_score = min(1.0, max(0.0, (plateau_height / max(noise, 1e-9)) / 8.0))
-        duration_score = min(1.0, max(0.0, duration_ms / 80.0))
-        occupancy_score = min(1.0, max(0.0, (occupancy - 0.45) / 0.45))
-        shape_score = min(1.0, max(0.0, height_ratio / 0.65))
-        confidence = float(
-            min(1.0, max(0.0, (0.35 * snr_score) + (0.25 * duration_score) + (0.25 * occupancy_score) + (0.15 * shape_score)))
+        refined_onset, refined_offset, onset_scores, offset_scores = _refine_short_plateau_edges(
+            y=y,
+            floor=floor,
+            support_mask=support_mask,
+            onset=onset,
+            offset=offset,
+            fs=fs,
+            noise=noise,
+            valid=valid,
+            blocked=blocked,
+            long_mask=long_mask,
         )
-        if confidence < 0.35:
+        refined_onset_score[:] = np.maximum(refined_onset_score, onset_scores)
+        refined_offset_score[:] = np.maximum(refined_offset_score, offset_scores)
+        onset = refined_onset
+        offset = refined_offset
+
+        duration = offset - onset
+        if duration < min_duration:
+            continue
+        if np.any(blocked[onset:offset]) or np.any(long_mask[onset:offset]):
+            continue
+
+        event_valid = valid[onset:offset]
+        if int(np.sum(event_valid)) < min_duration:
+            continue
+        event_values = med[onset:offset][event_valid]
+        event_floor_support = support_mask[onset:offset][event_valid]
+        if event_values.size == 0 or event_floor_support.size == 0:
+            continue
+
+        median_level = float(np.median(event_values))
+        raw_event_values = y[onset:offset][event_valid]
+        peak_level = float(np.max(raw_event_values)) if raw_event_values.size else median_level
+        event_floor_values = floor[onset:offset][event_valid]
+        floor_median = float(np.median(event_floor_values)) if event_floor_values.size else 0.0
+
+        local_noise = _local_baseline_noise(onset, offset)
+        effective_noise = max(noise, local_noise, 1e-9)
+
+        # This strict post-refinement validation stage is intentionally
+        # conservative: random or structured noise can pass the rough step-up
+        # screen, but should not pass stable raised-floor checks.
+        duration_ms = float((offset - onset) * 1000.0 / max(float(fs), 1e-9))
+        event_floor_support = ((floor[onset:offset] > (3.0 * effective_noise)) & valid[onset:offset])[event_valid]
+        floor_support_fraction, longest_event_support = _support_stats(event_floor_support)
+        if floor_support_fraction < 0.75:
+            continue
+        if longest_event_support < min_support:
+            continue
+        if (not np.isfinite(median_level)) or median_level < (4.0 * effective_noise):
+            continue
+        if floor_median < (3.0 * effective_noise):
+            continue
+
+        post_event_median, _post_valid_count, post_truncated = _post_event_level(offset)
+        if np.isfinite(post_event_median):
+            if post_event_median > (1.5 * effective_noise):
+                continue
+        elif post_truncated:
+            if floor_support_fraction < 0.85:
+                continue
+        else:
+            continue
+
+        if raw_event_values.size >= 2:
+            event_iqr = float(np.percentile(raw_event_values, 75) - np.percentile(raw_event_values, 25))
+        else:
+            event_iqr = 0.0
+        if event_iqr > (4.0 * effective_noise):
+            continue
+        if (peak_level - median_level) > (5.0 * effective_noise) and floor_support_fraction < 0.85:
+            continue
+
+        step_score = min(1.0, max(0.0, ((step_up_score[onset] / effective_noise) - 3.5) / 6.0))
+        level_score = min(1.0, max(0.0, ((median_level / effective_noise) - 4.0) / 6.0))
+        support_score = min(1.0, max(0.0, (floor_support_fraction - 0.75) / 0.25))
+        duration_score = min(1.0, max(0.0, (duration_ms - 25.0) / 75.0))
+        confidence = float(
+            min(1.0, max(0.0, (0.30 * step_score) + (0.30 * level_score) + (0.25 * support_score) + (0.15 * duration_score)))
+        )
+        if confidence < 0.65:
             continue
 
         mask[onset:offset] = True
@@ -1001,12 +1224,12 @@ def _detect_short_plateaus_baseline_corrected(
                 float(onset),
                 float(offset),
                 duration_ms,
-                plateau_height,
-                1.0 if internal_spikes else 0.0,
+                median_level,
+                floor_support_fraction,
                 confidence,
             ]
         )
-        next_available = offset + return_len
+        next_available = offset + min_step_gap
 
     if not events:
         return mask, np.zeros((0, 6), dtype=float)
@@ -1451,9 +1674,18 @@ def detect_spikes(
     signal = _interpolate_invalid(time, corrected)
     fs = float(sampling_rate_hz) if sampling_rate_hz is not None and np.isfinite(sampling_rate_hz) and sampling_rate_hz > 0 else _estimate_sampling_rate(time)
 
-    # Per user request: do not apply any filters. Keep only interpolation of invalid samples.
-    processed_signal = signal
-    # No smoothing/filtering: use the raw interpolated signal as the smoothed channel.
+    apply_highpass = bool(getattr(params, "use_highpass_filter", False)) and baseline_override is None
+    if apply_highpass:
+        processed_signal = _butterworth_highpass(
+            signal,
+            fs=fs,
+            cutoff_hz=float(getattr(params, "highpass_cutoff_hz", 1.0)),
+            order=int(getattr(params, "highpass_order", 3)),
+        )
+    else:
+        processed_signal = signal
+    highpass_signal = processed_signal if apply_highpass else np.zeros_like(processed_signal)
+    # No smoothing/filtering beyond the optional explicit high-pass preprocessing.
     smoothed = processed_signal
 
     blocked = np.zeros_like(smoothed, dtype=bool)
@@ -1497,8 +1729,11 @@ def detect_spikes(
         fs=fs,
         excluded_mask=blocked,
         plateau_median_window_ms=params.plateau_median_window_ms,
+        baseline_mode=params.baseline_mode,
         baseline_rolling_window_ms=params.baseline_rolling_window_ms,
         baseline_rolling_percentile=params.baseline_rolling_percentile,
+        baseline_savgol_window_ms=params.baseline_savgol_window_ms,
+        baseline_savgol_polyorder=params.baseline_savgol_polyorder,
         long_plateau_drift_window_ms=params.long_plateau_drift_window_ms,
         long_plateau_drift_percentile=params.long_plateau_drift_percentile,
         long_plateau_entry_noise_k=params.long_plateau_entry_noise_k,
@@ -1521,6 +1756,7 @@ def detect_spikes(
     # The long detector is used here as the baseline-exclusion/protection mask.
     long_plateau_mask = np.asarray(plateau_mask, dtype=bool).copy()
     run_short_plateau_detector = baseline_override is not None
+    _set_short_plateau_debug(processed_signal.size)
     if run_short_plateau_detector:
         short_plateau_signal = processed_signal
         if short_plateau_trace_override is not None:
@@ -1581,7 +1817,7 @@ def detect_spikes(
     qc_plot_data: Dict[str, np.ndarray] = {
         "corrected_trace": processed_signal,
         "input_trace": signal,
-        "highpass_signal": processed_signal,
+        "highpass_signal": highpass_signal,
         "confirmation_threshold_line": threshold,
         "dff": np.zeros_like(smoothed, dtype=float),
         "residual": detector_signal,
@@ -1598,6 +1834,7 @@ def detect_spikes(
         "plateau_debug_threshold_line": plateau_debug_threshold_line,
     }
     qc_plot_data.update(long_plateau_debug)
+    qc_plot_data.update(_LAST_SHORT_PLATEAU_DEBUG)
 
     return DetectionResult(
         spikes=spikes,

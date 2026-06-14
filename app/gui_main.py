@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 import datetime
 from pathlib import Path
@@ -9,7 +10,6 @@ from typing import Callable, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Qt, Signal
-from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
@@ -36,10 +37,9 @@ import PySide6.QtWidgets as QtWidgets
 import PySide6.QtGui as QtGui
 
 from .detection import DETECTOR_BUILD_TAG, detect_spikes
-from .hybrid_denoising import denoise_hybrid_fluorescence_trace, denoise_trace_hybrid_low_plateau_tv
+from .hybrid_denoising import denoise_hybrid_fluorescence_trace, denoise_trace_state_guided_low_plateau_tv
 from .io import estimate_sampling_rate_hz, load_excel_traces
-from .models import ArtifactParams, DetectionParams, SpikeCluster, SpikeRecord, TraceCuration
-from .models import cluster_spikes
+from .models import AppSession, ArtifactParams, DetectionParams, SpikeRecord, TraceCuration
 from .plot_widget import TracePlotWidget
 from .preprocessing import apply_artifact_interpolation
 from .session_io import apply_session_to_traces, load_session, save_session
@@ -98,6 +98,19 @@ def _detection_short_events(detection: object) -> np.ndarray:
         if events.ndim == 2 and events.shape[1] == 6:
             return events
     return np.zeros((0, 6), dtype=float)
+
+
+def _detection_highpass_trace(detection: object, enabled: bool) -> Optional[np.ndarray]:
+    if not enabled:
+        return None
+    qc = getattr(detection, "qc_plot_data", {})
+    if not isinstance(qc, dict):
+        return None
+    trace = qc.get("highpass_signal")
+    if trace is None:
+        return None
+    arr = np.asarray(trace, dtype=float)
+    return arr if arr.size > 0 else None
 
 
 def _finite_median(values: np.ndarray) -> float:
@@ -171,7 +184,7 @@ def _spike_export_dimensions(half_window_ms: float) -> Tuple[int, int, int, int]
     half = max(0.5, float(half_window_ms))
     scale = half / 5.0
 
-    # Reference width: at ±5 ms (10 ms total), export around half of prior width.
+    # Reference width: at +/-5 ms (10 ms total), export around half of prior width.
     single_width = int(np.clip(round(600.0 * scale), 500, 2400))
     single_height = int(np.clip(round(400.0 + 40.0 * np.log10(max(1.0, scale))), 360, 520))
     row_height = int(np.clip(round(180.0 * (scale ** 0.35)), 160, 280))
@@ -278,10 +291,10 @@ def _render_spike_png(
         denoised_plot.showGrid(x=True, y=True, alpha=0.2)
         denoised_plot.addLegend(offset=(10, 8))
         denoised_plot.setLabel("bottom", x_label)
-        denoised_plot.setLabel("left", "Hybrid denoised")
+        denoised_plot.setLabel("left", "State-guided denoised")
         denoised_plot.setMinimumHeight(plot_height)
         denoised_plot.setMaximumHeight(plot_height)
-        denoised_plot.plot(t_win_rescaled, denoised_win, pen=pg.mkPen("#8e24aa", width=2.0), name="Hybrid denoised")
+        denoised_plot.plot(t_win_rescaled, denoised_win, pen=pg.mkPen("#8e24aa", width=2.0), name="State-guided denoised")
         denoised_y = float(hybrid_denoised[spike.spike_index]) if spike.spike_index < len(hybrid_denoised) else 0.0
         denoised_plot.addItem(pg.ScatterPlotItem(x=[0.0], y=[denoised_y], size=10, brush=pg.mkBrush("#f1c40f"), pen=pg.mkPen("#ffffff", width=1.0)))
         denoised_plot.plot([0, 0], denoised_plot.viewRange()[1], pen=pg.mkPen("#ff0000", width=1.5, style=Qt.PenStyle.DashLine))
@@ -433,152 +446,6 @@ def _render_aligned_spikes_png(
     return pix
 
 
-def _render_cluster_png(
-    time: np.ndarray,
-    raw: np.ndarray,
-    corrected: np.ndarray,
-    baseline: Optional[np.ndarray],
-    threshold_line: Optional[np.ndarray],
-    cluster: SpikeCluster,
-    half_window_ms: float = 5.0,
-    width: int = 1200,
-    height: int = 400,
-) -> "QtGui.QPixmap":
-    """Render a single spike cluster as a PNG pixmap (no display required)."""
-    spikes = cluster.spikes
-    n = len(spikes)
-
-    # Center window on the middle spike.
-    mid_spike = spikes[n // 2]
-    t_center = mid_spike.spike_time
-
-    # Target a configurable ±window around the center spike.
-    half_ms = float(half_window_ms)
-    half_window = _half_window_in_time_units(time, half_ms)
-    zoom_factor = 1.05  # 5% breathing room so spikes aren't at the very edge
-    half_zoomed = half_window * zoom_factor
-
-    t_lo = t_center - half_zoomed
-    t_hi = t_center + half_zoomed
-    span_ms = (t_hi - t_lo) if _time_axis_is_ms(time) else (t_hi - t_lo) * 1000.0
-
-    # Debug: verify window size in ms
-    print(f"[DEBUG PNG] n={n}, spike_times={[s.spike_time for s in spikes]}, "
-          f"half_ms={half_ms:.1f}, t_lo={t_lo:.6f}, t_hi={t_hi:.6f}, "
-            f"span={span_ms:.1f}ms")
-
-    idx_lo = int(np.searchsorted(time, t_lo))
-    idx_hi = int(np.searchsorted(time, t_hi))
-    idx_lo = max(0, idx_lo - 1)
-    idx_hi = min(len(time), idx_hi + 1)
-
-    t_win = time[idx_lo:idx_hi]
-    raw_win = raw[idx_lo:idx_hi]
-    corr_win = corrected[idx_lo:idx_hi]
-    base_win = baseline[idx_lo:idx_hi] if baseline is not None else None
-    thresh_win = threshold_line[idx_lo:idx_hi] if threshold_line is not None else None
-
-    spike_xs = [float(time[s.spike_index]) for s in cluster.spikes if s.spike_index < len(time)]
-    spike_ys = [float(corrected[s.spike_index]) for s in cluster.spikes if s.spike_index < len(time)]
-
-    app = QtWidgets.QApplication.instance()
-    if app is None:
-        app = QtWidgets.QApplication([])
-
-    overview_height = max(90, int(height * 0.25))
-    total_height = height + overview_height
-
-    container = QtWidgets.QWidget()
-    layout = QtWidgets.QVBoxLayout(container)
-    layout.setContentsMargins(0, 0, 0, 0)
-    layout.setSpacing(6)
-
-    main_plot = pg.PlotWidget(background="#f7f9fc")
-    main_plot.showGrid(x=True, y=True, alpha=0.2)
-    main_plot.setLabel("bottom", _time_axis_label(time))
-    main_plot.setLabel("left", "Signal")
-    main_plot.setMinimumHeight(height)
-    main_plot.setMaximumHeight(height)
-
-    main_plot.plot(t_win, corr_win, pen=pg.mkPen("#2979ff", width=2.0))
-    if base_win is not None:
-        main_plot.plot(t_win, base_win, pen=pg.mkPen("#ff6d00", width=1.5))
-    if thresh_win is not None:
-        main_plot.plot(t_win, thresh_win, pen=pg.mkPen("#8e24aa", width=1.2, style=Qt.PenStyle.DashLine))
-
-    if spike_xs:
-        scatter = pg.ScatterPlotItem(x=spike_xs, y=spike_ys, size=10, brush=pg.mkBrush("#f1c40f"), pen=pg.mkPen("#ffffff", width=1.0))
-        main_plot.addItem(scatter)
-
-    # Add visible dashed vertical lines at window edges
-    y_v = main_plot.viewRange()[1]
-    main_plot.plot([t_lo, t_lo], y_v, pen=pg.mkPen("#999999", width=1.0, style=Qt.PenStyle.DashLine))
-    main_plot.plot([t_hi, t_hi], y_v, pen=pg.mkPen("#999999", width=1.0, style=Qt.PenStyle.DashLine))
-    # Add window label at top
-    label = pg.TextItem(
-        f"  {2.0 * half_ms:.0f}ms  ",
-        color="#999999",
-        fill=pg.mkColor("#ffffffcc"),
-        border=pg.mkColor("#cccccc"),
-        anchor=(0.5, 1.0),
-    )
-    main_plot.addItem(label)
-    label.setPos((t_lo + t_hi) / 2.0, y_v[1])
-
-    main_plot.setXRange(t_lo, t_hi, padding=0)
-    # Compute Y range from the corrected data plus spike amplitudes so
-    # the full spike shape is always visible (not clipped by percentile tails).
-    all_values = [v for arr in [corr_win] if arr.size > 0 for v in np.asarray(arr, dtype=float).flat]
-    all_values.extend(spike_ys)
-    finite = np.array(all_values, dtype=float)
-    finite = finite[np.isfinite(finite)]
-    if finite.size > 0:
-        lo = float(np.min(finite))
-        hi = float(np.max(finite))
-        if hi <= lo:
-            pad = 1e-3
-        else:
-            pad = max(1e-3, (hi - lo) * 0.10)
-        main_plot.setYRange(lo - pad, hi + pad, padding=0)
-
-    overview_plot = pg.PlotWidget(background="#f7f9fc")
-    overview_plot.showGrid(x=True, y=False, alpha=0.15)
-    overview_plot.setLabel("bottom", "Overview")
-    overview_plot.setMouseEnabled(x=False, y=False)
-    overview_plot.setMinimumHeight(overview_height)
-    overview_plot.setMaximumHeight(overview_height)
-
-    axis_width = 52
-    main_plot.getAxis("left").setWidth(axis_width)
-    overview_plot.getAxis("left").setWidth(axis_width)
-    overview_plot.getAxis("left").setStyle(showValues=False)
-
-    overview_plot.plot(time, corrected, pen=pg.mkPen("#2979ff", width=1.1))
-    if baseline is not None:
-        overview_plot.plot(time, baseline, pen=pg.mkPen("#ff6d00", width=1.0))
-
-    t_lo_over = max(float(time[0]), t_lo)
-    t_hi_over = min(float(time[-1]), t_hi)
-    region = pg.LinearRegionItem(
-        values=(t_lo_over, t_hi_over),
-        brush=pg.mkBrush(41, 121, 255, 50),
-        pen=pg.mkPen("#2979ff", width=1.2),
-        movable=False,
-    )
-    overview_plot.addItem(region)
-    overview_plot.setXRange(float(time[0]), float(time[-1]), padding=0)
-
-    layout.addWidget(main_plot)
-    layout.addWidget(overview_plot)
-    container.resize(width, total_height)
-
-    container.hide()
-    QtWidgets.QApplication.processEvents()
-    pix = QtWidgets.QWidget.grab(container)
-    container.close()
-    return pix
-
-
 def _render_superimposed_spikes_png(
     time: np.ndarray,
     corrected: np.ndarray,
@@ -699,7 +566,7 @@ def _render_superimposed_all_traces_png(
             x_label = _time_axis_label(time)
             break
 
-    # Build a color palette — one distinct color per trace.
+    # Build a color palette: one distinct color per trace.
     PALETTE = [
         "#2979ff", "#e74c3c", "#27ae60", "#f39c12",
         "#9b59b6", "#1abc9c", "#e67e22", "#34495e",
@@ -1466,11 +1333,15 @@ def _nan_stats(values: np.ndarray) -> Dict[str, float]:
 
 
 TRACE_SUMMARY_CONFIG = {
-    # Output filenames under Result/csv_YYYYMMDD_HHMMSS/
+    # Output filenames under Result/export_YYYYMMDD_HHMMSS/
     "csv_name": "trace_summary_stats.csv",
     "events_csv_name": "plateau_event_stats.csv",
-    "png_name": "trace_summary_stats.png",
-    "pdf_name": "trace_summary_stats.pdf",
+    "qc_csv_name": "trace_qc_summary.csv",
+    "spike_events_csv_name": "spike_event_stats.csv",
+    "spike_summary_csv_name": "trace_spike_summary_stats.csv",
+    "png_name": "summary_qc_report.png",
+    "spike_png_name": "spike_statistics_summary.png",
+    "pdf_name": "summary_qc_report.pdf",
     "save_pdf": True,
     "png_dpi": 400,
     # CSV schema
@@ -1488,6 +1359,85 @@ TRACE_SUMMARY_CONFIG = {
     },
 }
 
+EXPORT_TABLES_DIR = "tables"
+EXPORT_REPORTS_DIR = "reports"
+EXPORT_RELOAD_DIR = "reload"
+EXPORT_MANIFEST_NAME = "export_manifest.json"
+
+PLATEAU_EVENT_COLUMNS = [
+    "trace_id",
+    "plateau_id",
+    "detector_source",
+    "start_index",
+    "end_index_exclusive",
+    "onset_time_ms",
+    "start_time",
+    "end_time",
+    "duration_ms",
+    "fwhm_ms",
+    "rise_time_ms",
+    "decay_time_ms",
+    "plateau_sd",
+    "mean_amp_above_baseline",
+    "peak_amp_above_baseline",
+    "sample_count",
+]
+
+TRACE_SUMMARY_COLUMNS = [
+    "trace_id",
+    "plateau_count",
+    "first_onset_ms",
+    "mean_duration_ms",
+    "median_duration_ms",
+    "mean_fwhm_ms",
+    "median_fwhm_ms",
+    "mean_rise_time_ms",
+    "median_rise_time_ms",
+    "mean_peak_amp_above_baseline",
+    "median_peak_amp_above_baseline",
+    "mean_plateau_sd",
+    "median_plateau_sd",
+    "total_plateau_time_ms",
+    "plateau_time_fraction",
+    "mean_inter_plateau_interval_ms",
+    "median_inter_plateau_interval_ms",
+]
+
+SPIKE_EVENT_COLUMNS = [
+    "trace_id",
+    "spike_id",
+    "peak_index",
+    "peak_time",
+    "amplitude",
+    "delta_f_over_f0",
+    "snr",
+    "rise_time_ms",
+    "fwhm_ms",
+    "return_to_baseline_time_ms",
+    "post_spike_level",
+    "isi_ms",
+    "instantaneous_firing_rate_hz",
+    "source",
+]
+
+
+QC_TRACE_METRICS = {
+    "plateau_count": "Plateau count",
+    "median_plateau_sd": "Median plateau SD",
+    "median_duration_ms": "Median duration",
+    "median_fwhm_ms": "Median FWHM",
+    "plateau_time_fraction": "Plateau time fraction",
+}
+
+QC_EVENT_METRICS = {
+    "duration_ms": "duration_qc",
+    "fwhm_ms": "fwhm_qc",
+    "peak_amp_above_baseline": "amplitude_qc",
+    "plateau_sd": "noise_qc",
+}
+
+QC_OUTLIER_THRESHOLD = 4.5
+
 
 def _time_to_ms_scale(time: np.ndarray) -> float:
     t = np.asarray(time, dtype=float)
@@ -1498,8 +1448,79 @@ def _time_to_ms_scale(time: np.ndarray) -> float:
     if dt.size == 0:
         return 1.0
     dt_med = float(np.median(dt))
-    # If dt is >= 1e-3, this project convention treats axis as milliseconds.
-    return 1.0 if dt_med >= 1e-3 else 1000.0
+    sample_period_ms = _time_sample_period_ms(t)
+    if not np.isfinite(sample_period_ms) or sample_period_ms <= 0.0:
+        return 1.0
+    return float(sample_period_ms / dt_med)
+
+
+def _time_sample_period_ms(time: np.ndarray, sampling_rate_hz: Optional[float] = None) -> float:
+    fs = float(sampling_rate_hz) if sampling_rate_hz is not None else estimate_sampling_rate_hz(time)
+    if not np.isfinite(fs) or fs <= 0.0:
+        return float("nan")
+    return float(1000.0 / fs)
+
+
+def _trace_total_time_ms(time: np.ndarray, sampling_rate_hz: Optional[float] = None) -> float:
+    t = np.asarray(time, dtype=float)
+    t = t[np.isfinite(t)]
+    if t.size < 2:
+        return float("nan")
+    sample_period_ms = _time_sample_period_ms(t, sampling_rate_hz)
+    if not np.isfinite(sample_period_ms) or sample_period_ms <= 0.0:
+        return float("nan")
+    return float(t.size * sample_period_ms)
+
+
+def _finite_numeric_series(df: pd.DataFrame, col: str) -> np.ndarray:
+    if col not in df.columns:
+        return np.array([], dtype=float)
+    arr = pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=float)
+    return arr[np.isfinite(arr)]
+
+
+def _robust_high_outlier_mask(values: np.ndarray, threshold: float = QC_OUTLIER_THRESHOLD) -> np.ndarray:
+    arr = np.asarray(values, dtype=float)
+    mask = np.zeros(arr.shape, dtype=bool)
+    finite = np.isfinite(arr)
+    finite_vals = arr[finite]
+    if finite_vals.size < 4:
+        return mask
+
+    median = float(np.median(finite_vals))
+    mad = float(np.median(np.abs(finite_vals - median)))
+    if mad > 0.0 and np.isfinite(mad):
+        robust_z = 0.6745 * (arr - median) / mad
+        return finite & (robust_z > threshold)
+
+    q1, q3 = np.percentile(finite_vals, [25.0, 75.0])
+    iqr = float(q3 - q1)
+    if iqr > 0.0 and np.isfinite(iqr):
+        return finite & (arr > (float(q3) + 3.0 * iqr))
+
+    max_val = float(np.max(finite_vals))
+    if max_val > median:
+        return finite & (arr == max_val)
+
+    return mask
+
+
+def _label_outliers(df: pd.DataFrame, value_col: str, flag_col: str) -> None:
+    if value_col not in df.columns:
+        df[flag_col] = ""
+        return
+    vals = pd.to_numeric(df[value_col], errors="coerce").to_numpy(dtype=float)
+    outliers = _robust_high_outlier_mask(vals)
+    labels = np.full(vals.shape, "", dtype=object)
+    labels[outliers] = "high_outlier"
+    df[flag_col] = labels
+
+
+def _add_event_qc_flags(events_df: pd.DataFrame) -> pd.DataFrame:
+    out = events_df.copy()
+    for value_col, flag_col in QC_EVENT_METRICS.items():
+        _label_outliers(out, value_col, flag_col)
+    return out
 
 
 def _trace_duration_ms(time: np.ndarray, plateau_mask: Optional[np.ndarray]) -> float:
@@ -1516,13 +1537,10 @@ def _trace_duration_ms(time: np.ndarray, plateau_mask: Optional[np.ndarray]) -> 
     mask = mask[:n]
     t = t[:n]
 
-    dt = np.diff(t)
-    dt = dt[np.isfinite(dt) & (dt > 0)]
-    if dt.size == 0:
+    sample_period_ms = _time_sample_period_ms(t)
+    if not np.isfinite(sample_period_ms) or sample_period_ms <= 0.0:
         return 0.0
-    dt_med = float(np.median(dt))
-    scale = _time_to_ms_scale(t)
-    return float(np.sum(mask) * dt_med * scale)
+    return float(np.sum(mask) * sample_period_ms)
 
 
 def _trace_plateau_sd(corrected: np.ndarray, plateau_mask: Optional[np.ndarray]) -> float:
@@ -1582,10 +1600,10 @@ def _event_fwhm_samples(amplitude: np.ndarray) -> float:
 
 
 def _rise_decay_time_samples(amplitude: np.ndarray) -> tuple[float, float]:
-    """Return (rise_time_samples, decay_time_samples) using 10–90% of peak amplitude.
+    """Return (rise_time_samples, decay_time_samples) using 10-90% of peak amplitude.
 
-    Rise  = first crossing of 10% → first crossing of 90%, before the peak.
-    Decay = last crossing of 90% → first crossing of 10%, after the peak.
+    Rise  = first crossing of 10% to first crossing of 90%, before the peak.
+    Decay = last crossing of 90% to first crossing of 10%, after the peak.
     """
     y = np.asarray(amplitude, dtype=float).copy()
     if y.size < 3:
@@ -1605,7 +1623,7 @@ def _rise_decay_time_samples(amplitude: np.ndarray) -> tuple[float, float]:
     lo = 0.10 * peak_val
     hi = 0.90 * peak_val
 
-    # Rise: scan pre-peak for first 10% crossing → first 90% crossing
+    # Rise: scan pre-peak for first 10% crossing to first 90% crossing.
     rise_start: float = 0.0
     rise_end: float = float(peak_idx)
     for i in range(peak_idx):
@@ -1618,7 +1636,7 @@ def _rise_decay_time_samples(amplitude: np.ndarray) -> tuple[float, float]:
             break
     rise_samples = float(max(0.0, rise_end - rise_start))
 
-    # Decay: scan post-peak for last 90% crossing → first 10% crossing
+    # Decay: scan post-peak for last 90% crossing to first 10% crossing.
     decay_start: float = float(peak_idx)
     decay_end: float = float(y.size - 1)
     for i in range(y.size - 1, peak_idx - 1, -1):
@@ -1654,12 +1672,9 @@ def _trace_plateau_fwhm_ms(state: TraceCuration) -> float:
     if not np.any(m):
         return float("nan")
 
-    dt = np.diff(t)
-    dt = dt[np.isfinite(dt) & (dt > 0)]
-    if dt.size == 0:
+    sample_period_ms = _time_sample_period_ms(t, _trace_sampling_rate_hz(state))
+    if not np.isfinite(sample_period_ms) or sample_period_ms <= 0.0:
         return float("nan")
-    dt_med = float(np.median(dt))
-    scale = _time_to_ms_scale(t)
 
     widths_ms: List[float] = []
     for start, end in _contiguous_true_regions(m):
@@ -1668,7 +1683,7 @@ def _trace_plateau_fwhm_ms(state: TraceCuration) -> float:
         amp = y[start:end] - b[start:end]
         width_samples = _event_fwhm_samples(amp)
         if np.isfinite(width_samples):
-            widths_ms.append(float(width_samples * dt_med * scale))
+            widths_ms.append(float(width_samples * sample_period_ms))
 
     if not widths_ms:
         return float("nan")
@@ -1692,6 +1707,212 @@ def _trace_mean_amp_above_baseline(state: TraceCuration) -> float:
     if vals.size == 0:
         return float("nan")
     return float(np.mean(vals))
+
+
+def _interp_crossing_sample(y0: float, y1: float, level: float, i0: int, i1: int) -> float:
+    if not np.isfinite(y0) or not np.isfinite(y1) or y1 == y0:
+        return float("nan")
+    return float(i0 + ((float(level) - float(y0)) / (float(y1) - float(y0))) * float(i1 - i0))
+
+
+def _pre_peak_crossing(y: np.ndarray, level: float, start: int, peak: int) -> float:
+    for idx in range(int(peak) - 1, int(start) - 1, -1):
+        y0 = float(y[idx])
+        y1 = float(y[idx + 1])
+        if y0 <= level <= y1:
+            return _interp_crossing_sample(y0, y1, level, idx, idx + 1)
+    return float("nan")
+
+
+def _post_peak_crossing(y: np.ndarray, level: float, peak: int, stop: int) -> float:
+    for idx in range(int(peak), int(stop) - 1):
+        y0 = float(y[idx])
+        y1 = float(y[idx + 1])
+        if y0 >= level >= y1:
+            return _interp_crossing_sample(y0, y1, level, idx, idx + 1)
+    return float("nan")
+
+
+def _finite_spike_metric(spike: SpikeRecord, name: str) -> float:
+    try:
+        value = float(getattr(spike, name, float("nan")))
+    except (TypeError, ValueError):
+        return float("nan")
+    return value if np.isfinite(value) else float("nan")
+
+
+def _measure_spike_waveform_stats(state: TraceCuration, spike: SpikeRecord, half_window_ms: float = 5.0) -> Dict[str, float]:
+    cached = {
+        "rise_time_ms": _finite_spike_metric(spike, "rise_time_ms"),
+        "fwhm_ms": _finite_spike_metric(spike, "fwhm_ms"),
+        "return_to_baseline_time_ms": _finite_spike_metric(spike, "return_to_baseline_time_ms"),
+        "post_spike_level": _finite_spike_metric(spike, "post_spike_level"),
+    }
+
+    def _with_cached(computed: Dict[str, float]) -> Dict[str, float]:
+        out = dict(computed)
+        if cached["rise_time_ms"] >= 0.0:
+            out["rise_time_ms"] = cached["rise_time_ms"]
+        if cached["fwhm_ms"] > 0.0:
+            out["fwhm_ms"] = cached["fwhm_ms"]
+        if cached["return_to_baseline_time_ms"] >= 0.0:
+            out["return_to_baseline_time_ms"] = cached["return_to_baseline_time_ms"]
+        if np.isfinite(cached["post_spike_level"]):
+            out["post_spike_level"] = cached["post_spike_level"]
+        return out
+
+    nan_result = {
+        "rise_time_ms": float("nan"),
+        "fwhm_ms": float("nan"),
+        "return_to_baseline_time_ms": float("nan"),
+        "post_spike_level": float("nan"),
+    }
+
+    y = np.asarray(state.corrected, dtype=float)
+    baseline = np.asarray(state.baseline, dtype=float) if state.baseline is not None else np.zeros_like(y)
+    n = min(y.size, baseline.size)
+    if n <= 2:
+        return _with_cached(nan_result)
+
+    peak = int(spike.spike_index)
+    if peak <= 0 or peak >= n:
+        return _with_cached(nan_result)
+
+    fs = _trace_sampling_rate_hz(state)
+    window = max(1, int(round((float(half_window_ms) / 1000.0) * fs)))
+    start = max(0, peak - window)
+    stop = min(n, peak + window + 1)
+    amp = y[:n] - baseline[:n]
+    if stop - start < 3 or not np.all(np.isfinite(amp[start:stop])):
+        return _with_cached(nan_result)
+
+    peak_amp = float(amp[peak])
+    if not np.isfinite(peak_amp) or peak_amp <= 0.0:
+        return _with_cached(nan_result)
+
+    left = amp[start : peak + 1]
+    right = amp[peak:stop]
+    shoulder = max(float(np.min(left)), float(np.min(right)))
+    local_peak_amp = peak_amp - shoulder
+    if not np.isfinite(local_peak_amp) or local_peak_amp <= 0.0:
+        return _with_cached(nan_result)
+
+    lo = shoulder + (0.10 * local_peak_amp)
+    hi = shoulder + (0.90 * local_peak_amp)
+    half = shoulder + (0.50 * local_peak_amp)
+    sample_to_ms = 1000.0 / max(float(fs), 1e-9)
+
+    rise_10 = _pre_peak_crossing(amp, lo, start, peak)
+    rise_90 = _pre_peak_crossing(amp, hi, start, peak)
+    rise_time_ms = float((rise_90 - rise_10) * sample_to_ms) if np.isfinite(rise_10) and np.isfinite(rise_90) and rise_90 >= rise_10 else float("nan")
+
+    half_left = _pre_peak_crossing(amp, half, start, peak)
+    half_right = _post_peak_crossing(amp, half, peak, stop)
+    fwhm_ms = float((half_right - half_left) * sample_to_ms) if np.isfinite(half_left) and np.isfinite(half_right) and half_right >= half_left else float("nan")
+
+    return_cross = _post_peak_crossing(amp, lo, peak, stop)
+    return_to_baseline_time_ms = float((return_cross - float(peak)) * sample_to_ms) if np.isfinite(return_cross) and return_cross >= float(peak) else float("nan")
+
+    if np.isfinite(return_cross):
+        post_start = max(peak + 1, min(stop, int(np.ceil(return_cross))))
+    else:
+        post_start = min(stop, peak + max(1, int(round(0.001 * fs))))
+    post_vals = amp[post_start:stop]
+    post_vals = post_vals[np.isfinite(post_vals)]
+    post_spike_level = float(np.median(post_vals)) if post_vals.size > 0 else float("nan")
+
+    return _with_cached(
+        {
+            "rise_time_ms": rise_time_ms,
+            "fwhm_ms": fwhm_ms,
+            "return_to_baseline_time_ms": return_to_baseline_time_ms,
+            "post_spike_level": post_spike_level,
+        }
+    )
+
+
+def _spike_delta_f_over_f0(spike: SpikeRecord) -> float:
+    cached = _finite_spike_metric(spike, "delta_f_over_f0")
+    if np.isfinite(cached):
+        return cached
+    f0 = float(spike.baseline_at_spike)
+    if not np.isfinite(f0) or f0 == 0.0:
+        return float("nan")
+    return float(spike.amplitude_above_baseline / f0)
+
+
+def _build_spike_event_rows(trace_names: List[str], traces: Dict[str, TraceCuration]) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    for trace_name in sorted(trace_names):
+        state = traces.get(trace_name)
+        if state is None:
+            continue
+        spikes = sorted(state.spikes, key=lambda spike: spike.spike_index)
+        prev_index: Optional[int] = None
+        sample_period_ms = _time_sample_period_ms(np.asarray(state.time, dtype=float), _trace_sampling_rate_hz(state))
+        for idx, spike in enumerate(spikes, 1):
+            peak_time = float(spike.spike_time)
+            peak_index = int(spike.spike_index)
+            if prev_index is None or not np.isfinite(sample_period_ms) or sample_period_ms <= 0.0:
+                isi_ms = float("nan")
+                rate_hz = float("nan")
+            else:
+                isi_ms = float((peak_index - prev_index) * sample_period_ms)
+                rate_hz = float(1000.0 / isi_ms) if np.isfinite(isi_ms) and isi_ms > 0.0 else float("nan")
+            prev_index = peak_index
+
+            waveform = _measure_spike_waveform_stats(state, spike, half_window_ms=5.0)
+            rows.append(
+                {
+                    "trace_id": str(trace_name),
+                    "spike_id": f"S{idx:04d}",
+                    "peak_index": peak_index,
+                    "peak_time": peak_time,
+                    "amplitude": float(spike.amplitude_above_baseline),
+                    "delta_f_over_f0": _spike_delta_f_over_f0(spike),
+                    "snr": float(spike.snr),
+                    "rise_time_ms": waveform["rise_time_ms"],
+                    "fwhm_ms": waveform["fwhm_ms"],
+                    "return_to_baseline_time_ms": waveform["return_to_baseline_time_ms"],
+                    "post_spike_level": waveform["post_spike_level"],
+                    "isi_ms": isi_ms,
+                    "instantaneous_firing_rate_hz": rate_hz,
+                    "source": spike.source,
+                }
+            )
+    return rows
+
+
+def _build_trace_spike_summary_rows(trace_names: List[str], spike_event_rows: List[Dict[str, object]]) -> List[Dict[str, object]]:
+    events_df = pd.DataFrame(spike_event_rows)
+    metric_cols = [
+        "amplitude",
+        "delta_f_over_f0",
+        "snr",
+        "rise_time_ms",
+        "fwhm_ms",
+        "return_to_baseline_time_ms",
+        "post_spike_level",
+        "isi_ms",
+        "instantaneous_firing_rate_hz",
+    ]
+
+    rows: List[Dict[str, object]] = []
+    for trace_name in sorted(trace_names):
+        if not events_df.empty and "trace_id" in events_df.columns:
+            per = events_df[events_df["trace_id"] == str(trace_name)]
+        else:
+            per = pd.DataFrame()
+        row: Dict[str, object] = {
+            "trace_id": str(trace_name),
+            "spike_count": int(per.shape[0]),
+        }
+        for col in metric_cols:
+            vals = _finite_numeric_series(per, col)
+            row[f"mean_{col}"] = float(np.mean(vals)) if vals.size > 0 else float("nan")
+            row[f"median_{col}"] = float(np.median(vals)) if vals.size > 0 else float("nan")
+        rows.append(row)
+    return rows
 
 
 def _build_plateau_event_rows(trace_names: List[str], traces: Dict[str, TraceCuration]) -> List[Dict[str, object]]:
@@ -1720,35 +1941,29 @@ def _build_plateau_event_rows(trace_names: List[str], traces: Dict[str, TraceCur
         if not np.any(m):
             continue
 
-        dt = np.diff(t)
-        dt = dt[np.isfinite(dt) & (dt > 0)]
-        if dt.size == 0:
+        sample_period_ms = _time_sample_period_ms(t, _trace_sampling_rate_hz(state))
+        if not np.isfinite(sample_period_ms) or sample_period_ms <= 0.0:
             continue
-        dt_med = float(np.median(dt))
-        scale = _time_to_ms_scale(t)
-        t0 = float(t[0]) if t.size > 0 and np.isfinite(t[0]) else 0.0
 
         regions = _contiguous_true_regions(m)
         for idx, (start, end) in enumerate(regions, 1):
             if end <= start:
                 continue
 
-            sig = y[start:end]
             amp = y[start:end] - b[start:end]
-            sig_f = sig[np.isfinite(sig)]
             amp_f = amp[np.isfinite(amp)]
 
-            onset_time_ms = float((t[start] - t0) * scale) if np.isfinite(t[start]) else float("nan")
-            duration_ms = float((end - start) * dt_med * scale)
+            onset_time_ms = float(start * sample_period_ms)
+            duration_ms = float((end - start) * sample_period_ms)
 
             fwhm_samples = _event_fwhm_samples(amp)
-            fwhm_ms = float(fwhm_samples * dt_med * scale) if np.isfinite(fwhm_samples) else float("nan")
+            fwhm_ms = float(fwhm_samples * sample_period_ms) if np.isfinite(fwhm_samples) else float("nan")
 
             rise_s, decay_s = _rise_decay_time_samples(amp)
-            rise_time_ms = float(rise_s * dt_med * scale) if np.isfinite(rise_s) else float("nan")
-            decay_time_ms = float(decay_s * dt_med * scale) if np.isfinite(decay_s) else float("nan")
+            rise_time_ms = float(rise_s * sample_period_ms) if np.isfinite(rise_s) else float("nan")
+            decay_time_ms = float(decay_s * sample_period_ms) if np.isfinite(decay_s) else float("nan")
 
-            plateau_sd = float(np.std(sig_f, ddof=0)) if sig_f.size >= 2 else float("nan")
+            plateau_sd = float(np.std(amp_f, ddof=0)) if amp_f.size >= 2 else float("nan")
             mean_amp = float(np.mean(amp_f)) if amp_f.size > 0 else float("nan")
             peak_amp = float(np.max(amp_f)) if amp_f.size > 0 else float("nan")
 
@@ -1777,9 +1992,7 @@ def _build_plateau_event_rows(trace_names: List[str], traces: Dict[str, TraceCur
 
 
 def _trace_spike_means(state: TraceCuration) -> tuple[float, float]:
-    spikes = [s for s in state.spikes if s.status in ("accepted", "manual")]
-    if not spikes:
-        spikes = list(state.spikes)
+    spikes = list(state.spikes)
     if not spikes:
         return float("nan"), float("nan")
 
@@ -1822,6 +2035,8 @@ def _build_trace_summary_rows(
             per = pd.DataFrame()
 
         if per.empty:
+            state = traces.get(trace_name)
+            total_time_ms = _trace_total_time_ms(state.time, _trace_sampling_rate_hz(state)) if state is not None else float("nan")
             rows.append(
                 {
                     "trace_id": str(trace_name),
@@ -1837,7 +2052,10 @@ def _build_trace_summary_rows(
                     "median_peak_amp_above_baseline": float("nan"),
                     "mean_plateau_sd": float("nan"),
                     "median_plateau_sd": float("nan"),
+                    "total_plateau_time_ms": 0.0,
+                    "plateau_time_fraction": 0.0 if np.isfinite(total_time_ms) and total_time_ms > 0.0 else float("nan"),
                     "mean_inter_plateau_interval_ms": float("nan"),
+                    "median_inter_plateau_interval_ms": float("nan"),
                 }
             )
             continue
@@ -1863,8 +2081,18 @@ def _build_trace_summary_rows(
             gaps = np.diff(sorted_onsets)
             gaps = gaps[gaps > 0]
             mean_ipi = float(np.mean(gaps)) if gaps.size > 0 else float("nan")
+            median_ipi = float(np.median(gaps)) if gaps.size > 0 else float("nan")
         else:
             mean_ipi = float("nan")
+            median_ipi = float("nan")
+
+        total_plateau_time = float(np.nansum(duration_vals[np.isfinite(duration_vals)]))
+        state = traces.get(trace_name)
+        total_time_ms = _trace_total_time_ms(state.time, _trace_sampling_rate_hz(state)) if state is not None else float("nan")
+        if np.isfinite(total_time_ms) and total_time_ms > 0.0:
+            plateau_fraction = float(total_plateau_time / total_time_ms)
+        else:
+            plateau_fraction = float("nan")
 
         rows.append(
             {
@@ -1881,10 +2109,196 @@ def _build_trace_summary_rows(
                 "median_peak_amp_above_baseline": med_peak,
                 "mean_plateau_sd": mean_sd,
                 "median_plateau_sd": med_sd,
+                "total_plateau_time_ms": total_plateau_time,
+                "plateau_time_fraction": plateau_fraction,
                 "mean_inter_plateau_interval_ms": mean_ipi,
+                "median_inter_plateau_interval_ms": median_ipi,
             }
         )
     return rows
+
+
+def _add_trace_qc_flags(trace_df: pd.DataFrame) -> pd.DataFrame:
+    out = trace_df.copy()
+    notes: List[List[str]] = [[] for _ in range(len(out))]
+
+    if "plateau_count" in out.columns:
+        counts = pd.to_numeric(out["plateau_count"], errors="coerce").to_numpy(dtype=float)
+        for i, value in enumerate(counts):
+            if np.isfinite(value) and value <= 0.0:
+                notes[i].append("no_plateaus")
+
+    for col, label in QC_TRACE_METRICS.items():
+        if col not in out.columns:
+            continue
+        vals = pd.to_numeric(out[col], errors="coerce").to_numpy(dtype=float)
+        for i, flagged in enumerate(_robust_high_outlier_mask(vals)):
+            if flagged:
+                notes[i].append(f"high_{label.lower().replace(' ', '_')}")
+
+    out["qc_status"] = ["review" if row_notes else "ok" for row_notes in notes]
+    out["qc_notes"] = ["; ".join(row_notes) for row_notes in notes]
+    return out
+
+
+def _build_all_trace_summary_row(events_df: pd.DataFrame) -> Dict[str, object]:
+    def _col_vals_all(col: str) -> np.ndarray:
+        if col not in events_df.columns:
+            return np.array([], dtype=float)
+        return pd.to_numeric(events_df[col], errors="coerce").to_numpy(dtype=float)
+
+    def _agg(arr: np.ndarray) -> tuple[float, float]:
+        arr = arr[np.isfinite(arr)]
+        if arr.size == 0:
+            return float("nan"), float("nan")
+        return float(np.mean(arr)), float(np.median(arr))
+
+    pooled_gaps: List[float] = []
+    if "trace_id" in events_df.columns and "onset_time_ms" in events_df.columns:
+        for _trace_id, per_events in events_df.groupby("trace_id", sort=False):
+            per_onsets = pd.to_numeric(per_events["onset_time_ms"], errors="coerce").to_numpy(dtype=float)
+            per_onsets = np.sort(per_onsets[np.isfinite(per_onsets)])
+            if per_onsets.size > 1:
+                gaps = np.diff(per_onsets)
+                pooled_gaps.extend([float(gap) for gap in gaps if np.isfinite(gap) and gap > 0.0])
+    if pooled_gaps:
+        pooled_gap_arr = np.asarray(pooled_gaps, dtype=float)
+        mean_ipi_all = float(np.mean(pooled_gap_arr))
+        median_ipi_all = float(np.median(pooled_gap_arr))
+    else:
+        mean_ipi_all = float("nan")
+        median_ipi_all = float("nan")
+
+    m_dur, med_dur = _agg(_col_vals_all("duration_ms"))
+    m_fwhm, med_fwhm = _agg(_col_vals_all("fwhm_ms"))
+    m_rise, med_rise = _agg(_col_vals_all("rise_time_ms"))
+    m_peak, med_peak = _agg(_col_vals_all("peak_amp_above_baseline"))
+    m_sd, med_sd = _agg(_col_vals_all("plateau_sd"))
+    total_plateau = _col_vals_all("duration_ms")
+    total_plateau_all = float(np.nansum(total_plateau[np.isfinite(total_plateau)]))
+
+    return {
+        "trace_id": "ALL",
+        "plateau_count": int(events_df.shape[0]),
+        "first_onset_ms": float("nan"),
+        "mean_duration_ms": m_dur,
+        "median_duration_ms": med_dur,
+        "mean_fwhm_ms": m_fwhm,
+        "median_fwhm_ms": med_fwhm,
+        "mean_rise_time_ms": m_rise,
+        "median_rise_time_ms": med_rise,
+        "mean_peak_amp_above_baseline": m_peak,
+        "median_peak_amp_above_baseline": med_peak,
+        "mean_plateau_sd": m_sd,
+        "median_plateau_sd": med_sd,
+        "total_plateau_time_ms": total_plateau_all,
+        "plateau_time_fraction": float("nan"),
+        "mean_inter_plateau_interval_ms": mean_ipi_all,
+        "median_inter_plateau_interval_ms": median_ipi_all,
+    }
+
+
+def _ordered_dataframe(rows: List[Dict[str, object]], preferred_columns: List[str]) -> pd.DataFrame:
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame(columns=preferred_columns)
+    ordered = [col for col in preferred_columns if col in df.columns]
+    tail = [col for col in df.columns if col not in ordered]
+    return df[ordered + tail]
+
+
+def _pad_numeric(values: np.ndarray, size: int) -> np.ndarray:
+    arr = np.asarray(values, dtype=float).reshape(-1)
+    if arr.size == size:
+        return arr
+    out = np.full(size, np.nan, dtype=float)
+    n = min(size, arr.size)
+    if n > 0:
+        out[:n] = arr[:n]
+    return out
+
+
+def _build_corrected_traces_dataframe(trace_names: List[str], traces: Dict[str, TraceCuration]) -> pd.DataFrame:
+    available = [(str(name), traces[name]) for name in trace_names if name in traces]
+    if not available:
+        return pd.DataFrame(columns=["time"])
+
+    max_len = max(
+        max(np.asarray(state.time, dtype=float).size, np.asarray(state.corrected, dtype=float).size)
+        for _name, state in available
+    )
+    first_time = np.asarray(available[0][1].time, dtype=float)
+    data: Dict[str, np.ndarray] = {"time": _pad_numeric(first_time, max_len)}
+    for trace_name, state in available:
+        data[trace_name] = _pad_numeric(np.asarray(state.corrected, dtype=float), max_len)
+    return pd.DataFrame(data)
+
+
+def _build_export_dataframes(trace_names: List[str], traces: Dict[str, TraceCuration]) -> Dict[str, pd.DataFrame]:
+    event_rows = _build_plateau_event_rows(trace_names, traces)
+    events_df = _ordered_dataframe(event_rows, PLATEAU_EVENT_COLUMNS)
+    events_df = _add_event_qc_flags(events_df)
+    if {"trace_id", "plateau_id"}.issubset(events_df.columns):
+        events_df = events_df.sort_values(["trace_id", "plateau_id"], kind="mergesort").reset_index(drop=True)
+
+    trace_rows = _build_trace_summary_rows(trace_names, traces, event_rows=event_rows)
+    trace_df = _ordered_dataframe(trace_rows, TRACE_SUMMARY_COLUMNS)
+    if not events_df.empty:
+        trace_df = pd.concat([trace_df, pd.DataFrame([_build_all_trace_summary_row(events_df)])], ignore_index=True)
+    trace_df = _ordered_dataframe(trace_df.to_dict("records"), TRACE_SUMMARY_COLUMNS)
+
+    qc_trace_df = _add_trace_qc_flags(trace_df)
+    qc_columns = TRACE_SUMMARY_COLUMNS + ["qc_status", "qc_notes"]
+    qc_trace_df = _ordered_dataframe(qc_trace_df.to_dict("records"), qc_columns)
+
+    spike_event_rows = _build_spike_event_rows(trace_names, traces)
+    spike_event_df = _ordered_dataframe(spike_event_rows, SPIKE_EVENT_COLUMNS)
+
+    spike_summary_rows = _build_trace_spike_summary_rows(trace_names, spike_event_rows)
+    spike_summary_df = pd.DataFrame(spike_summary_rows)
+
+    return {
+        "plateau_events": events_df,
+        "trace_summary": trace_df,
+        "trace_qc": qc_trace_df,
+        "spike_events": spike_event_df,
+        "spike_summary": spike_summary_df,
+        "corrected_traces": _build_corrected_traces_dataframe(trace_names, traces),
+    }
+
+
+def _prepare_export_layout(out_dir: Path) -> Dict[str, Path]:
+    layout = {
+        "root": out_dir,
+        "tables": out_dir / EXPORT_TABLES_DIR,
+        "reports": out_dir / EXPORT_REPORTS_DIR,
+        "reload": out_dir / EXPORT_RELOAD_DIR,
+    }
+    for path in layout.values():
+        path.mkdir(parents=True, exist_ok=True)
+    return layout
+
+
+def _find_export_file(folder_path: Path, filename: str) -> Optional[Path]:
+    folder = Path(folder_path)
+    candidate_roots = [folder]
+    if folder.name in {EXPORT_TABLES_DIR, EXPORT_REPORTS_DIR, EXPORT_RELOAD_DIR}:
+        candidate_roots.append(folder.parent)
+
+    seen: set[Path] = set()
+    for root in candidate_roots:
+        for candidate in (
+            root / filename,
+            root / EXPORT_RELOAD_DIR / filename,
+            root / EXPORT_TABLES_DIR / filename,
+            root / EXPORT_REPORTS_DIR / filename,
+        ):
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            if candidate.exists():
+                return candidate
+    return None
 
 
 def _validate_required_columns(df: pd.DataFrame, required_cols: List[str]) -> None:
@@ -1893,96 +2307,388 @@ def _validate_required_columns(df: pd.DataFrame, required_cols: List[str]) -> No
         raise ValueError(f"Missing required columns: {missing}")
 
 
-def _save_trace_summary_figure(csv_path: Path, png_path: Path, pdf_path: Optional[Path] = None) -> None:
-    cfg = TRACE_SUMMARY_CONFIG
-    # All summary statistics to display as bar charts
-    _SUMMARY_STATS = [
-        ("plateau_count", "Plateau count", "count"),
-        ("first_onset_ms", "Latency to first plateau", "ms"),
-        ("mean_duration_ms", "Mean plateau duration", "ms"),
-        ("mean_fwhm_ms", "Mean FWHM", "ms"),
-        ("mean_rise_time_ms", "Mean rise time", "ms"),
-        ("mean_peak_amp_above_baseline", "Mean peak amplitude", "a.u."),
-        ("mean_plateau_sd", "Mean plateau SD", "a.u."),
-        ("mean_inter_plateau_interval_ms", "Mean inter-plateau interval", "ms"),
-    ]
+def _short_trace_label(name: object, max_len: int = 26) -> str:
+    text = str(name)
+    if len(text) <= max_len:
+        return text
+    return f"{text[: max_len - 1]}..."
 
-    df = pd.read_csv(csv_path)
-    # Exclude the ALL-traces summary row from individual bar charts
+
+def _format_report_value(value: object, digits: int = 2) -> str:
+    try:
+        val = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if not np.isfinite(val):
+        return ""
+    if abs(val) >= 1000.0:
+        return f"{val:.0f}"
+    if abs(val) >= 100.0:
+        return f"{val:.1f}"
+    return f"{val:.{digits}f}"
+
+
+def _save_trace_summary_figure(csv_path: Path, png_path: Path, pdf_path: Optional[Path] = None) -> None:
+    """Backward-compatible wrapper for older callers."""
+    trace_df = pd.read_csv(csv_path)
+    _save_qc_summary_report(trace_df=trace_df, events_df=pd.DataFrame(), png_path=png_path, pdf_path=pdf_path)
+
+
+def _save_qc_summary_report(
+    trace_df: pd.DataFrame,
+    events_df: pd.DataFrame,
+    png_path: Path,
+    pdf_path: Optional[Path] = None,
+) -> None:
+    cfg = TRACE_SUMMARY_CONFIG
+    df = trace_df.copy()
     if "trace_id" in df.columns:
         df = df[df["trace_id"] != "ALL"].copy()
-    df = df.sort_values("trace_id", kind="mergesort").reset_index(drop=True)
+        df = df.sort_values("trace_id", kind="mergesort").reset_index(drop=True)
+    events = events_df.copy()
 
-    # Local import keeps GUI startup light and makes plotting dependency explicit.
     import matplotlib.pyplot as plt
+    from matplotlib.colors import LinearSegmentedColormap
 
     plt.style.use("default")
-    n_stats = len(_SUMMARY_STATS)
-    n_cols = 4
-    n_rows = (n_stats + n_cols - 1) // n_cols  # ceil(n_stats / n_cols)
-    
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(16, 4 * n_rows), constrained_layout=True)
+    fig = plt.figure(figsize=(17, 14), constrained_layout=True)
     fig.patch.set_facecolor("white")
-    
-    # Flatten axes for iteration
-    if n_rows == 1 and n_cols == 1:
-        axes = [[axes]]
-    elif n_rows == 1 or n_cols == 1:
-        axes = axes.reshape((n_rows, n_cols))
+    grid = fig.add_gridspec(4, 2, height_ratios=[1.35, 1.45, 1.35, 1.25], width_ratios=[1.15, 1.0])
+    ax_table = fig.add_subplot(grid[0, :])
+    ax_heat = fig.add_subplot(grid[1, :])
+    ax_dist = fig.add_subplot(grid[2, :])
+    ax_count = fig.add_subplot(grid[3, 0])
+    ax_fraction = fig.add_subplot(grid[3, 1])
+    fig.suptitle("Plateau Detection QC Summary", fontsize=18, fontweight="bold")
+
+    ax_table.axis("off")
+    table_cols = [
+        ("trace_id", "Trace"),
+        ("plateau_count", "N"),
+        ("first_onset_ms", "First onset ms"),
+        ("median_duration_ms", "Median duration ms"),
+        ("median_fwhm_ms", "Median FWHM ms"),
+        ("median_rise_time_ms", "Median rise ms"),
+        ("median_peak_amp_above_baseline", "Median peak a.u."),
+        ("median_plateau_sd", "Median plateau SD a.u."),
+        ("qc_status", "QC"),
+        ("qc_notes", "Notes"),
+    ]
+    display = df.head(18).copy()
+    table_data: List[List[str]] = []
+    for _, row in display.iterrows():
+        table_row: List[str] = []
+        for col, _label in table_cols:
+            if col == "trace_id":
+                table_row.append(_short_trace_label(row.get(col, ""), max_len=22))
+            elif col in {"qc_status", "qc_notes"}:
+                max_len = 36 if col == "qc_notes" else 8
+                table_row.append(_short_trace_label(row.get(col, ""), max_len=max_len))
+            else:
+                table_row.append(_format_report_value(row.get(col, "")))
+        table_data.append(table_row)
+    if table_data:
+        col_widths = [0.17, 0.045, 0.09, 0.10, 0.09, 0.085, 0.105, 0.12, 0.07, 0.125]
+        table = ax_table.table(
+            cellText=table_data,
+            colLabels=[label for _col, label in table_cols],
+            loc="center",
+            cellLoc="center",
+            colLoc="center",
+            colWidths=col_widths,
+        )
+        table.auto_set_font_size(False)
+        table.set_fontsize(7.4)
+        table.scale(1.0, 1.35)
+        for (row_idx, col_idx), cell in table.get_celld().items():
+            cell.set_edgecolor("#d1d5db")
+            if row_idx == 0:
+                cell.set_facecolor("#e5e7eb")
+                cell.set_text_props(weight="bold", color="#111827")
+            elif col_idx == len(table_cols) - 2 and cell.get_text().get_text() == "review":
+                cell.set_facecolor("#fee2e2")
+                cell.set_text_props(weight="bold", color="#991b1b")
     else:
-        axes = axes
+        ax_table.text(0.5, 0.5, "No traces available", ha="center", va="center", fontsize=12, color="#6b7280")
+    if len(df) > len(display):
+        ax_table.text(0.99, 0.02, f"Showing first {len(display)} of {len(df)} traces", ha="right", va="bottom", transform=ax_table.transAxes, fontsize=8, color="#6b7280")
 
-    for idx, (col, title, unit) in enumerate(_SUMMARY_STATS):
-        row = idx // n_cols
-        col_idx = idx % n_cols
-        ax = axes[row, col_idx] if n_rows > 1 else axes[0, col_idx]
-        
+    heat_cols = [
+        ("plateau_count", "Count"),
+        ("first_onset_ms", "First onset"),
+        ("median_duration_ms", "Duration"),
+        ("median_fwhm_ms", "FWHM"),
+        ("median_rise_time_ms", "Rise"),
+        ("median_peak_amp_above_baseline", "Peak amp"),
+        ("median_plateau_sd", "Plateau SD"),
+        ("plateau_time_fraction", "Time fraction"),
+    ]
+    heat = np.full((len(df), len(heat_cols)), np.nan, dtype=float)
+    for col_idx, (col, _label) in enumerate(heat_cols):
         if col not in df.columns:
-            ax.set_title(title, fontsize=11, fontweight="bold")
-            ax.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax.transAxes, color="#9ca3af")
-            ax.axis("off")
             continue
-
         vals = pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=float)
-        trace_names = df["trace_id"].to_numpy() if "trace_id" in df.columns else [f"T{i}" for i in range(len(vals))]
-        
-        # Keep only finite values and corresponding trace names
-        finite_mask = np.isfinite(vals)
-        vals = vals[finite_mask]
-        trace_names = trace_names[finite_mask]
+        finite = vals[np.isfinite(vals)]
+        if finite.size < 2:
+            continue
+        median = float(np.median(finite))
+        mad = float(np.median(np.abs(finite - median)))
+        if mad > 0.0 and np.isfinite(mad):
+            heat[:, col_idx] = np.clip(0.6745 * (vals - median) / mad, -4.0, 4.0)
+        else:
+            span = float(np.nanmax(finite) - np.nanmin(finite))
+            if span > 0.0:
+                heat[:, col_idx] = ((vals - float(np.nanmin(finite))) / span) * 2.0 - 1.0
+            else:
+                heat[:, col_idx] = 0.0
+    cmap = LinearSegmentedColormap.from_list("qc_heat", ["#2563eb", "#f8fafc", "#dc2626"])
+    shown_heat = heat[:30, :]
+    image = ax_heat.imshow(shown_heat, aspect="auto", interpolation="nearest", cmap=cmap, vmin=-4.0, vmax=4.0)
+    ax_heat.set_title("Trace metric heatmap (robust z-score; red = unusually high)", fontsize=11, fontweight="bold")
+    ax_heat.set_xticks(range(len(heat_cols)))
+    ax_heat.set_xticklabels([label for _col, label in heat_cols], rotation=30, ha="right", fontsize=9)
+    labels = [_short_trace_label(name, max_len=34) for name in df.get("trace_id", pd.Series(dtype=object)).to_numpy()[:30]]
+    ax_heat.set_yticks(range(len(labels)))
+    ax_heat.set_yticklabels(labels, fontsize=8)
+    for spine in ax_heat.spines.values():
+        spine.set_visible(False)
+    if shown_heat.size > 0:
+        fig.colorbar(image, ax=ax_heat, shrink=0.75, label="robust z")
 
-        ax.set_facecolor("white")
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
-        ax.grid(axis="y", color="#e5e7eb", linewidth=0.8)
-        ax.grid(axis="x", visible=False)
+    dist_metrics = [
+        ("duration_ms", "Duration (ms)"),
+        ("fwhm_ms", "FWHM (ms)"),
+        ("peak_amp_above_baseline", "Peak amplitude (a.u.)"),
+        ("plateau_sd", "Plateau SD (a.u.)"),
+    ]
+    ax_dist.set_title("Event distributions (each point is one plateau)", fontsize=11, fontweight="bold")
+    plotted = False
+    rng = np.random.default_rng(12345)
+    for pos, (col, label) in enumerate(dist_metrics, 1):
+        vals = _finite_numeric_series(events, col)
+        if vals.size == 0:
+            continue
+        plotted = True
+        jitter = rng.uniform(-0.10, 0.10, size=vals.size)
+        ax_dist.scatter(np.full(vals.size, pos) + jitter, vals, s=18, alpha=0.65, color="#334155", edgecolors="none")
+        ax_dist.boxplot(vals, positions=[pos], widths=0.35, showfliers=False, patch_artist=True, boxprops={"facecolor": "#dbeafe", "edgecolor": "#1d4ed8"}, medianprops={"color": "#111827", "linewidth": 1.4})
+    ax_dist.set_xticks(range(1, len(dist_metrics) + 1))
+    ax_dist.set_xticklabels([label for _col, label in dist_metrics], rotation=15, ha="right", fontsize=9)
+    ax_dist.grid(axis="y", color="#e5e7eb")
+    ax_dist.spines["top"].set_visible(False)
+    ax_dist.spines["right"].set_visible(False)
+    if not plotted:
+        ax_dist.text(0.5, 0.5, "No plateau events available", ha="center", va="center", transform=ax_dist.transAxes, color="#6b7280")
 
-        if vals.size > 0:
-            # Create bar chart
-            bars = ax.bar(range(vals.size), vals, color="#3b82f6", alpha=0.8, edgecolor="#1e40af", linewidth=1.2)
-            
-            # Color bars with slight gradient
-            for i, bar in enumerate(bars):
-                bar.set_color(plt.cm.Blues(0.5 + 0.3 * (i / max(1, vals.size - 1))))
-            
-            ax.set_xticks(range(vals.size))
-            ax.set_xticklabels(trace_names, rotation=45, ha="right", fontsize=9)
-        
-        ylabel = f"{col} ({unit})" if unit else col
-        ax.set_title(title, fontsize=11, fontweight="bold")
-        ax.set_ylabel(ylabel, fontsize=10)
+    trace_labels = [_short_trace_label(name, max_len=22) for name in df.get("trace_id", pd.Series(dtype=object)).to_numpy()]
+    y_pos = np.arange(len(df))
+    count_vals = pd.to_numeric(df.get("plateau_count", pd.Series(dtype=float)), errors="coerce").to_numpy(dtype=float)
+    frac_vals = pd.to_numeric(df.get("plateau_time_fraction", pd.Series(dtype=float)), errors="coerce").to_numpy(dtype=float)
+    status = df.get("qc_status", pd.Series(["ok"] * len(df))).astype(str).to_numpy()
+    colors = np.where(status == "review", "#dc2626", "#2563eb")
 
-    # Hide extra subplot panels
-    for idx in range(n_stats, n_rows * n_cols):
-        row = idx // n_cols
-        col_idx = idx % n_cols
-        ax = axes[row, col_idx] if n_rows > 1 else axes[0, col_idx]
-        ax.axis("off")
+    ax_count.barh(y_pos, np.nan_to_num(count_vals, nan=0.0), color=colors, alpha=0.85)
+    ax_count.set_title("Plateau count by trace", fontsize=11, fontweight="bold")
+    ax_count.set_yticks(y_pos)
+    ax_count.set_yticklabels(trace_labels, fontsize=8)
+    ax_count.invert_yaxis()
+    ax_count.grid(axis="x", color="#e5e7eb")
+    ax_count.spines["top"].set_visible(False)
+    ax_count.spines["right"].set_visible(False)
 
-    cfg = TRACE_SUMMARY_CONFIG
+    ax_fraction.barh(y_pos, np.nan_to_num(frac_vals, nan=0.0), color=colors, alpha=0.85)
+    ax_fraction.set_title("Total plateau time fraction", fontsize=11, fontweight="bold")
+    ax_fraction.set_yticks(y_pos)
+    ax_fraction.set_yticklabels([])
+    ax_fraction.invert_yaxis()
+    ax_fraction.grid(axis="x", color="#e5e7eb")
+    ax_fraction.spines["top"].set_visible(False)
+    ax_fraction.spines["right"].set_visible(False)
+    ax_fraction.set_xlabel("fraction of trace")
+
+    fig.text(0.01, 0.01, "Plateau SD is the standard deviation of baseline-subtracted amplitude samples within detected plateau regions.", fontsize=8, color="#6b7280")
     fig.savefig(png_path, dpi=int(cfg["png_dpi"]), facecolor="white", bbox_inches="tight")
     if pdf_path is not None:
         fig.savefig(pdf_path, dpi=300, facecolor="white", bbox_inches="tight")
+    plt.close(fig)
+
+
+def _plot_distribution_panel(ax: object, df: pd.DataFrame, metrics: List[Tuple[str, str]], title: str) -> None:
+    import matplotlib.pyplot as plt
+
+    ax.set_title(title, fontsize=11, fontweight="bold")
+    plotted = False
+    rng = np.random.default_rng(24680)
+    for pos, (col, label) in enumerate(metrics, 1):
+        vals = _finite_numeric_series(df, col)
+        if vals.size == 0:
+            continue
+        plotted = True
+        jitter = rng.uniform(-0.10, 0.10, size=vals.size)
+        ax.scatter(np.full(vals.size, pos) + jitter, vals, s=18, alpha=0.65, color="#475569", edgecolors="none")
+        ax.boxplot(
+            vals,
+            positions=[pos],
+            widths=0.35,
+            showfliers=False,
+            patch_artist=True,
+            boxprops={"facecolor": "#dcfce7", "edgecolor": "#15803d"},
+            medianprops={"color": "#111827", "linewidth": 1.4},
+        )
+    ax.set_xticks(range(1, len(metrics) + 1))
+    ax.set_xticklabels([label for _col, label in metrics], rotation=18, ha="right", fontsize=9)
+    ax.grid(axis="y", color="#e5e7eb")
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    if not plotted:
+        ax.text(0.5, 0.5, "No spike values available", ha="center", va="center", transform=ax.transAxes, color="#6b7280")
+
+
+def _save_spike_statistics_summary(
+    spike_summary_df: pd.DataFrame,
+    spike_events_df: pd.DataFrame,
+    png_path: Path,
+) -> None:
+    cfg = TRACE_SUMMARY_CONFIG
+    summary = spike_summary_df.copy()
+    events = spike_events_df.copy()
+    if "trace_id" in summary.columns:
+        summary = summary.sort_values("trace_id", kind="mergesort").reset_index(drop=True)
+
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import LinearSegmentedColormap
+
+    plt.style.use("default")
+    fig = plt.figure(figsize=(17, 12), constrained_layout=True)
+    fig.patch.set_facecolor("white")
+    grid = fig.add_gridspec(3, 2, height_ratios=[0.75, 1.35, 1.35], width_ratios=[1.05, 1.0])
+    ax_cards = fig.add_subplot(grid[0, :])
+    ax_count = fig.add_subplot(grid[1, 0])
+    ax_heat = fig.add_subplot(grid[1, 1])
+    ax_dist = fig.add_subplot(grid[2, 0])
+    ax_timing = fig.add_subplot(grid[2, 1])
+    fig.suptitle("Spike Statistics Summary", fontsize=18, fontweight="bold")
+
+    trace_count = int(summary.shape[0]) if "trace_id" in summary.columns else int(events.get("trace_id", pd.Series(dtype=object)).nunique())
+    total_spikes = int(events.shape[0])
+    if "spike_count" in summary.columns:
+        spike_counts = pd.to_numeric(summary["spike_count"], errors="coerce").to_numpy(dtype=float)
+        traces_with_spikes = int(np.count_nonzero(np.nan_to_num(spike_counts, nan=0.0) > 0.0))
+    else:
+        traces_with_spikes = int(events.get("trace_id", pd.Series(dtype=object)).nunique())
+
+    def _median_label(col: str, suffix: str = "") -> str:
+        vals = _finite_numeric_series(events, col)
+        if vals.size == 0:
+            return "n/a"
+        return f"{_format_report_value(float(np.median(vals)))}{suffix}"
+
+    cards = [
+        ("Traces", str(trace_count)),
+        ("Total spikes", str(total_spikes)),
+        ("Traces with spikes", str(traces_with_spikes)),
+        ("Median amplitude", _median_label("amplitude")),
+        ("Median FWHM", _median_label("fwhm_ms", " ms")),
+        ("Median ISI", _median_label("isi_ms", " ms")),
+        ("Median rate", _median_label("instantaneous_firing_rate_hz", " Hz")),
+    ]
+    ax_cards.axis("off")
+    for i, (label, value) in enumerate(cards):
+        x = (i + 0.5) / len(cards)
+        ax_cards.text(x, 0.62, value, ha="center", va="center", fontsize=16, fontweight="bold", color="#111827", transform=ax_cards.transAxes)
+        ax_cards.text(x, 0.30, label, ha="center", va="center", fontsize=9, color="#475569", transform=ax_cards.transAxes)
+
+    if "trace_id" in summary.columns and "spike_count" in summary.columns and not summary.empty:
+        count_df = summary[["trace_id", "spike_count"]].copy()
+        count_df["spike_count"] = pd.to_numeric(count_df["spike_count"], errors="coerce").fillna(0.0)
+    elif "trace_id" in events.columns and not events.empty:
+        count_df = events.groupby("trace_id").size().reset_index(name="spike_count")
+    else:
+        count_df = pd.DataFrame(columns=["trace_id", "spike_count"])
+    count_df = count_df.sort_values(["spike_count", "trace_id"], ascending=[True, True], kind="mergesort").tail(24)
+    if not count_df.empty:
+        labels = [_short_trace_label(name, max_len=24) for name in count_df["trace_id"].to_numpy()]
+        y_pos = np.arange(len(count_df))
+        ax_count.barh(y_pos, count_df["spike_count"].to_numpy(dtype=float), color="#2563eb", alpha=0.85)
+        ax_count.set_yticks(y_pos)
+        ax_count.set_yticklabels(labels, fontsize=8)
+        ax_count.set_xlabel("spikes")
+    else:
+        ax_count.text(0.5, 0.5, "No spikes available", ha="center", va="center", transform=ax_count.transAxes, color="#6b7280")
+    ax_count.set_title("Spike count by trace", fontsize=11, fontweight="bold")
+    ax_count.grid(axis="x", color="#e5e7eb")
+    ax_count.spines["top"].set_visible(False)
+    ax_count.spines["right"].set_visible(False)
+
+    heat_cols = [
+        ("spike_count", "Count"),
+        ("median_amplitude", "Amplitude"),
+        ("median_delta_f_over_f0", "Delta F/F0"),
+        ("median_snr", "SNR"),
+        ("median_fwhm_ms", "FWHM"),
+        ("median_isi_ms", "ISI"),
+        ("median_instantaneous_firing_rate_hz", "Rate"),
+    ]
+    heat_df = summary.head(30).copy()
+    heat = np.full((len(heat_df), len(heat_cols)), np.nan, dtype=float)
+    for col_idx, (col, _label) in enumerate(heat_cols):
+        if col not in heat_df.columns:
+            continue
+        vals = pd.to_numeric(heat_df[col], errors="coerce").to_numpy(dtype=float)
+        finite = vals[np.isfinite(vals)]
+        if finite.size == 0:
+            continue
+        if finite.size < 2:
+            heat[np.isfinite(vals), col_idx] = 0.0
+            continue
+        median = float(np.median(finite))
+        mad = float(np.median(np.abs(finite - median)))
+        if mad > 0.0 and np.isfinite(mad):
+            heat[:, col_idx] = np.clip(0.6745 * (vals - median) / mad, -4.0, 4.0)
+        else:
+            span = float(np.nanmax(finite) - np.nanmin(finite))
+            heat[:, col_idx] = ((vals - float(np.nanmin(finite))) / span) * 2.0 - 1.0 if span > 0.0 else 0.0
+    if heat.size > 0 and heat.shape[0] > 0:
+        cmap = LinearSegmentedColormap.from_list("spike_heat", ["#2563eb", "#f8fafc", "#dc2626"])
+        image = ax_heat.imshow(heat, aspect="auto", interpolation="nearest", cmap=cmap, vmin=-4.0, vmax=4.0)
+        ax_heat.set_xticks(range(len(heat_cols)))
+        ax_heat.set_xticklabels([label for _col, label in heat_cols], rotation=30, ha="right", fontsize=9)
+        labels = [_short_trace_label(name, max_len=28) for name in heat_df.get("trace_id", pd.Series(dtype=object)).to_numpy()]
+        ax_heat.set_yticks(range(len(labels)))
+        ax_heat.set_yticklabels(labels, fontsize=8)
+        fig.colorbar(image, ax=ax_heat, shrink=0.74, label="robust z")
+    else:
+        ax_heat.text(0.5, 0.5, "No trace summary available", ha="center", va="center", transform=ax_heat.transAxes, color="#6b7280")
+    ax_heat.set_title("Per-trace spike metric heatmap", fontsize=11, fontweight="bold")
+    for spine in ax_heat.spines.values():
+        spine.set_visible(False)
+
+    _plot_distribution_panel(
+        ax_dist,
+        events,
+        [
+            ("amplitude", "Amplitude"),
+            ("delta_f_over_f0", "Delta F/F0"),
+            ("snr", "SNR"),
+            ("fwhm_ms", "FWHM ms"),
+        ],
+        "Spike metric distributions",
+    )
+    _plot_distribution_panel(
+        ax_timing,
+        events,
+        [
+            ("isi_ms", "ISI ms"),
+            ("instantaneous_firing_rate_hz", "Rate Hz"),
+            ("rise_time_ms", "Rise ms"),
+            ("return_to_baseline_time_ms", "Return ms"),
+        ],
+        "ISI, rate, and timing distributions",
+    )
+
+    fig.text(0.01, 0.01, "ISI and firing rate are computed from spike-index distance and trace sampling rate.", fontsize=8, color="#6b7280")
+    png_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(png_path, dpi=int(cfg["png_dpi"]), facecolor="white", bbox_inches="tight")
     plt.close(fig)
 
 
@@ -2004,13 +2710,237 @@ def _safe_excel_sheet_name(name: str, used_names: set[str]) -> str:
     return candidate
 
 
-STATUS_ROW_COLORS = {
-    "pending": QColor("#fff4cc"),
-    "accepted": QColor("#dcfce7"),
-    "rejected": QColor("#fee2e2"),
-    "manual": QColor("#dbeafe"),
-    "deleted": QColor("#e5e7eb"),
-}
+def _spike_record_from_event_stats_row(row: pd.Series, trace_name: str) -> SpikeRecord:
+    def _num(key: str, default: float = float("nan")) -> float:
+        return float(pd.to_numeric(row.get(key, default), errors="coerce"))
+
+    peak_index = int(_num("peak_index", 0.0))
+    amplitude = _num("amplitude", 0.0)
+    snr = _num("snr", 0.0)
+    dff = _num("delta_f_over_f0")
+    baseline = float(amplitude / dff) if np.isfinite(amplitude) and np.isfinite(dff) and dff != 0.0 else 0.0
+    peak_value = float(baseline + amplitude) if np.isfinite(baseline) else float(amplitude)
+    return SpikeRecord(
+        trace_name=trace_name,
+        candidate_index=peak_index,
+        spike_index=peak_index,
+        spike_time=_num("peak_time", 0.0),
+        spike_amplitude_raw_or_corrected=peak_value,
+        baseline_at_spike=baseline,
+        amplitude_above_baseline=amplitude,
+        prominence=0.0,
+        width=1.0,
+        local_noise_estimate=float(amplitude / snr) if np.isfinite(amplitude) and np.isfinite(snr) and snr != 0.0 else 0.0,
+        snr=snr,
+        detection_threshold_used=0.0,
+        fwhm_ms=_num("fwhm_ms"),
+        delta_f_over_f0=dff,
+        rise_time_ms=_num("rise_time_ms"),
+        return_to_baseline_time_ms=_num("return_to_baseline_time_ms"),
+        post_spike_level=_num("post_spike_level"),
+        status="pending",
+        source=str(row.get("source", "auto")),
+        notes="loaded-spike-event-stats",
+    )
+
+
+@dataclass(frozen=True)
+class TraceAnalysisResult:
+    corrected: np.ndarray
+    hybrid_denoised: np.ndarray
+    correction_baseline: np.ndarray
+    detection: object
+    artifact_mask: np.ndarray
+    sampling_rate_hz: float
+
+
+@dataclass(frozen=True)
+class TraceAnalysisRequest:
+    trace_name: str
+    time: np.ndarray
+    raw: np.ndarray
+    corrected_source: np.ndarray
+    sampling_rate_hz: float
+    detection_params: DetectionParams
+    artifact_params: ArtifactParams
+    generation: int
+
+
+def _clone_detection_params(params: DetectionParams) -> DetectionParams:
+    return DetectionParams.from_dict(params.to_dict())
+
+
+def _clone_artifact_params(params: ArtifactParams) -> ArtifactParams:
+    return ArtifactParams.from_dict(params.to_dict())
+
+
+def _analysis_low_state_kwargs(params: DetectionParams) -> Dict[str, object]:
+    return {
+        "threshold_sd": float(params.gonzalez_threshold_sd),
+        "max_clusters": int(params.gonzalez_max_clusters),
+        "attenuation_min": float(params.gonzalez_attenuation_min),
+        "attenuation_max": float(params.gonzalez_attenuation_max),
+        "enable_noise_cluster_rejection": bool(params.gonzalez_enable_noise_cluster_rejection),
+        "enable_event_template_rejection": bool(params.gonzalez_enable_event_template_rejection),
+        "enable_low_state_safety_gate": bool(params.enable_low_state_safety_gate),
+        "min_event_peak_preservation": float(params.min_event_peak_preservation),
+        "min_local_max_ratio": float(params.min_local_max_ratio),
+        "min_reliable_low_state_fraction": float(params.min_reliable_low_state_fraction),
+        "min_reliable_low_state_samples": int(params.min_reliable_low_state_samples),
+        "plateau_tv_min_duration_ms": float(params.plateau_tv_min_duration_ms),
+        "plateau_tv_max_weight_factor": float(params.plateau_tv_max_weight_factor),
+    }
+
+
+def analyze_trace_data(
+    request: TraceAnalysisRequest,
+    legacy_denoise_fn: Callable[..., np.ndarray] = denoise_hybrid_fluorescence_trace,
+) -> TraceAnalysisResult:
+    """Run artifact interpolation, plateau detection, denoising, and spike detection for one trace."""
+    time = np.asarray(request.time, dtype=float)
+    corrected_source = np.asarray(request.corrected_source, dtype=float)
+    sampling_rate_hz = (
+        float(request.sampling_rate_hz)
+        if np.isfinite(request.sampling_rate_hz) and float(request.sampling_rate_hz) > 0.0
+        else _sampling_rate_hz(time)
+    )
+    corrected, artifact_mask = apply_artifact_interpolation(
+        time,
+        corrected_source,
+        params=request.artifact_params.to_dict(),
+    )
+
+    baseline_result = detect_spikes(
+        request.trace_name,
+        time,
+        corrected,
+        request.detection_params,
+        artifact_mask=artifact_mask,
+        sampling_rate_hz=sampling_rate_hz,
+    )
+    baseline = np.asarray(baseline_result.baseline, dtype=float)
+    computation_source = np.asarray(baseline_result.processed_signal, dtype=float)
+    plateau_mask = _detection_mask(baseline_result, "long_plateau_mask")
+    low_state_denoiser = str(request.detection_params.low_state_denoiser or "gonzalez_adaptive_wavelet")
+    corrected_baseline_corrected = computation_source - baseline
+    # State-guided denoising is used as a detection aid. The returned
+    # corrected trace below remains the preferred source for quantitative
+    # amplitude, width, area, plateau level, and export summary measurements.
+    denoised_baseline_corrected = np.asarray(
+        denoise_trace_state_guided_low_plateau_tv(
+            corrected_baseline_corrected,
+            fs=sampling_rate_hz,
+            plateau_mask=plateau_mask,
+            plateau_tv_weight=float(request.detection_params.plateau_tv_weight),
+            boundary_protect_ms=float(request.detection_params.low_state_boundary_protect_ms),
+            low_state_denoiser=low_state_denoiser,
+            low_state_denoise_fn=legacy_denoise_fn if low_state_denoiser == "legacy_hybrid" else None,
+            **_analysis_low_state_kwargs(request.detection_params),
+        ),
+        dtype=float,
+    )
+    detection = detect_spikes(
+        request.trace_name,
+        time,
+        denoised_baseline_corrected,
+        request.detection_params,
+        artifact_mask=artifact_mask,
+        baseline_override=np.zeros_like(baseline),
+        plateau_mask_override=plateau_mask,
+        sampling_rate_hz=sampling_rate_hz,
+        short_plateau_trace_override=corrected_baseline_corrected,
+    )
+    detection.qc_plot_data["highpass_signal"] = np.asarray(
+        baseline_result.qc_plot_data.get("highpass_signal", np.zeros_like(corrected)),
+        dtype=float,
+    )
+    return TraceAnalysisResult(
+        corrected=corrected_baseline_corrected,
+        hybrid_denoised=denoised_baseline_corrected,
+        correction_baseline=baseline,
+        detection=detection,
+        artifact_mask=np.asarray(artifact_mask, dtype=bool),
+        sampling_rate_hz=sampling_rate_hz,
+    )
+
+
+def build_pending_trace_states(
+    time_map: Dict[str, np.ndarray],
+    raw_map: Dict[str, np.ndarray],
+    corrected_map: Dict[str, np.ndarray],
+    sampling_rate_map: Dict[str, float],
+    generation: int = 0,
+) -> Dict[str, TraceCuration]:
+    states: Dict[str, TraceCuration] = {}
+    for trace_name, raw in raw_map.items():
+        time = np.asarray(time_map[trace_name], dtype=float)
+        raw_array = np.asarray(raw, dtype=float)
+        corrected_source = np.asarray(corrected_map[trace_name], dtype=float)
+        n = min(time.size, raw_array.size, corrected_source.size)
+        time = time[:n]
+        raw_array = raw_array[:n]
+        corrected_source = corrected_source[:n]
+        states[trace_name] = TraceCuration(
+            trace_name=trace_name,
+            raw=raw_array,
+            corrected_source=corrected_source,
+            corrected=corrected_source.copy(),
+            time=time,
+            sampling_rate_hz=float(sampling_rate_map.get(trace_name, _sampling_rate_hz(time))),
+            baseline=np.zeros_like(corrected_source, dtype=float),
+            correction_baseline=None,
+            artifact_mask=None,
+            spikes=[],
+            smoothed=None,
+            debug_threshold=None,
+            candidate_windows=[],
+            analysis_status="pending",
+            analysis_error="",
+            analysis_generation=int(generation),
+        )
+    return states
+
+
+class _ExcelImportWorkerSignals(QObject):
+    finished = Signal(str, object, object, object, object, object)
+
+
+class _ExcelImportTask(QRunnable):
+    def __init__(self, file_path: str, generation: int) -> None:
+        super().__init__()
+        self.file_path = str(file_path)
+        self.generation = int(generation)
+        self.signals = _ExcelImportWorkerSignals()
+
+    def run(self) -> None:
+        try:
+            time_map, raw_map, corrected_map, sampling_rate_map = load_excel_traces(self.file_path)
+            self.signals.finished.emit(self.file_path, self.generation, time_map, raw_map, corrected_map, sampling_rate_map)
+        except Exception as exc:
+            self.signals.finished.emit(self.file_path, self.generation, None, None, None, str(exc))
+
+
+class _TraceAnalysisWorkerSignals(QObject):
+    finished = Signal(str, int, object, object)
+
+
+class _TraceAnalysisTask(QRunnable):
+    def __init__(
+        self,
+        request: TraceAnalysisRequest,
+        legacy_denoise_fn: Callable[..., np.ndarray],
+    ) -> None:
+        super().__init__()
+        self.request = request
+        self.legacy_denoise_fn = legacy_denoise_fn
+        self.signals = _TraceAnalysisWorkerSignals()
+
+    def run(self) -> None:
+        try:
+            result = analyze_trace_data(self.request, legacy_denoise_fn=self.legacy_denoise_fn)
+            self.signals.finished.emit(self.request.trace_name, self.request.generation, result, None)
+        except Exception as exc:
+            self.signals.finished.emit(self.request.trace_name, self.request.generation, None, str(exc))
 
 
 class _HybridWorkerSignals(QObject):
@@ -2021,30 +2951,49 @@ class _HybridDenoiseTask(QRunnable):
     def __init__(
         self,
         trace_name: str,
-        cache_key: Tuple[float, str],
-        denoise_fn: Callable[..., np.ndarray],
+        cache_key: Tuple[object, ...],
         corrected: np.ndarray,
         fs: float,
         baseline: Optional[np.ndarray],
+        plateau_mask: Optional[np.ndarray],
+        low_state_denoiser: str,
+        low_state_kwargs: Dict[str, object],
+        plateau_tv_weight: float,
+        boundary_protect_ms: float,
+        legacy_denoise_fn: Callable[..., np.ndarray],
     ) -> None:
         super().__init__()
         self.trace_name = trace_name
         self.cache_key = cache_key
-        self.denoise_fn = denoise_fn
         self.corrected = np.asarray(corrected, dtype=float).copy()
         self.fs = float(fs)
         self.baseline = None if baseline is None else np.asarray(baseline, dtype=float).copy()
+        self.plateau_mask = None if plateau_mask is None else np.asarray(plateau_mask, dtype=bool).copy()
+        self.low_state_denoiser = str(low_state_denoiser)
+        self.low_state_kwargs = dict(low_state_kwargs)
+        self.plateau_tv_weight = float(plateau_tv_weight)
+        self.boundary_protect_ms = float(boundary_protect_ms)
+        self.legacy_denoise_fn = legacy_denoise_fn
         self.signals = _HybridWorkerSignals()
 
     def run(self) -> None:
         try:
+            denoise_input = self.corrected
+            if self.baseline is not None and self.baseline.shape == self.corrected.shape:
+                denoise_input = self.corrected - self.baseline
+            plateau_mask = self.plateau_mask
+            if plateau_mask is None or plateau_mask.shape != denoise_input.shape:
+                plateau_mask = np.zeros(denoise_input.shape, dtype=bool)
             result = np.asarray(
-                self.denoise_fn(
-                    self.corrected,
+                denoise_trace_state_guided_low_plateau_tv(
+                    denoise_input,
                     fs=self.fs,
-                    baseline=self.baseline,
-                    threshold_sd=self.cache_key[0],
-                    event_mode=self.cache_key[1],
+                    plateau_mask=plateau_mask,
+                    plateau_tv_weight=self.plateau_tv_weight,
+                    boundary_protect_ms=self.boundary_protect_ms,
+                    low_state_denoiser=self.low_state_denoiser,
+                    low_state_denoise_fn=self.legacy_denoise_fn if self.low_state_denoiser == "legacy_hybrid" else None,
+                    **self.low_state_kwargs,
                 ),
                 dtype=float,
             )
@@ -2060,7 +3009,7 @@ class SpikeCurationMainWindow(QMainWindow):
         denoise_fn: Optional[Callable[..., np.ndarray]] = None,
     ) -> None:
         super().__init__()
-        self.setWindowTitle(f"Spike Curation App [{DETECTOR_BUILD_TAG}]")
+        self.setWindowTitle(f"Spike Detector [{DETECTOR_BUILD_TAG}]")
         self.resize(1500, 920)
 
         self.excel_path: str = ""
@@ -2074,6 +3023,16 @@ class SpikeCurationMainWindow(QMainWindow):
         self._hybrid_denoise_fn = hybrid_denoise_fn if denoise_fn is None else denoise_fn
         self._hybrid_thread_pool = QThreadPool(self)
         self._hybrid_tasks: List[_HybridDenoiseTask] = []
+        self._import_thread_pool = QThreadPool(self)
+        self._import_thread_pool.setMaxThreadCount(1)
+        self._analysis_thread_pool = QThreadPool(self)
+        self._analysis_thread_pool.setMaxThreadCount(2)
+        self._import_task: Optional[_ExcelImportTask] = None
+        self._analysis_tasks: List[_TraceAnalysisTask] = []
+        self._analysis_generation = 0
+        self._loading_excel = False
+        self._pending_session: Optional[AppSession] = None
+        self._pending_session_generation: Optional[int] = None
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -2087,9 +3046,8 @@ class SpikeCurationMainWindow(QMainWindow):
         self.btn_load_exported = QPushButton("Load Exported Result")
         self.btn_load_session = QPushButton("Load Session")
         self.btn_save_session = QPushButton("Save Session")
-        self.btn_export = QPushButton("Export CSV")
-        self.btn_export_png = QPushButton("Export PNG")
-        self.btn_export_png_current = QPushButton("Export PNG (Current)")
+        self.btn_export = QPushButton("Export All")
+        self.btn_export_png_current = QPushButton("Export Current")
         self.btn_reload_params_cfg = QPushButton("Reload Params Config")
         self.btn_rerun_current = QPushButton("Re-detect Current")
         self.btn_rerun_all = QPushButton("Re-detect All")
@@ -2100,7 +3058,6 @@ class SpikeCurationMainWindow(QMainWindow):
             self.btn_load_session,
             self.btn_save_session,
             self.btn_export,
-            self.btn_export_png,
             self.btn_export_png_current,
             self.btn_reload_params_cfg,
             self.btn_rerun_current,
@@ -2135,8 +3092,18 @@ class SpikeCurationMainWindow(QMainWindow):
         self.param_detection_mode.addItem("MAD threshold", "mad")
         self.param_detection_mode.addItem("STD threshold", "std")
         self.param_detection_mode.addItem("SNR threshold", "snr")
+        self.param_baseline_mode = QComboBox()
+        self.param_baseline_mode.addItem("Percentile", "percentile")
+        self.param_baseline_mode.addItem("Savitzky-Golay", "savgol")
         self.param_startup_exclusion_ms = self._make_double_spin(0.0, 1000.0, self.detection_params.startup_exclusion_ms, 1.0)
         self.param_baseline_rolling_window_ms = self._make_double_spin(5.0, 5000.0, self.detection_params.baseline_rolling_window_ms, 5.0)
+        self.param_baseline_rolling_percentile = self._make_double_spin(1.0, 50.0, self.detection_params.baseline_rolling_percentile, 1.0)
+        self.param_baseline_savgol_window_ms = self._make_double_spin(5.0, 5000.0, self.detection_params.baseline_savgol_window_ms, 5.0)
+        self.param_baseline_savgol_polyorder = self._make_int_spin(1, 7, self.detection_params.baseline_savgol_polyorder)
+        self.param_use_highpass_filter = QCheckBox("Enable high-pass preprocessing")
+        self.param_use_highpass_filter.setChecked(bool(self.detection_params.use_highpass_filter))
+        self.param_highpass_cutoff_hz = self._make_double_spin(0.001, 1000.0, self.detection_params.highpass_cutoff_hz, 0.1)
+        self.param_highpass_order = self._make_int_spin(1, 10, self.detection_params.highpass_order)
         self.param_plateau_median_window_ms = self._make_double_spin(5.0, 500.0, self.detection_params.plateau_median_window_ms, 1.0)
         self.param_spike_noise_k = self._make_double_spin(0.1, 100.0, self.detection_params.spike_noise_k, 0.1)
         self.param_spike_prominence_k = self._make_double_spin(0.0, 100.0, self.detection_params.spike_prominence_k, 0.1)
@@ -2145,7 +3112,14 @@ class SpikeCurationMainWindow(QMainWindow):
 
         params_layout.addRow("detection_mode", self.param_detection_mode)
         params_layout.addRow("startup_exclusion_ms", self.param_startup_exclusion_ms)
+        params_layout.addRow("baseline_mode", self.param_baseline_mode)
         params_layout.addRow("baseline_rolling_window_ms", self.param_baseline_rolling_window_ms)
+        params_layout.addRow("baseline_rolling_percentile", self.param_baseline_rolling_percentile)
+        params_layout.addRow("baseline_savgol_window_ms", self.param_baseline_savgol_window_ms)
+        params_layout.addRow("baseline_savgol_polyorder", self.param_baseline_savgol_polyorder)
+        params_layout.addRow(self.param_use_highpass_filter)
+        params_layout.addRow("highpass_cutoff_hz", self.param_highpass_cutoff_hz)
+        params_layout.addRow("highpass_order", self.param_highpass_order)
         params_layout.addRow("plateau_median_window_ms", self.param_plateau_median_window_ms)
         params_layout.addRow("spike_threshold_k", self.param_spike_noise_k)
         params_layout.addRow("spike_prominence_k", self.param_spike_prominence_k)
@@ -2171,32 +3145,83 @@ class SpikeCurationMainWindow(QMainWindow):
         self.chk_show_raw = QCheckBox("Show raw")
         self.chk_show_corrected = QCheckBox("Show corrected")
         self.chk_show_baseline = QCheckBox("Show baseline")
-        self.chk_show_hybrid_denoised = QCheckBox("Show hybrid denoised")
+        self.chk_show_highpass = QCheckBox("Show high-pass")
+        self.chk_show_hybrid_denoised = QCheckBox("Show state-guided denoised")
 
         self.chk_show_raw.setChecked(True)
         self.chk_show_corrected.setChecked(True)
         self.chk_show_baseline.setChecked(True)
+        self.chk_show_highpass.setChecked(False)
         self.chk_show_hybrid_denoised.setChecked(False)
 
         overlay_layout.addRow(self.chk_show_raw)
         overlay_layout.addRow(self.chk_show_corrected)
         overlay_layout.addRow(self.chk_show_baseline)
+        overlay_layout.addRow(self.chk_show_highpass)
         overlay_layout.addRow(self.chk_show_hybrid_denoised)
         left_layout.addWidget(overlay_group)
 
-        denoise_group = QGroupBox("Hybrid Denoising")
+        denoise_group = QGroupBox("State-Guided Denoising")
         denoise_layout = QFormLayout(denoise_group)
-        self.param_hybrid_threshold_sd = self._make_double_spin(0.0, 10.0, 2.0, 0.1)
-        self.param_plateau_tv_weight = self._make_double_spin(0.0, 100.0, 2.0, 0.1)
-        self.param_hybrid_plateau_protect_ms = self._make_double_spin(0.0, 500.0, 20.0, 1.0)
-        self.param_hybrid_event_mode = QComboBox()
-        self.param_hybrid_event_mode.addItem("SVD", "svd")
-        self.param_hybrid_event_mode.addItem("PCA", "pca")
-        self.param_hybrid_event_mode.addItem("None", "none")
-        denoise_layout.addRow("Hybrid threshold_sd", self.param_hybrid_threshold_sd)
+        self.param_low_state_denoiser = QComboBox()
+        self.param_low_state_denoiser.addItem("Gonzalez adaptive wavelet", "gonzalez_adaptive_wavelet")
+        self.param_low_state_denoiser.addItem("Legacy Hybrid", "legacy_hybrid")
+        self.param_low_state_denoiser.addItem("No low-state denoising", "none")
+        low_state_index = self.param_low_state_denoiser.findData(str(self.detection_params.low_state_denoiser))
+        self.param_low_state_denoiser.setCurrentIndex(max(0, low_state_index))
+        self.param_gonzalez_threshold_sd = self._make_double_spin(
+            0.0,
+            10.0,
+            self.detection_params.gonzalez_threshold_sd,
+            0.1,
+        )
+        self.param_gonzalez_max_clusters = self._make_int_spin(
+            1,
+            100,
+            int(self.detection_params.gonzalez_max_clusters),
+        )
+        self.param_gonzalez_attenuation_min = self._make_double_spin(
+            0.0,
+            1.0,
+            self.detection_params.gonzalez_attenuation_min,
+            0.05,
+        )
+        self.param_gonzalez_attenuation_max = self._make_double_spin(
+            0.0,
+            1.0,
+            self.detection_params.gonzalez_attenuation_max,
+            0.05,
+        )
+        self.param_gonzalez_noise_cluster_rejection = QCheckBox("Noise-cluster rejection")
+        self.param_gonzalez_noise_cluster_rejection.setChecked(
+            bool(self.detection_params.gonzalez_enable_noise_cluster_rejection)
+        )
+        self.param_gonzalez_event_template_rejection = QCheckBox("Event-template cleanup")
+        self.param_gonzalez_event_template_rejection.setChecked(
+            bool(self.detection_params.gonzalez_enable_event_template_rejection)
+        )
+        self.param_plateau_tv_weight = self._make_double_spin(
+            0.0,
+            100.0,
+            self.detection_params.plateau_tv_weight,
+            0.1,
+        )
+        self.param_plateau_tv_weight.setToolTip("Used by state-aware Gonzalez and Legacy Hybrid modes.")
+        self.param_low_state_boundary_protect_ms = self._make_double_spin(
+            0.0,
+            500.0,
+            self.detection_params.low_state_boundary_protect_ms,
+            1.0,
+        )
+        denoise_layout.addRow("Low-state denoising method", self.param_low_state_denoiser)
+        denoise_layout.addRow("Gonzalez threshold SD", self.param_gonzalez_threshold_sd)
+        denoise_layout.addRow("Gonzalez max clusters", self.param_gonzalez_max_clusters)
+        denoise_layout.addRow("Gonzalez attenuation min", self.param_gonzalez_attenuation_min)
+        denoise_layout.addRow("Gonzalez attenuation max", self.param_gonzalez_attenuation_max)
+        denoise_layout.addRow(self.param_gonzalez_noise_cluster_rejection)
+        denoise_layout.addRow(self.param_gonzalez_event_template_rejection)
         denoise_layout.addRow("Plateau TV strength", self.param_plateau_tv_weight)
-        denoise_layout.addRow("Hybrid plateau protection (ms)", self.param_hybrid_plateau_protect_ms)
-        denoise_layout.addRow("Hybrid event mode", self.param_hybrid_event_mode)
+        denoise_layout.addRow("Boundary protection (ms)", self.param_low_state_boundary_protect_ms)
         left_layout.addWidget(denoise_group)
 
         left_layout.addStretch(1)
@@ -2207,8 +3232,8 @@ class SpikeCurationMainWindow(QMainWindow):
         self.plot = TracePlotWidget()
         right_layout.addWidget(self.plot, stretch=5)
 
-        self.table = QTableWidget(0, 7)
-        self.table.setHorizontalHeaderLabels(["idx", "time", "status", "source", "amp", "snr", "prom"])
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["idx", "time", "amp", "snr", "prom"])
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setAlternatingRowColors(True)
         self.table.setStyleSheet(
@@ -2218,7 +3243,13 @@ class SpikeCurationMainWindow(QMainWindow):
         )
         right_layout.addWidget(self.table, stretch=1)
 
-        splitter.addWidget(left_panel)
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        left_scroll.setWidget(left_panel)
+
+        splitter.addWidget(left_scroll)
         splitter.addWidget(right_panel)
         splitter.setSizes([280, 1200])
 
@@ -2244,9 +3275,8 @@ class SpikeCurationMainWindow(QMainWindow):
         self.btn_load_exported.clicked.connect(self.load_exported_dialog)
         self.btn_load_session.clicked.connect(self.load_session_dialog)
         self.btn_save_session.clicked.connect(self.save_session_dialog)
-        self.btn_export.clicked.connect(self.export_dialog)
-        self.btn_export_png.clicked.connect(self.export_png_dialog)
-        self.btn_export_png_current.clicked.connect(self.export_png_current_dialog)
+        self.btn_export.clicked.connect(self.export_all_dialog)
+        self.btn_export_png_current.clicked.connect(self.export_current_dialog)
         self.btn_reload_params_cfg.clicked.connect(self.reload_detection_params_config)
         self.btn_rerun_current.clicked.connect(self.rerun_current)
         self.btn_rerun_all.clicked.connect(self.rerun_all)
@@ -2260,7 +3290,10 @@ class SpikeCurationMainWindow(QMainWindow):
         self.chk_show_raw.stateChanged.connect(self._on_overlay_changed)
         self.chk_show_corrected.stateChanged.connect(self._on_overlay_changed)
         self.chk_show_baseline.stateChanged.connect(self._on_overlay_changed)
+        self.chk_show_highpass.stateChanged.connect(self._on_overlay_changed)
         self.chk_show_hybrid_denoised.stateChanged.connect(self._on_overlay_changed)
+        self.param_low_state_denoiser.currentIndexChanged.connect(self._update_denoise_control_state)
+        self._update_denoise_control_state()
 
     def _init_shortcuts(self) -> None:
         self.shortcuts = bind_shortcuts(
@@ -2270,13 +3303,9 @@ class SpikeCurationMainWindow(QMainWindow):
                 "Left": self.prev_trace,
                 "N": self.jump_next_spike,
                 "B": self.jump_prev_spike,
-                "A": lambda: self.set_selected_status("accepted"),
-                "R": lambda: self.set_selected_status("rejected"),
-                "P": lambda: self.set_selected_status("pending"),
-                "Space": self.toggle_selected_status,
-                "Delete": self.delete_selected_spike,
                 "Ctrl+S": self.save_session_dialog,
-                "Ctrl+E": self.export_dialog,
+                "Ctrl+E": self.export_all_dialog,
+                "Ctrl+Shift+E": self.export_current_dialog,
                 "Q": lambda: self._toggle_checkbox(self.chk_show_raw),
                 "W": lambda: self._toggle_checkbox(self.chk_show_corrected),
             },
@@ -2287,34 +3316,92 @@ class SpikeCurationMainWindow(QMainWindow):
 
     def _pull_params_from_widgets(self) -> None:
         self.detection_params.detection_mode = str(self.param_detection_mode.currentData() or "mad")
+        self.detection_params.baseline_mode = str(self.param_baseline_mode.currentData() or "percentile")
         self.detection_params.startup_exclusion_ms = float(self.param_startup_exclusion_ms.value())
         self.detection_params.baseline_rolling_window_ms = float(self.param_baseline_rolling_window_ms.value())
+        self.detection_params.baseline_rolling_percentile = float(self.param_baseline_rolling_percentile.value())
+        self.detection_params.baseline_savgol_window_ms = float(self.param_baseline_savgol_window_ms.value())
+        self.detection_params.baseline_savgol_polyorder = int(self.param_baseline_savgol_polyorder.value())
+        self.detection_params.use_highpass_filter = bool(self.param_use_highpass_filter.isChecked())
+        self.detection_params.highpass_cutoff_hz = float(self.param_highpass_cutoff_hz.value())
+        self.detection_params.highpass_order = int(self.param_highpass_order.value())
         self.detection_params.plateau_median_window_ms = float(self.param_plateau_median_window_ms.value())
         self.detection_params.spike_noise_k = float(self.param_spike_noise_k.value())
         self.detection_params.spike_prominence_k = float(self.param_spike_prominence_k.value())
         self.detection_params.min_separation_ms = float(self.param_min_separation_ms.value())
         self.detection_params.spike_zoom_half_window_ms = float(self.param_spike_zoom_half_window_ms.value())
+        self.detection_params.low_state_denoiser = str(
+            self.param_low_state_denoiser.currentData() or "gonzalez_adaptive_wavelet"
+        )
+        self.detection_params.gonzalez_threshold_sd = float(self.param_gonzalez_threshold_sd.value())
+        self.detection_params.gonzalez_max_clusters = int(self.param_gonzalez_max_clusters.value())
+        self.detection_params.gonzalez_attenuation_min = float(self.param_gonzalez_attenuation_min.value())
+        self.detection_params.gonzalez_attenuation_max = float(self.param_gonzalez_attenuation_max.value())
+        self.detection_params.gonzalez_enable_noise_cluster_rejection = bool(
+            self.param_gonzalez_noise_cluster_rejection.isChecked()
+        )
+        self.detection_params.gonzalez_enable_event_template_rejection = bool(
+            self.param_gonzalez_event_template_rejection.isChecked()
+        )
+        self.detection_params.plateau_tv_weight = float(self.param_plateau_tv_weight.value())
+        self.detection_params.low_state_boundary_protect_ms = float(self.param_low_state_boundary_protect_ms.value())
         self.artifact_params.absolute_low = float(self.param_artifact_abs_low.value())
         self.artifact_params.min_depth = float(self.param_artifact_min_depth.value())
         self.artifact_params.drop_start_abs = float(self.param_artifact_drop_start.value())
 
     def _push_params_to_widgets(self) -> None:
-        # peak_window_ms removed (unused)
         mode_index = self.param_detection_mode.findData(str(self.detection_params.detection_mode))
         self.param_detection_mode.setCurrentIndex(max(0, mode_index))
+        baseline_mode_index = self.param_baseline_mode.findData(str(self.detection_params.baseline_mode))
+        self.param_baseline_mode.setCurrentIndex(max(0, baseline_mode_index))
         self.param_startup_exclusion_ms.setValue(self.detection_params.startup_exclusion_ms)
         self.param_baseline_rolling_window_ms.setValue(self.detection_params.baseline_rolling_window_ms)
+        self.param_baseline_rolling_percentile.setValue(self.detection_params.baseline_rolling_percentile)
+        self.param_baseline_savgol_window_ms.setValue(self.detection_params.baseline_savgol_window_ms)
+        self.param_baseline_savgol_polyorder.setValue(int(self.detection_params.baseline_savgol_polyorder))
+        self.param_use_highpass_filter.setChecked(bool(self.detection_params.use_highpass_filter))
+        self.param_highpass_cutoff_hz.setValue(float(self.detection_params.highpass_cutoff_hz))
+        self.param_highpass_order.setValue(int(self.detection_params.highpass_order))
         self.param_plateau_median_window_ms.setValue(self.detection_params.plateau_median_window_ms)
         self.param_spike_noise_k.setValue(self.detection_params.spike_noise_k)
         self.param_spike_prominence_k.setValue(self.detection_params.spike_prominence_k)
         self.param_min_separation_ms.setValue(self.detection_params.min_separation_ms)
         self.param_spike_zoom_half_window_ms.setValue(self.detection_params.spike_zoom_half_window_ms)
+        low_state_index = self.param_low_state_denoiser.findData(str(self.detection_params.low_state_denoiser))
+        self.param_low_state_denoiser.setCurrentIndex(max(0, low_state_index))
+        self.param_gonzalez_threshold_sd.setValue(float(self.detection_params.gonzalez_threshold_sd))
+        self.param_gonzalez_max_clusters.setValue(int(self.detection_params.gonzalez_max_clusters))
+        self.param_gonzalez_attenuation_min.setValue(float(self.detection_params.gonzalez_attenuation_min))
+        self.param_gonzalez_attenuation_max.setValue(float(self.detection_params.gonzalez_attenuation_max))
+        self.param_gonzalez_noise_cluster_rejection.setChecked(
+            bool(self.detection_params.gonzalez_enable_noise_cluster_rejection)
+        )
+        self.param_gonzalez_event_template_rejection.setChecked(
+            bool(self.detection_params.gonzalez_enable_event_template_rejection)
+        )
+        self.param_plateau_tv_weight.setValue(float(self.detection_params.plateau_tv_weight))
+        self.param_low_state_boundary_protect_ms.setValue(float(self.detection_params.low_state_boundary_protect_ms))
+        self._update_denoise_control_state()
         self.param_artifact_abs_low.setValue(self.artifact_params.absolute_low)
         self.param_artifact_min_depth.setValue(self.artifact_params.min_depth)
         self.param_artifact_drop_start.setValue(self.artifact_params.drop_start_abs)
 
-    # Fixed root for all exports.
-    _RESULT_ROOT = Path(r"C:\Users\LM\Desktop\Spike detector\Result")
+    def _update_denoise_control_state(self, *_args: object) -> None:
+        low_state_denoiser = str(self.param_low_state_denoiser.currentData() or "gonzalez_adaptive_wavelet")
+        state_aware_mode = low_state_denoiser in {"gonzalez_adaptive_wavelet", "legacy_hybrid"}
+        self.param_plateau_tv_weight.setEnabled(state_aware_mode)
+        self.param_plateau_tv_weight.setToolTip(
+            "Used by state-aware Gonzalez and Legacy Hybrid modes." if state_aware_mode else "Ignored when denoising is disabled."
+        )
+        self.param_low_state_boundary_protect_ms.setEnabled(state_aware_mode)
+        self.param_low_state_boundary_protect_ms.setToolTip(
+            "Used by state-aware Gonzalez and Legacy Hybrid modes." if state_aware_mode else "Ignored when denoising is disabled."
+        )
+
+    def _result_root(self) -> Path:
+        if getattr(sys, "frozen", False):
+            return Path(sys.executable).resolve().parent / "Result"
+        return Path(__file__).resolve().parents[2] / "Result"
 
     def _make_export_dir(self, label: str) -> Path:
         """Create and return a timestamped subfolder under the Result directory.
@@ -2322,7 +3409,7 @@ class SpikeCurationMainWindow(QMainWindow):
         Pattern: Result/<label>_YYYYMMDD_HHMMSS/
         """
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_dir = self._RESULT_ROOT / f"{label}_{ts}"
+        out_dir = self._result_root() / f"{label}_{ts}"
         out_dir.mkdir(parents=True, exist_ok=True)
         return out_dir
 
@@ -2369,29 +3456,18 @@ class SpikeCurationMainWindow(QMainWindow):
             return
         self.load_excel(file_path)
 
-    def _spike_from_row(self, row: pd.Series, trace_name: str) -> SpikeRecord:
-        def _num(key: str, default: float = 0.0) -> float:
-            return float(pd.to_numeric(row.get(key, default), errors="coerce"))
+    def _set_loading_controls_enabled(self, enabled: bool) -> None:
+        for button in [
+            self.btn_load_excel,
+            self.btn_load_exported,
+            self.btn_load_session,
+            self.btn_rerun_current,
+            self.btn_rerun_all,
+        ]:
+            button.setEnabled(enabled)
 
-        spike_index = int(_num("spike_index", 0))
-        return SpikeRecord(
-            trace_name=trace_name,
-            candidate_index=int(_num("candidate_index", spike_index)),
-            spike_index=spike_index,
-            spike_time=_num("spike_time", 0.0),
-            spike_amplitude_raw_or_corrected=_num("spike_amplitude_raw_or_corrected", 0.0),
-            baseline_at_spike=_num("baseline_at_spike", 0.0),
-            amplitude_above_baseline=_num("amplitude_above_baseline", 0.0),
-            prominence=_num("prominence", 0.0),
-            width=_num("width", 0.0),
-            local_noise_estimate=_num("local_noise_estimate", 0.0),
-            snr=_num("snr", 0.0),
-            detection_threshold_used=_num("detection_threshold_used", 0.0),
-            fwhm_ms=_num("fwhm_ms", 0.0),
-            status=str(row.get("status", "pending")),
-            source=str(row.get("source", "auto")),
-            notes=str(row.get("notes", "")),
-        )
+    def _spike_from_event_stats_row(self, row: pd.Series, trace_name: str) -> SpikeRecord:
+        return _spike_record_from_event_stats_row(row, trace_name)
 
     def load_exported_dialog(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Open Export Folder")
@@ -2402,9 +3478,9 @@ class SpikeCurationMainWindow(QMainWindow):
     def load_exported_result(self, folder: str) -> None:
         try:
             folder_path = Path(folder)
-            corrected_path = folder_path / "corrected_traces.csv"
-            if not corrected_path.exists():
-                raise FileNotFoundError("corrected_traces.csv not found in selected folder")
+            corrected_path = _find_export_file(folder_path, "corrected_traces.csv")
+            if corrected_path is None:
+                raise FileNotFoundError("corrected_traces.csv not found in selected folder or export subfolders")
 
             corrected_df = pd.read_csv(corrected_path)
             if "time" not in corrected_df.columns:
@@ -2431,36 +3507,21 @@ class SpikeCurationMainWindow(QMainWindow):
                     baseline=None,
                     debug_threshold=None,
                     candidate_windows=[],
-                    deleted_spikes=[],
                 )
                 self.traces[trace_name] = state
 
-            review_path = folder_path / "spike_review_log.csv"
-            curated_path = folder_path / "curated_spikes.csv"
-            if review_path.exists():
-                review_df = pd.read_csv(review_path)
-                for _, row in review_df.iterrows():
-                    trace_name = str(row.get("trace_name", ""))
+            spike_event_path = _find_export_file(folder_path, "spike_event_stats.csv")
+            if spike_event_path is not None:
+                spike_event_df = pd.read_csv(spike_event_path)
+                for _, row in spike_event_df.iterrows():
+                    trace_name = str(row.get("trace_id", row.get("trace_name", "")))
                     state = self.traces.get(trace_name)
                     if state is None:
                         continue
-                    spike = self._spike_from_row(row, trace_name)
-                    if spike.status == "deleted":
-                        state.deleted_spikes.append(spike)
-                    else:
-                        state.spikes.append(spike)
-            elif curated_path.exists():
-                curated_df = pd.read_csv(curated_path)
-                for _, row in curated_df.iterrows():
-                    trace_name = str(row.get("trace_name", ""))
-                    state = self.traces.get(trace_name)
-                    if state is None:
-                        continue
-                    state.spikes.append(self._spike_from_row(row, trace_name))
+                    state.spikes.append(self._spike_from_event_stats_row(row, trace_name))
 
             for state in self.traces.values():
                 state.sort_spikes()
-                state.deleted_spikes.sort(key=lambda spike: spike.spike_index)
 
             self.trace_names = sorted(self.traces.keys())
             self._refresh_trace_list()
@@ -2470,57 +3531,77 @@ class SpikeCurationMainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self, "Load Export Error", str(exc))
 
-    def load_excel(self, file_path: str) -> None:
-        try:
-            self.excel_path = file_path
-            time_map, raw_map, corrected_map, sampling_rate_map = load_excel_traces(file_path)
-            self._pull_params_from_widgets()
+    def load_excel(self, file_path: str, pending_session: Optional[AppSession] = None) -> None:
+        self._pull_params_from_widgets()
+        self._analysis_generation += 1
+        generation = self._analysis_generation
+        self.excel_path = file_path
+        self.traces.clear()
+        self.trace_names = []
+        self.current_trace_name = None
+        self._table_spikes = []
+        self._analysis_tasks = []
+        self._pending_session = pending_session
+        self._pending_session_generation = generation if pending_session is not None else None
+        self.trace_list.clear()
+        self.table.setRowCount(0)
+        self._loading_excel = True
+        self._set_loading_controls_enabled(False)
+        self.status_label.setText(f"Loading Excel: {Path(file_path).name}...")
 
-            self.traces.clear()
-            for trace_name, raw in raw_map.items():
-                time = time_map[trace_name]
-                corrected, artifact_mask = apply_artifact_interpolation(
-                    time,
-                    corrected_map[trace_name],
-                    params=self.artifact_params.to_dict(),
-                )
-                sampling_rate_hz = float(sampling_rate_map.get(trace_name, _sampling_rate_hz(time)))
-                corrected, hybrid_denoised, correction_baseline, detection = self._detect_on_hybrid_denoised(
-                    trace_name, time, corrected, artifact_mask, sampling_rate_hz=sampling_rate_hz
-                )
-                baseline_for_view = detection.baseline
-                threshold_for_view = detection.threshold
-                trace_state = TraceCuration(
-                    trace_name=trace_name,
-                    raw=raw,
-                    corrected_source=corrected_map[trace_name],
-                    corrected=corrected,
-                    time=time,
-                    sampling_rate_hz=sampling_rate_hz,
-                    spikes=detection.spikes,
-                    smoothed=detection.smoothed,
-                    baseline=baseline_for_view,
-                    correction_baseline=correction_baseline,
-                    artifact_mask=np.asarray(artifact_mask, dtype=bool),
-                    plateau_mask=_detection_mask(detection, "baseline_mask"),
-                    long_plateau_mask=_detection_mask(detection, "long_plateau_mask"),
-                    short_plateau_mask=_detection_mask(detection, "short_plateau_mask", fallback_key=""),
-                    short_plateau_events=_detection_short_events(detection),
-                    debug_threshold=threshold_for_view,
-                    candidate_windows=detection.candidate_windows,
-                    hybrid_denoised=hybrid_denoised,
-                    hybrid_denoised_cache_key=self._hybrid_cache_key(),
-                )
-                trace_state.sort_spikes()
-                self.traces[trace_name] = trace_state
+        task = _ExcelImportTask(file_path, generation)
+        task.signals.finished.connect(self._on_excel_import_finished)
+        self._import_task = task
+        self._import_thread_pool.start(task)
 
-            self.trace_names = sorted(self.traces.keys())
-            self._refresh_trace_list()
-            if self.trace_names:
-                self.trace_list.setCurrentRow(0)
-            self.status_label.setText(f"Loaded {Path(file_path).name} | traces: {len(self.trace_names)}")
-        except Exception as exc:
-            QMessageBox.critical(self, "Load Error", str(exc))
+    def _on_excel_import_finished(
+        self,
+        file_path: str,
+        generation: int,
+        time_map: Optional[Dict[str, np.ndarray]],
+        raw_map: Optional[Dict[str, np.ndarray]],
+        corrected_map: Optional[Dict[str, np.ndarray]],
+        sampling_or_error: object,
+    ) -> None:
+        if int(generation) != self._analysis_generation:
+            return
+        self._import_task = None
+        self._loading_excel = False
+        self._set_loading_controls_enabled(True)
+        if time_map is None or raw_map is None or corrected_map is None or isinstance(sampling_or_error, str):
+            self._pending_session = None
+            self._pending_session_generation = None
+            QMessageBox.critical(self, "Load Error", str(sampling_or_error))
+            self.status_label.setText("Excel load failed")
+            return
+
+        sampling_rate_map = sampling_or_error
+        if not isinstance(sampling_rate_map, dict):
+            self._pending_session = None
+            self._pending_session_generation = None
+            QMessageBox.critical(self, "Load Error", "Unexpected Excel import result")
+            self.status_label.setText("Excel load failed")
+            return
+
+        self.traces = build_pending_trace_states(
+            time_map=time_map,
+            raw_map=raw_map,
+            corrected_map=corrected_map,
+            sampling_rate_map=sampling_rate_map,
+            generation=int(generation),
+        )
+        self.trace_names = sorted(self.traces.keys())
+        if self._pending_session is not None:
+            apply_session_to_traces(self._pending_session, self.traces)
+        self._refresh_trace_list()
+        if self.trace_names:
+            self.trace_list.setCurrentRow(0)
+            self._start_analysis_for_trace(self.trace_names[0], priority=10)
+            for trace_name in self.trace_names[1:]:
+                self._start_analysis_for_trace(trace_name, priority=0)
+        self.status_label.setText(
+            f"Loaded {Path(file_path).name} | traces: {len(self.trace_names)} | analyzing selected trace..."
+        )
 
     def load_session_dialog(self) -> None:
         file_path, _ = QFileDialog.getOpenFileName(self, "Open Session", "", "JSON Files (*.json)")
@@ -2533,18 +3614,20 @@ class SpikeCurationMainWindow(QMainWindow):
             self._push_params_to_widgets()
 
             if app_session.excel_path:
-                self.load_excel(app_session.excel_path)
-            if not self.traces:
+                self.load_excel(app_session.excel_path, pending_session=app_session)
+                self.status_label.setText(f"Loading session traces: {Path(file_path).name}")
                 return
-
-            apply_session_to_traces(app_session, self.traces)
-            self._render_current_trace(reset_view=True)
-            self.status_label.setText(f"Loaded session: {Path(file_path).name}")
+            if self.traces:
+                apply_session_to_traces(app_session, self.traces)
+                self._render_current_trace(reset_view=True)
+                self.status_label.setText(f"Loaded session: {Path(file_path).name}")
         except Exception as exc:
             QMessageBox.critical(self, "Session Error", str(exc))
 
     def save_session_dialog(self) -> None:
         if not self.traces:
+            return
+        if not self._analysis_ready_for_trace_names(self.trace_names, action="save session"):
             return
         file_path, _ = QFileDialog.getSaveFileName(self, "Save Session", "spike_session.json", "JSON Files (*.json)")
         if not file_path:
@@ -2553,183 +3636,129 @@ class SpikeCurationMainWindow(QMainWindow):
         save_session(file_path, self.excel_path, self.detection_params, self.artifact_params, self.traces)
         self.status_label.setText(f"Session saved: {Path(file_path).name}")
 
+    def _analysis_ready_for_trace_names(self, trace_names: List[str], action: str) -> bool:
+        not_done = [
+            name
+            for name in trace_names
+            if name in self.traces and self.traces[name].analysis_status != "done"
+        ]
+        if not not_done:
+            return True
+        current = self.current_trace_name
+        if current in not_done:
+            self._start_analysis_for_trace(current, priority=10)
+        for name in not_done:
+            if name != current:
+                self._start_analysis_for_trace(name, priority=0)
+        self.status_label.setText(
+            f"Cannot {action} yet; analysis is still pending/running for {len(not_done)} trace(s)."
+        )
+        QMessageBox.information(
+            self,
+            "Analysis In Progress",
+            f"Please wait until analysis finishes before you {action}. Pending/running traces: {len(not_done)}.",
+        )
+        return False
+
+    def _write_export_tables_and_report(self, out_dir: Path, trace_names: List[str]) -> List[Path]:
+        active_trace_names = [name for name in trace_names if name in self.traces]
+        layout = _prepare_export_layout(out_dir)
+        cfg = TRACE_SUMMARY_CONFIG
+
+        export_tables = _build_export_dataframes(active_trace_names, self.traces)
+
+        table_paths = {
+            "trace_summary": layout["tables"] / str(cfg["csv_name"]),
+            "trace_qc": layout["tables"] / str(cfg["qc_csv_name"]),
+            "plateau_events": layout["tables"] / str(cfg["events_csv_name"]),
+            "spike_events": layout["tables"] / str(cfg["spike_events_csv_name"]),
+            "spike_summary": layout["tables"] / str(cfg["spike_summary_csv_name"]),
+        }
+        for key, path in table_paths.items():
+            export_tables[key].to_csv(path, index=False)
+
+        reload_corrected_path = layout["reload"] / "corrected_traces.csv"
+        reload_spike_event_path = layout["reload"] / str(cfg["spike_events_csv_name"])
+        export_tables["corrected_traces"].to_csv(reload_corrected_path, index=False)
+        export_tables["spike_events"].to_csv(reload_spike_event_path, index=False)
+
+        png_path = layout["reports"] / str(cfg["png_name"])
+        pdf_path = layout["reports"] / str(cfg["pdf_name"]) if bool(cfg.get("save_pdf", False)) else None
+        _save_qc_summary_report(
+            trace_df=export_tables["trace_qc"],
+            events_df=export_tables["plateau_events"],
+            png_path=png_path,
+            pdf_path=pdf_path,
+        )
+        spike_png_path = layout["reports"] / str(cfg["spike_png_name"])
+        _save_spike_statistics_summary(
+            spike_summary_df=export_tables["spike_summary"],
+            spike_events_df=export_tables["spike_events"],
+            png_path=spike_png_path,
+        )
+
+        written_files = list(table_paths.values()) + [reload_corrected_path, reload_spike_event_path, png_path, spike_png_path]
+        if pdf_path is not None:
+            written_files.append(pdf_path)
+        return written_files
+
+    def _write_export_manifest(self, out_dir: Path, export_type: str, trace_names: List[str]) -> Path:
+        active_trace_names = [name for name in trace_names if name in self.traces]
+        files = sorted(
+            path
+            for path in out_dir.rglob("*")
+            if path.is_file() and path.name != EXPORT_MANIFEST_NAME
+        )
+        folders = sorted(path for path in out_dir.rglob("*") if path.is_dir())
+        manifest = {
+            "export_version": 2,
+            "export_type": export_type,
+            "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
+            "source_excel": self.excel_path,
+            "trace_count": len(active_trace_names),
+            "traces": [str(name) for name in active_trace_names],
+            "folders": {
+                "tables": EXPORT_TABLES_DIR,
+                "reports": EXPORT_REPORTS_DIR,
+                "reload": EXPORT_RELOAD_DIR,
+            },
+            "generated_folders": [str(path.relative_to(out_dir)) for path in folders],
+            "files": [str(path.relative_to(out_dir)) for path in files],
+        }
+        manifest_path = out_dir / EXPORT_MANIFEST_NAME
+        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        return manifest_path
+
     def export_dialog(self) -> None:
         if not self.traces:
             return
+        if not self._analysis_ready_for_trace_names(self.trace_names, action="export"):
+            return
 
-        out_dir = Path(self._make_export_dir("csv"))
-        cfg = TRACE_SUMMARY_CONFIG
+        out_dir = Path(self._make_export_dir("export_tables"))
+        written_files = self._write_export_tables_and_report(out_dir, self.trace_names)
+        self._write_export_manifest(out_dir, "tables", self.trace_names)
 
-        # ── Event-level CSV ──────────────────────────────────────────────────
-        event_rows = _build_plateau_event_rows(self.trace_names, self.traces)
-        event_cols = [
-            "trace_id",
-            "plateau_id",
-            "detector_source",
-            "start_index",
-            "end_index_exclusive",
-            "onset_time_ms",
-            "start_time",
-            "end_time",
-            "duration_ms",
-            "fwhm_ms",
-            "rise_time_ms",
-            "decay_time_ms",
-            "plateau_sd",
-            "mean_amp_above_baseline",
-            "peak_amp_above_baseline",
-            "sample_count",
-        ]
-        events_df = pd.DataFrame(event_rows)
-        if events_df.empty:
-            events_df = pd.DataFrame(columns=event_cols)
-        else:
-            ordered_ev = [c for c in event_cols if c in events_df.columns]
-            tail_ev = [c for c in events_df.columns if c not in ordered_ev]
-            events_df = events_df[ordered_ev + tail_ev]
-        events_df = events_df.sort_values(["trace_id", "plateau_id"], kind="mergesort").reset_index(drop=True)
-        events_csv_path = out_dir / str(cfg.get("events_csv_name", "plateau_event_stats.csv"))
-        events_df.to_csv(events_csv_path, index=False)
-
-        # ── Per-trace (neuron) summary CSV ───────────────────────────────────
-        rows = _build_trace_summary_rows(self.trace_names, self.traces, event_rows=event_rows)
-
-        trace_df = pd.DataFrame(rows)
-
-        # Build ALL-traces grand summary row from all event data
-        if not events_df.empty:
-            def _col_vals_all(col: str) -> np.ndarray:
-                if col not in events_df.columns:
-                    return np.array([], dtype=float)
-                return pd.to_numeric(events_df[col], errors="coerce").to_numpy(dtype=float)
-
-            def _agg(arr: np.ndarray) -> tuple[float, float]:
-                arr = arr[np.isfinite(arr)]
-                if arr.size == 0:
-                    return float("nan"), float("nan")
-                return float(np.mean(arr)), float(np.median(arr))
-
-            all_onsets = _col_vals_all("onset_time_ms")
-            all_dur = _col_vals_all("duration_ms")
-            all_fwhm = _col_vals_all("fwhm_ms")
-            all_rise = _col_vals_all("rise_time_ms")
-            all_peak = _col_vals_all("peak_amp_above_baseline")
-            all_sd = _col_vals_all("plateau_sd")
-
-            finite_onsets_all = all_onsets[np.isfinite(all_onsets)]
-            sorted_onsets_all = np.sort(finite_onsets_all)
-            if sorted_onsets_all.size > 1:
-                gaps_all = np.diff(sorted_onsets_all)
-                gaps_all = gaps_all[gaps_all > 0]
-                mean_ipi_all = float(np.mean(gaps_all)) if gaps_all.size > 0 else float("nan")
-            else:
-                mean_ipi_all = float("nan")
-
-            m_dur, med_dur = _agg(all_dur)
-            m_fwhm, med_fwhm = _agg(all_fwhm)
-            m_rise, med_rise = _agg(all_rise)
-            m_peak, med_peak = _agg(all_peak)
-            m_sd, med_sd = _agg(all_sd)
-
-            all_row = {
-                "trace_id": "ALL",
-                "plateau_count": int(events_df.shape[0]),
-                "first_onset_ms": float(np.min(finite_onsets_all)) if finite_onsets_all.size > 0 else float("nan"),
-                "mean_duration_ms": m_dur,
-                "median_duration_ms": med_dur,
-                "mean_fwhm_ms": m_fwhm,
-                "median_fwhm_ms": med_fwhm,
-                "mean_rise_time_ms": m_rise,
-                "median_rise_time_ms": med_rise,
-                "mean_peak_amp_above_baseline": m_peak,
-                "median_peak_amp_above_baseline": med_peak,
-                "mean_plateau_sd": m_sd,
-                "median_plateau_sd": med_sd,
-                "mean_inter_plateau_interval_ms": mean_ipi_all,
-            }
-            trace_df = pd.concat([trace_df, pd.DataFrame([all_row])], ignore_index=True)
-
-        summary_col_order = [
-            "trace_id",
-            "plateau_count",
-            "first_onset_ms",
-            "mean_duration_ms",
-            "median_duration_ms",
-            "mean_fwhm_ms",
-            "median_fwhm_ms",
-            "mean_rise_time_ms",
-            "median_rise_time_ms",
-            "mean_peak_amp_above_baseline",
-            "median_peak_amp_above_baseline",
-            "mean_plateau_sd",
-            "median_plateau_sd",
-            "mean_inter_plateau_interval_ms",
-        ]
-        ordered = [c for c in summary_col_order if c in trace_df.columns]
-        tail = [c for c in trace_df.columns if c not in ordered]
-        trace_df = trace_df[ordered + tail]
-
-        # Reactivate export format consumed by "Load Exported Result".
-        corrected_rows: Dict[str, np.ndarray] = {}
-        time_ref: Optional[np.ndarray] = None
-        for trace_name in self.trace_names:
-            state = self.traces.get(trace_name)
-            if state is None:
-                continue
-            if time_ref is None:
-                time_ref = np.asarray(state.time, dtype=float)
-            corrected_rows[str(trace_name)] = np.asarray(state.corrected, dtype=float)
-
-        if time_ref is not None and corrected_rows:
-            corrected_export = pd.DataFrame({"time": time_ref})
-            for trace_name in self.trace_names:
-                if trace_name in corrected_rows:
-                    corrected_export[str(trace_name)] = corrected_rows[trace_name]
-            corrected_export.to_csv(out_dir / "corrected_traces.csv", index=False)
-
-        review_rows: List[Dict[str, object]] = []
-        curated_rows: List[Dict[str, object]] = []
-        for trace_name in self.trace_names:
-            state = self.traces.get(trace_name)
-            if state is None:
-                continue
-
-            all_spikes = sorted(state.spikes + state.deleted_spikes, key=lambda spike: spike.spike_index)
-            for spike in all_spikes:
-                row = spike.to_dict()
-                row["trace_name"] = str(trace_name)
-                review_rows.append(row)
-                if str(spike.status) != "deleted":
-                    curated_rows.append(row.copy())
-
-        if review_rows:
-            pd.DataFrame(review_rows).to_csv(out_dir / "spike_review_log.csv", index=False)
-        if curated_rows:
-            pd.DataFrame(curated_rows).to_csv(out_dir / "curated_spikes.csv", index=False)
-
-        csv_path = out_dir / str(cfg["csv_name"])
-        trace_df.to_csv(csv_path, index=False)
-
-        png_path = out_dir / str(cfg["png_name"])
-        pdf_path = out_dir / str(cfg["pdf_name"]) if bool(cfg.get("save_pdf", False)) else None
-        _save_trace_summary_figure(csv_path=csv_path, png_path=png_path, pdf_path=pdf_path)
-
-        extra = f", {pdf_path.name}" if pdf_path is not None else ""
         self.status_label.setText(
-            f"Exported {csv_path.name}, {events_csv_path.name}, {png_path.name}{extra} to {out_dir}"
+            f"Exported {len(written_files)} table/report/reload files to {out_dir}"
         )
 
 
-    def export_png_dialog(self) -> None:
+    def export_all_dialog(self) -> None:
         if not self.traces:
+            return
+        if not self._analysis_ready_for_trace_names(self.trace_names, action="export all"):
             return
         self._pull_params_from_widgets()
 
-        out_dir = self._make_export_dir("png_all")
+        out_dir = self._make_export_dir("export_all")
         out_dir.mkdir(parents=True, exist_ok=True)
-        spikes_dir = out_dir / "spikes"
-        plateaus_dir = out_dir / "plateaus"
-        summary_dir = out_dir / "summary"
+        self._write_export_tables_and_report(out_dir, self.trace_names)
+
+        images_dir = out_dir / "images"
+        spikes_dir = images_dir / "spikes"
+        plateaus_dir = images_dir / "plateaus"
+        summary_dir = images_dir / "summary"
         spikes_dir.mkdir(parents=True, exist_ok=True)
         plateaus_dir.mkdir(parents=True, exist_ok=True)
         summary_dir.mkdir(parents=True, exist_ok=True)
@@ -2775,90 +3804,101 @@ class SpikeCurationMainWindow(QMainWindow):
                     (trace_name, state.time, state.corrected, np.asarray(state.plateau_mask, dtype=bool))
                 )
 
-        if exported_traces == 0:
-            self.status_label.setText("No spikes available to export")
-            return
+        if exported_traces > 0:
+            # Grid of per-trace superimposed waveform plots placed side-by-side.
+            superimposed_grid = _compose_horizontal_traces_png(
+                all_trace_superimposed_pixmaps,
+                title=f"All traces | superimposed waveforms (trace count={len(all_trace_superimposed_pixmaps)})",
+                column_height=400,
+            )
+            if not superimposed_grid.isNull():
+                superimposed_grid.save(str(summary_dir / "all_traces_superimposed_grid.png"))
 
-        # Grid of per-trace superimposed waveform plots placed side-by-side.
-        superimposed_grid = _compose_horizontal_traces_png(
-            all_trace_superimposed_pixmaps,
-            title=f"All traces | superimposed waveforms (trace count={len(all_trace_superimposed_pixmaps)})",
-            column_height=400,
-        )
-        if not superimposed_grid.isNull():
-            superimposed_grid.save(str(summary_dir / "all_traces_superimposed_grid.png"))
+            plateau_superimposed_grid = _compose_horizontal_traces_png(
+                all_trace_plateau_superimposed_pixmaps,
+                title=f"All traces | plateau superimposed per trace (trace count={len(all_trace_plateau_superimposed_pixmaps)})",
+                column_height=400,
+            )
+            if not plateau_superimposed_grid.isNull():
+                plateau_superimposed_grid.save(str(summary_dir / "all_traces_plateaus_superimposed_grid.png"))
 
-        plateau_superimposed_grid = _compose_horizontal_traces_png(
-            all_trace_plateau_superimposed_pixmaps,
-            title=f"All traces | plateau superimposed per trace (trace count={len(all_trace_plateau_superimposed_pixmaps)})",
-            column_height=400,
-        )
-        if not plateau_superimposed_grid.isNull():
-            plateau_superimposed_grid.save(str(summary_dir / "all_traces_plateaus_superimposed_grid.png"))
+            # Single plot with all spike waveforms from all traces overlaid together.
+            _, _, _, combined_w = _spike_export_dimensions(self.detection_params.spike_zoom_half_window_ms)
+            combined_superimposed = _render_superimposed_all_traces_png(
+                all_trace_data_for_combined,
+                half_window_ms=self.detection_params.spike_zoom_half_window_ms,
+                width=combined_w,
+                height=500,
+            )
+            if not combined_superimposed.isNull():
+                combined_superimposed.save(str(summary_dir / "all_traces_superimposed_combined.png"))
 
-        # Single plot with all spike waveforms from all traces overlaid together.
-        _, _, _, combined_w = _spike_export_dimensions(self.detection_params.spike_zoom_half_window_ms)
-        combined_superimposed = _render_superimposed_all_traces_png(
-            all_trace_data_for_combined,
-            half_window_ms=self.detection_params.spike_zoom_half_window_ms,
-            width=combined_w,
-            height=500,
-        )
-        if not combined_superimposed.isNull():
-            combined_superimposed.save(str(summary_dir / "all_traces_superimposed_combined.png"))
+            combined_aligned = _compose_horizontal_traces_png(
+                all_trace_aligned_pixmaps,
+                title=f"All traces | aligned stacks (trace count={len(all_trace_aligned_pixmaps)})",
+                column_height=300,
+            )
+            if not combined_aligned.isNull():
+                combined_aligned.save(str(summary_dir / "all_traces_aligned.png"))
 
-        combined_aligned = _compose_horizontal_traces_png(
-            all_trace_aligned_pixmaps,
-            title=f"All traces | aligned stacks (trace count={len(all_trace_aligned_pixmaps)})",
-            column_height=300,
-        )
-        if not combined_aligned.isNull():
-            combined_aligned.save(str(summary_dir / "all_traces_aligned.png"))
+            combined_plateau_superimposed = _render_superimposed_all_traces_plateaus_png(
+                all_trace_plateau_data_for_combined,
+                width=1500,
+                height=500,
+            )
+            if not combined_plateau_superimposed.isNull():
+                combined_plateau_superimposed.save(str(summary_dir / "all_traces_plateaus_superimposed_combined.png"))
 
-        combined_plateau_superimposed = _render_superimposed_all_traces_plateaus_png(
-            all_trace_plateau_data_for_combined,
-            width=1500,
-            height=500,
-        )
-        if not combined_plateau_superimposed.isNull():
-            combined_plateau_superimposed.save(str(summary_dir / "all_traces_plateaus_superimposed_combined.png"))
-
+        self._write_export_manifest(out_dir, "all", self.trace_names)
+        image_note = f" and images for {exported_traces} traces" if exported_traces > 0 else "; no spike/plateau images were available"
         self.status_label.setText(
-            f"Exported categorized PNGs for {exported_traces} traces to {out_dir} (spikes/plateaus/summary)"
+            f"Exported all tables, reports, reload files{image_note} to {out_dir}"
         )
 
-    def export_png_current_dialog(self) -> None:
+    def export_current_dialog(self) -> None:
         state = self._current_trace()
         if state is None:
+            return
+        if not self._analysis_ready_for_trace_names([state.trace_name], action="export current trace"):
             return
         self._pull_params_from_widgets()
 
         has_spikes = bool(state.spikes)
         has_plateau_map = bool(state.plateau_mask is not None and np.any(np.asarray(state.plateau_mask, dtype=bool)))
-        if not has_spikes and not has_plateau_map:
-            self.status_label.setText("No spikes or plateau labels in current trace to export")
-            return
 
         safe_name = "".join(c if c.isalnum() else "_" for c in state.trace_name)
-        out_dir = self._make_export_dir(f"png_{safe_name}")
+        out_dir = self._make_export_dir(f"export_current_{safe_name}")
         out_dir.mkdir(parents=True, exist_ok=True)
-        spikes_dir = out_dir / "spikes"
-        plateaus_dir = out_dir / "plateaus"
-        summary_dir = out_dir / "summary"
+        self._write_export_tables_and_report(out_dir, [state.trace_name])
+
+        images_dir = out_dir / "images"
+        spikes_dir = images_dir / "spikes"
+        plateaus_dir = images_dir / "plateaus"
+        summary_dir = images_dir / "summary"
         spikes_dir.mkdir(parents=True, exist_ok=True)
         plateaus_dir.mkdir(parents=True, exist_ok=True)
         summary_dir.mkdir(parents=True, exist_ok=True)
 
         pg.setConfigOptions(antialias=True)
-        self._export_trace_spike_bundle(
-            state,
-            out_dir,
-            spikes_dir=spikes_dir,
-            plateaus_dir=plateaus_dir,
-        )
+        exported_count = 0
+        if has_spikes or has_plateau_map:
+            exported_count, _aligned_pix, _superimposed_pix = self._export_trace_spike_bundle(
+                state,
+                out_dir,
+                spikes_dir=spikes_dir,
+                plateaus_dir=plateaus_dir,
+            )
+        self._write_export_manifest(out_dir, "current", [state.trace_name])
+        image_note = " with images" if exported_count > 0 or has_plateau_map else "; no spike/plateau images were available"
         self.status_label.setText(
-            f"Exported categorized PNGs for '{state.trace_name}' to {out_dir} (spikes/plateaus/summary)"
+            f"Exported current trace tables, reports, reload files{image_note} to {out_dir}"
         )
+
+    def export_png_dialog(self) -> None:
+        self.export_all_dialog()
+
+    def export_png_current_dialog(self) -> None:
+        self.export_current_dialog()
 
     def _export_trace_spike_bundle(
         self,
@@ -2878,10 +3918,6 @@ class SpikeCurationMainWindow(QMainWindow):
         spike_pixmaps: List[QtGui.QPixmap] = []
         half_window_ms = float(self.detection_params.spike_zoom_half_window_ms)
         single_w, single_h, aligned_row_h, _ = _spike_export_dimensions(half_window_ms)
-        if state.hybrid_denoised is None:
-            raise RuntimeError(
-                "Hybrid denoised detection trace is unavailable. Rerun detection before exporting PNGs."
-            )
 
         for spike_idx, spike in enumerate(state.spikes, 1):
             pix = _render_spike_png(
@@ -2997,30 +4033,189 @@ class SpikeCurationMainWindow(QMainWindow):
                         "onset_index",
                         "offset_index_exclusive",
                         "duration_ms",
-                        "plateau_height",
-                        "internal_spikes",
+                        "median_level",
+                        "floor_support_fraction",
                         "confidence",
                     ],
                 )
                 short_df.insert(0, "trace_name", state.trace_name)
                 short_df["onset_index"] = short_df["onset_index"].astype(int)
                 short_df["offset_index_exclusive"] = short_df["offset_index_exclusive"].astype(int)
-                short_df["internal_spikes"] = short_df["internal_spikes"].astype(bool)
                 short_df.to_csv(str(plateau_out / f"{safe_name}_short_plateau_detector_events.csv"), index=False)
 
         return len(spike_pixmaps), aligned_pix, superimposed_pix
 
 
     def _refresh_trace_list(self) -> None:
+        selected = self.current_trace_name
+        self.trace_list.blockSignals(True)
         self.trace_list.clear()
         for name in self.trace_names:
-            item = QListWidgetItem(name)
+            state = self.traces.get(name)
+            suffix = ""
+            if state is not None:
+                if state.analysis_status == "pending":
+                    suffix = " [pending]"
+                elif state.analysis_status == "running":
+                    suffix = " [analyzing]"
+                elif state.analysis_status == "error":
+                    suffix = " [error]"
+            item = QListWidgetItem(f"{name}{suffix}")
+            item.setData(Qt.ItemDataRole.UserRole, name)
             self.trace_list.addItem(item)
+        if selected in self.trace_names:
+            self.trace_list.setCurrentRow(self.trace_names.index(selected))
+        self.trace_list.blockSignals(False)
+
+    def _refresh_trace_list_item(self, trace_name: str) -> None:
+        try:
+            row = self.trace_names.index(trace_name)
+        except ValueError:
+            return
+        item = self.trace_list.item(row)
+        state = self.traces.get(trace_name)
+        if item is None or state is None:
+            return
+        suffix = ""
+        if state.analysis_status == "pending":
+            suffix = " [pending]"
+        elif state.analysis_status == "running":
+            suffix = " [analyzing]"
+        elif state.analysis_status == "error":
+            suffix = " [error]"
+        item.setText(f"{trace_name}{suffix}")
+        item.setData(Qt.ItemDataRole.UserRole, trace_name)
+
+    def _make_analysis_request(self, state: TraceCuration) -> TraceAnalysisRequest:
+        return TraceAnalysisRequest(
+            trace_name=state.trace_name,
+            time=np.asarray(state.time, dtype=float).copy(),
+            raw=np.asarray(state.raw, dtype=float).copy(),
+            corrected_source=np.asarray(state.corrected_source, dtype=float).copy(),
+            sampling_rate_hz=_trace_sampling_rate_hz(state),
+            detection_params=_clone_detection_params(self.detection_params),
+            artifact_params=_clone_artifact_params(self.artifact_params),
+            generation=int(self._analysis_generation),
+        )
+
+    def _start_analysis_for_trace(self, trace_name: str, priority: int = 0, force: bool = False) -> None:
+        state = self.traces.get(trace_name)
+        if state is None:
+            return
+        if not force and state.analysis_status in {"running", "done"}:
+            return
+        if force:
+            state.corrected = np.asarray(state.corrected_source, dtype=float).copy()
+            state.hybrid_denoised = None
+            state.hybrid_denoised_cache_key = None
+            state.hybrid_denoised_pending_key = None
+            state.baseline = np.zeros_like(state.corrected, dtype=float)
+            state.correction_baseline = None
+            state.highpass_trace = None
+            state.artifact_mask = None
+            state.plateau_mask = None
+            state.long_plateau_mask = None
+            state.short_plateau_mask = None
+            state.short_plateau_events = None
+            state.debug_threshold = None
+            state.candidate_windows = []
+            state.spikes = []
+            state.deleted_spikes = []
+            state.bursts = []
+            state.deleted_bursts = []
+        state.analysis_status = "running"
+        state.analysis_error = ""
+        state.analysis_generation = int(self._analysis_generation)
+        self._refresh_trace_list_item(trace_name)
+        request = self._make_analysis_request(state)
+        task = _TraceAnalysisTask(request, self._hybrid_denoise_fn)
+        task.signals.finished.connect(self._on_trace_analysis_finished)
+        self._analysis_tasks.append(task)
+        self._analysis_thread_pool.start(task, priority=int(priority))
+
+    def _apply_saved_session_state_to_trace(self, trace_name: str) -> None:
+        if self._pending_session is None or trace_name not in self._pending_session.trace_states:
+            return
+        if self._pending_session_generation != self._analysis_generation:
+            return
+        state = self.traces.get(trace_name)
+        if state is None:
+            return
+        trace_session = AppSession(
+            excel_path=self._pending_session.excel_path,
+            detection_params=self._pending_session.detection_params,
+            artifact_params=self._pending_session.artifact_params,
+            trace_states={trace_name: self._pending_session.trace_states[trace_name]},
+        )
+        apply_session_to_traces(trace_session, {trace_name: state})
+
+    def _apply_analysis_result(self, state: TraceCuration, result: TraceAnalysisResult) -> None:
+        detection = result.detection
+        state.spikes = detection.spikes
+        state.corrected = result.corrected
+        state.sampling_rate_hz = result.sampling_rate_hz
+        state.hybrid_denoised = result.hybrid_denoised
+        state.hybrid_denoised_cache_key = self._hybrid_cache_key()
+        state.hybrid_denoised_pending_key = None
+        state.smoothed = detection.smoothed
+        state.baseline = detection.baseline
+        state.correction_baseline = result.correction_baseline
+        state.highpass_trace = _detection_highpass_trace(detection, self.detection_params.use_highpass_filter)
+        state.artifact_mask = np.asarray(result.artifact_mask, dtype=bool)
+        state.debug_threshold = detection.threshold
+        state.candidate_windows = detection.candidate_windows
+        state.plateau_mask = _detection_mask(detection, "baseline_mask")
+        state.long_plateau_mask = _detection_mask(detection, "long_plateau_mask")
+        state.short_plateau_mask = _detection_mask(detection, "short_plateau_mask", fallback_key="")
+        state.short_plateau_events = _detection_short_events(detection)
+        state.analysis_status = "done"
+        state.analysis_error = ""
+        self._apply_saved_session_state_to_trace(state.trace_name)
+        state.sort_spikes()
+
+    def _on_trace_analysis_finished(
+        self,
+        trace_name: str,
+        generation: int,
+        result: Optional[TraceAnalysisResult],
+        error: Optional[str],
+    ) -> None:
+        self._analysis_tasks = [
+            task
+            for task in self._analysis_tasks
+            if not (task.request.trace_name == trace_name and task.request.generation == generation)
+        ]
+        state = self.traces.get(trace_name)
+        if state is None or int(generation) != int(self._analysis_generation):
+            return
+        if result is None or error is not None:
+            state.analysis_status = "error"
+            state.analysis_error = str(error or "Unknown analysis error")
+            self._refresh_trace_list_item(trace_name)
+            if self.current_trace_name == trace_name:
+                self._render_current_trace(reset_view=True)
+            if self._pending_session is not None and all(
+                trace.analysis_status in {"done", "error"} for trace in self.traces.values()
+            ):
+                self._pending_session = None
+                self._pending_session_generation = None
+            return
+
+        self._apply_analysis_result(state, result)
+        self._refresh_trace_list_item(trace_name)
+        if self.current_trace_name == trace_name:
+            self._render_current_trace(reset_view=True)
+        if self._pending_session is not None and all(
+            trace.analysis_status in {"done", "error"} for trace in self.traces.values()
+        ):
+            self._pending_session = None
+            self._pending_session_generation = None
 
     def on_trace_selected(self, row: int) -> None:
         if row < 0 or row >= len(self.trace_names):
             return
         self.current_trace_name = self.trace_names[row]
+        self._start_analysis_for_trace(self.current_trace_name, priority=10)
         self._render_current_trace(reset_view=True)
 
     def _current_trace(self) -> Optional[TraceCuration]:
@@ -3033,11 +4228,12 @@ class SpikeCurationMainWindow(QMainWindow):
         if state is None:
             return
 
-        spikes_for_plot = sorted(state.spikes + state.deleted_spikes, key=lambda spike: spike.spike_index)
+        spikes_for_plot = sorted(state.spikes, key=lambda spike: spike.spike_index)
         self.plot.set_overlay_visibility(
             show_raw=self.chk_show_raw.isChecked(),
             show_corrected=self.chk_show_corrected.isChecked(),
             show_baseline=self.chk_show_baseline.isChecked(),
+            show_highpass=self.chk_show_highpass.isChecked(),
             show_hybrid_denoised=self.chk_show_hybrid_denoised.isChecked(),
         )
 
@@ -3058,6 +4254,7 @@ class SpikeCurationMainWindow(QMainWindow):
             raw=raw_for_view,
             corrected=corrected_for_view,
             hybrid_denoised=hybrid_for_view,
+            highpass=state.highpass_trace,
             raw_baseline=raw_baseline_for_view,
             corrected_baseline=corrected_baseline_for_view,
             spikes=spikes_for_plot,
@@ -3070,6 +4267,15 @@ class SpikeCurationMainWindow(QMainWindow):
             startup_exclusion_ms=self.detection_params.startup_exclusion_ms,
         )
         self._refresh_table(state)
+        if state.analysis_status != "done":
+            fs_status = f" | fs: {_trace_sampling_rate_hz(state):.3g} Hz"
+            if state.analysis_status == "error":
+                self.status_label.setText(
+                    f"Trace: {state.trace_name}{fs_status} | analysis error: {state.analysis_error or 'unknown error'}"
+                )
+            else:
+                self.status_label.setText(f"Trace: {state.trace_name}{fs_status} | analysis {state.analysis_status}")
+            return
         plateau_count = 0
         if state.plateau_mask is not None:
             plateau_count = len(_contiguous_true_regions(np.asarray(state.plateau_mask, dtype=bool)))
@@ -3078,15 +4284,56 @@ class SpikeCurationMainWindow(QMainWindow):
             short_count = len(_contiguous_true_regions(np.asarray(state.short_plateau_mask, dtype=bool)))
         hybrid_status = ""
         if self.chk_show_hybrid_denoised.isChecked():
-            hybrid_status = " | hybrid denoised: shown" if state.hybrid_denoised is not None else ""
+            hybrid_status = " | state-guided denoised: shown" if state.hybrid_denoised is not None else ""
         fs_status = f" | fs: {_trace_sampling_rate_hz(state):.3g} Hz"
         self.status_label.setText(
             f"Trace: {state.trace_name}{fs_status} | plateaus: {plateau_count} (short: {short_count}) | spikes: {len(state.spikes)}{hybrid_status}"
         )
 
-    def _hybrid_cache_key(self) -> Tuple[float, str]:
-        mode = str(self.param_hybrid_event_mode.currentData() or "svd")
-        return float(self.param_hybrid_threshold_sd.value()), mode
+    def _low_state_denoise_kwargs(self) -> Dict[str, object]:
+        return {
+            "threshold_sd": float(self.param_gonzalez_threshold_sd.value()),
+            "max_clusters": int(self.param_gonzalez_max_clusters.value()),
+            "attenuation_min": float(self.param_gonzalez_attenuation_min.value()),
+            "attenuation_max": float(self.param_gonzalez_attenuation_max.value()),
+            "enable_noise_cluster_rejection": bool(self.param_gonzalez_noise_cluster_rejection.isChecked()),
+            "enable_event_template_rejection": bool(self.param_gonzalez_event_template_rejection.isChecked()),
+            "enable_low_state_safety_gate": bool(self.detection_params.enable_low_state_safety_gate),
+            "min_event_peak_preservation": float(self.detection_params.min_event_peak_preservation),
+            "min_local_max_ratio": float(self.detection_params.min_local_max_ratio),
+            "min_reliable_low_state_fraction": float(self.detection_params.min_reliable_low_state_fraction),
+            "min_reliable_low_state_samples": int(self.detection_params.min_reliable_low_state_samples),
+            "plateau_tv_min_duration_ms": float(self.detection_params.plateau_tv_min_duration_ms),
+            "plateau_tv_max_weight_factor": float(self.detection_params.plateau_tv_max_weight_factor),
+        }
+
+    def _hybrid_cache_key(self) -> Tuple[object, ...]:
+        low_state_denoiser = str(self.param_low_state_denoiser.currentData() or "gonzalez_adaptive_wavelet")
+        state_aware_mode = low_state_denoiser in {"gonzalez_adaptive_wavelet", "legacy_hybrid"}
+        plateau_tv_weight = (
+            float(self.param_plateau_tv_weight.value()) if state_aware_mode else None
+        )
+        boundary_protect_ms = (
+            float(self.param_low_state_boundary_protect_ms.value()) if state_aware_mode else None
+        )
+        return (
+            low_state_denoiser,
+            float(self.param_gonzalez_threshold_sd.value()),
+            int(self.param_gonzalez_max_clusters.value()),
+            float(self.param_gonzalez_attenuation_min.value()),
+            float(self.param_gonzalez_attenuation_max.value()),
+            bool(self.param_gonzalez_noise_cluster_rejection.isChecked()),
+            bool(self.param_gonzalez_event_template_rejection.isChecked()),
+            bool(self.detection_params.enable_low_state_safety_gate),
+            float(self.detection_params.min_event_peak_preservation),
+            float(self.detection_params.min_local_max_ratio),
+            float(self.detection_params.min_reliable_low_state_fraction),
+            int(self.detection_params.min_reliable_low_state_samples),
+            float(self.detection_params.plateau_tv_min_duration_ms),
+            float(self.detection_params.plateau_tv_max_weight_factor),
+            plateau_tv_weight,
+            boundary_protect_ms,
+        )
 
     def _ensure_hybrid_denoised(self, state: TraceCuration) -> None:
         cache_key = self._hybrid_cache_key()
@@ -3099,13 +4346,20 @@ class SpikeCurationMainWindow(QMainWindow):
         if state.hybrid_denoised_pending_key == cache_key:
             return
         state.hybrid_denoised_pending_key = cache_key
+        low_state_denoiser = str(self.param_low_state_denoiser.currentData() or "gonzalez_adaptive_wavelet")
+        plateau_mask = state.long_plateau_mask if state.long_plateau_mask is not None else state.plateau_mask
         task = _HybridDenoiseTask(
             trace_name=state.trace_name,
             cache_key=cache_key,
-            denoise_fn=self._hybrid_denoise_fn,
             corrected=state.corrected,
             fs=_trace_sampling_rate_hz(state),
             baseline=state.baseline,
+            plateau_mask=plateau_mask,
+            low_state_denoiser=low_state_denoiser,
+            low_state_kwargs=self._low_state_denoise_kwargs(),
+            plateau_tv_weight=float(self.param_plateau_tv_weight.value()),
+            boundary_protect_ms=float(self.param_low_state_boundary_protect_ms.value()),
+            legacy_denoise_fn=self._hybrid_denoise_fn,
         )
         task.signals.finished.connect(self._on_hybrid_denoise_finished)
         self._hybrid_tasks.append(task)
@@ -3119,55 +4373,34 @@ class SpikeCurationMainWindow(QMainWindow):
         artifact_mask: np.ndarray,
         sampling_rate_hz: Optional[float] = None,
     ):
-        """Detect plateaus on source data, then detect spikes on hybrid denoising."""
-        # Plateau labels and their interpolated fluorescence baseline must come
-        # from the artifact-interpolated source trace before any denoising.
-        baseline_result = detect_spikes(
-            trace_name,
-            time,
-            corrected,
-            self.detection_params,
-            artifact_mask=artifact_mask,
-            sampling_rate_hz=sampling_rate_hz,
+        """Detect plateaus on source data, then detect spikes on state-guided denoising."""
+        params = _clone_detection_params(self.detection_params)
+        params.low_state_denoiser = str(self.param_low_state_denoiser.currentData() or params.low_state_denoiser)
+        params.gonzalez_threshold_sd = float(self.param_gonzalez_threshold_sd.value())
+        params.gonzalez_max_clusters = int(self.param_gonzalez_max_clusters.value())
+        params.gonzalez_attenuation_min = float(self.param_gonzalez_attenuation_min.value())
+        params.gonzalez_attenuation_max = float(self.param_gonzalez_attenuation_max.value())
+        params.gonzalez_enable_noise_cluster_rejection = bool(self.param_gonzalez_noise_cluster_rejection.isChecked())
+        params.gonzalez_enable_event_template_rejection = bool(self.param_gonzalez_event_template_rejection.isChecked())
+        params.plateau_tv_weight = float(self.param_plateau_tv_weight.value())
+        params.low_state_boundary_protect_ms = float(self.param_low_state_boundary_protect_ms.value())
+        request = TraceAnalysisRequest(
+            trace_name=trace_name,
+            time=np.asarray(time, dtype=float),
+            raw=np.asarray(corrected, dtype=float),
+            corrected_source=np.asarray(corrected, dtype=float),
+            sampling_rate_hz=float(sampling_rate_hz) if sampling_rate_hz is not None else _sampling_rate_hz(time),
+            detection_params=params,
+            artifact_params=_clone_artifact_params(self.artifact_params),
+            generation=int(self._analysis_generation),
         )
-        baseline = np.asarray(baseline_result.baseline, dtype=float)
-        plateau_mask = _detection_mask(baseline_result, "long_plateau_mask")
-        threshold_sd, event_mode = self._hybrid_cache_key()
-        fs = float(sampling_rate_hz) if sampling_rate_hz is not None and np.isfinite(sampling_rate_hz) and float(sampling_rate_hz) > 0.0 else _sampling_rate_hz(time)
-        # Keep the original Hybrid output for low-state samples. Replace the
-        # plateau and its protected margin with state-local TV denoising.
-        denoised_uncorrected = np.asarray(
-            denoise_trace_hybrid_low_plateau_tv(
-                corrected,
-                fs=fs,
-                plateau_mask=plateau_mask,
-                plateau_tv_weight=float(self.param_plateau_tv_weight.value()),
-                boundary_protect_ms=float(self.param_hybrid_plateau_protect_ms.value()),
-                hybrid_denoise_fn=self._hybrid_denoise_fn,
-                threshold_sd=threshold_sd,
-                event_mode=event_mode,
-            ),
-            dtype=float,
-        )
-        corrected_baseline_corrected = np.asarray(corrected, dtype=float) - baseline
-        denoised_baseline_corrected = denoised_uncorrected - baseline
-        detection = detect_spikes(
-            trace_name,
-            time,
-            denoised_baseline_corrected,
-            self.detection_params,
-            artifact_mask=artifact_mask,
-            baseline_override=np.zeros_like(baseline),
-            plateau_mask_override=plateau_mask,
-            sampling_rate_hz=sampling_rate_hz,
-            short_plateau_trace_override=corrected_baseline_corrected,
-        )
-        return corrected_baseline_corrected, denoised_baseline_corrected, baseline, detection
+        result = analyze_trace_data(request, legacy_denoise_fn=self._hybrid_denoise_fn)
+        return result.corrected, result.hybrid_denoised, result.correction_baseline, result.detection
 
     def _on_hybrid_denoise_finished(
         self,
         trace_name: str,
-        cache_key: Tuple[float, str],
+        cache_key: Tuple[object, ...],
         result: Optional[np.ndarray],
         error: Optional[str],
     ) -> None:
@@ -3179,14 +4412,14 @@ class SpikeCurationMainWindow(QMainWindow):
             result_array = np.asarray(result, dtype=float)
             if result_array.shape != np.asarray(state.corrected).shape or not np.all(np.isfinite(result_array)):
                 result = None
-                error = "Hybrid denoising returned invalid data"
+                error = "State-guided denoising returned invalid data"
         state.hybrid_denoised_pending_key = None
         if error is not None or result is None:
             state.hybrid_denoised = None
             state.hybrid_denoised_cache_key = None
             if self.current_trace_name == trace_name:
                 self.chk_show_hybrid_denoised.setChecked(False)
-                QMessageBox.warning(self, "Hybrid Denoising Error", str(error or "Unknown error"))
+                QMessageBox.warning(self, "State-Guided Denoising Error", str(error or "Unknown error"))
             return
         result_array = np.asarray(result, dtype=float)
         normalized_result = _as_corrected_units(
@@ -3204,23 +4437,19 @@ class SpikeCurationMainWindow(QMainWindow):
         self._render_current_trace(refit_y=True)
 
     def _refresh_table(self, state: TraceCuration) -> None:
-        table_spikes = sorted(state.spikes + state.deleted_spikes, key=lambda spike: spike.spike_index)
+        table_spikes = sorted(state.spikes, key=lambda spike: spike.spike_index)
         self._table_spikes = table_spikes
         self.table.setRowCount(len(table_spikes))
         for row, spike in enumerate(table_spikes):
             values = [
                 str(spike.spike_index),
                 f"{spike.spike_time:.2f}",
-                spike.status,
-                spike.source,
                 f"{spike.amplitude_above_baseline:.2f}",
                 f"{spike.snr:.2f}",
                 f"{spike.prominence:.2f}",
             ]
             for col, value in enumerate(values):
                 item = QTableWidgetItem(value)
-                item.setBackground(STATUS_ROW_COLORS.get(spike.status, QColor("white")))
-                item.setForeground(QColor("#111111"))
                 self.table.setItem(row, col, item)
 
     def _nearest_sample_index(self, state: TraceCuration, clicked_time: float) -> int:
@@ -3254,130 +4483,39 @@ class SpikeCurationMainWindow(QMainWindow):
         half_window = _half_window_in_time_units(state.time, half_window_ms)
         self.plot.main_plot.setXRange(t - half_window, t + half_window, padding=0)
 
-    def _selected_spike(self) -> Optional[SpikeRecord]:
-        row = self.table.currentRow()
-        if row < 0 or row >= len(self._table_spikes):
-            return None
-        return self._table_spikes[row]
-
-    def set_selected_status(self, status: str) -> None:
-        state = self._current_trace()
-        spike = self._selected_spike()
-        if state is None or spike is None:
-            return
-
-        if status == "deleted":
-            if spike in state.spikes:
-                state.spikes.remove(spike)
-                state.deleted_spikes.append(spike)
-                state.deleted_spikes.sort(key=lambda item: item.spike_index)
-            spike.status = "deleted"  # type: ignore[assignment]
-            self._render_current_trace()
-            return
-
-        if spike in state.deleted_spikes:
-            state.deleted_spikes.remove(spike)
-            state.spikes.append(spike)
-            state.sort_spikes()
-
-        spike.status = status  # type: ignore[assignment]
-        self._render_current_trace()
-
-    def toggle_selected_status(self) -> None:
-        state = self._current_trace()
-        spike = self._selected_spike()
-        if state is None or spike is None:
-            return
-
-        if spike in state.deleted_spikes:
-            state.deleted_spikes.remove(spike)
-            state.spikes.append(spike)
-            state.sort_spikes()
-
-        cycle = {"pending": "accepted", "accepted": "rejected", "rejected": "pending"}
-        spike.status = cycle.get(spike.status, "pending")  # type: ignore[assignment]
-        self._render_current_trace()
-
-    def delete_selected_spike(self) -> None:
-        state = self._current_trace()
-        spike = self._selected_spike()
-        if state is None or spike is None:
-            return
-        if spike in state.spikes:
-            state.spikes.remove(spike)
-            spike.status = "deleted"  # type: ignore[assignment]
-            state.deleted_spikes.append(spike)
-            state.deleted_spikes.sort(key=lambda item: item.spike_index)
-        self._render_current_trace()
-
     def rerun_all(self) -> None:
         if not self.traces:
             return
         self._pull_params_from_widgets()
-        for state in self.traces.values():
-            corrected, artifact_mask = apply_artifact_interpolation(
-                state.time,
-                state.corrected_source,
-                params=self.artifact_params.to_dict(),
-            )
-            sampling_rate_hz = _trace_sampling_rate_hz(state)
-            corrected, hybrid_denoised, correction_baseline, detection = self._detect_on_hybrid_denoised(
-                state.trace_name, state.time, corrected, artifact_mask, sampling_rate_hz=sampling_rate_hz
-            )
-            state.spikes = detection.spikes
-            state.deleted_spikes = []
-            state.corrected = corrected
-            state.sampling_rate_hz = sampling_rate_hz
-            state.hybrid_denoised = hybrid_denoised
-            state.hybrid_denoised_cache_key = self._hybrid_cache_key()
-            state.hybrid_denoised_pending_key = None
-            state.smoothed = detection.smoothed
-            state.baseline = detection.baseline
-            state.correction_baseline = correction_baseline
-            state.artifact_mask = np.asarray(artifact_mask, dtype=bool)
-            state.debug_threshold = detection.threshold
-            state.candidate_windows = detection.candidate_windows
-            state.plateau_mask = _detection_mask(detection, "baseline_mask")
-            state.long_plateau_mask = _detection_mask(detection, "long_plateau_mask")
-            state.short_plateau_mask = _detection_mask(detection, "short_plateau_mask", fallback_key="")
-            state.short_plateau_events = _detection_short_events(detection)
-            state.sort_spikes()
+        self._analysis_generation += 1
+        self._pending_session = None
+        self._pending_session_generation = None
+        current = self.current_trace_name
+        for name, state in self.traces.items():
+            state.analysis_generation = int(self._analysis_generation)
+            state.analysis_status = "pending"
+            state.analysis_error = ""
+        if current:
+            self._start_analysis_for_trace(current, priority=10, force=True)
+        for name in self.trace_names:
+            if name != current:
+                self._start_analysis_for_trace(name, priority=0, force=True)
+        self._refresh_trace_list()
         self._render_current_trace()
+        self.status_label.setText(f"Re-detecting {len(self.trace_names)} traces in background...")
 
     def rerun_current(self) -> None:
         state = self._current_trace()
         if state is None:
             return
         self._pull_params_from_widgets()
-
-        corrected, artifact_mask = apply_artifact_interpolation(
-            state.time,
-            state.corrected_source,
-            params=self.artifact_params.to_dict(),
-        )
-        sampling_rate_hz = _trace_sampling_rate_hz(state)
-        corrected, hybrid_denoised, correction_baseline, detection = self._detect_on_hybrid_denoised(
-            state.trace_name, state.time, corrected, artifact_mask, sampling_rate_hz=sampling_rate_hz
-        )
-        state.spikes = detection.spikes
-        state.deleted_spikes = []
-        state.corrected = corrected
-        state.sampling_rate_hz = sampling_rate_hz
-        state.hybrid_denoised = hybrid_denoised
-        state.hybrid_denoised_cache_key = self._hybrid_cache_key()
-        state.hybrid_denoised_pending_key = None
-        state.smoothed = detection.smoothed
-        state.baseline = detection.baseline
-        state.correction_baseline = correction_baseline
-        state.artifact_mask = np.asarray(artifact_mask, dtype=bool)
-        state.debug_threshold = detection.threshold
-        state.candidate_windows = detection.candidate_windows
-        state.plateau_mask = _detection_mask(detection, "baseline_mask")
-        state.long_plateau_mask = _detection_mask(detection, "long_plateau_mask")
-        state.short_plateau_mask = _detection_mask(detection, "short_plateau_mask", fallback_key="")
-        state.short_plateau_events = _detection_short_events(detection)
-        state.sort_spikes()
+        self._analysis_generation += 1
+        self._pending_session = None
+        self._pending_session_generation = None
+        state.analysis_generation = int(self._analysis_generation)
+        self._start_analysis_for_trace(state.trace_name, priority=10, force=True)
         self._render_current_trace()
+        self.status_label.setText(f"Re-detecting {state.trace_name} in background...")
 
     def next_trace(self) -> None:
         row = self.trace_list.currentRow()

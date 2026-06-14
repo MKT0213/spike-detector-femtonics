@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, Iterable, List, Optional
+from typing import Iterable, List, Optional
 
 import numpy as np
 import pyqtgraph as pg
@@ -8,15 +8,6 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import QVBoxLayout, QWidget
 
 from .models import SpikeRecord
-
-
-STATUS_COLORS: Dict[str, str] = {
-    "pending": "#f1c40f",
-    "accepted": "#2ecc71",
-    "rejected": "#e74c3c",
-    "manual": "#3498db",
-    "deleted": "#6b7280",
-}
 
 
 class SmoothViewBox(pg.ViewBox):
@@ -98,7 +89,11 @@ class TracePlotWidget(QWidget):
 
         self.main_raw = self.main_plot.plot(pen=pg.mkPen("#9aa0a6", width=0.9), name="Raw")
         self.main_corrected = self.main_plot.plot(pen=pg.mkPen("#2979ff", width=1.8), name="Corrected")
-        self.main_hybrid_denoised = self.main_plot.plot(pen=pg.mkPen("#8e24aa", width=1.8), name="Hybrid Denoised")
+        self.main_highpass = self.main_plot.plot(
+            pen=pg.mkPen("#00897b", width=1.3, style=Qt.PenStyle.DashLine),
+            name="High-pass",
+        )
+        self.main_hybrid_denoised = self.main_plot.plot(pen=pg.mkPen("#8e24aa", width=1.8), name="State-Guided Denoised")
         self.main_plateau = self.main_plot.plot(pen=pg.mkPen("#c62828", width=2.2), name="Long Plateau")
         self.main_short_plateau = self.main_plot.plot(pen=pg.mkPen("#1565c0", width=2.2), name="Short Plateau")
         self.main_raw_baseline = self.main_plot.plot(pen=pg.mkPen("#ff6d00", width=1.6), name="Raw Baseline")
@@ -114,6 +109,7 @@ class TracePlotWidget(QWidget):
         for item in [
             self.main_raw,
             self.main_corrected,
+            self.main_highpass,
             self.main_hybrid_denoised,
             self.main_plateau,
             self.main_short_plateau,
@@ -125,12 +121,12 @@ class TracePlotWidget(QWidget):
             item.setClipToView(True)
             item.setDownsampling(auto=True, method="peak")
 
-        self.scatter_items: Dict[str, pg.ScatterPlotItem] = {
-            status: pg.ScatterPlotItem(size=9, brush=pg.mkBrush(color), pen=pg.mkPen("#ffffff", width=1.0))
-            for status, color in STATUS_COLORS.items()
-        }
-        for scatter in self.scatter_items.values():
-            self.main_plot.addItem(scatter)
+        self.spike_scatter = pg.ScatterPlotItem(
+            size=9,
+            brush=pg.mkBrush("#f1c40f"),
+            pen=pg.mkPen("#ffffff", width=1.0),
+        )
+        self.main_plot.addItem(self.spike_scatter)
 
         self.overview_curve = self.overview_plot.plot(pen=pg.mkPen("#777", width=1))
         self.overview_curve.setClipToView(True)
@@ -148,10 +144,13 @@ class TracePlotWidget(QWidget):
         self._show_raw = True
         self._show_corrected = True
         self._show_baseline = True
+        self._show_highpass = False
         self._show_hybrid_denoised = False
         self._has_raw_baseline = False
         self._has_corrected_baseline = False
+        self._has_highpass = False
         self._has_hybrid_denoised = False
+        self.main_highpass.setZValue(10)
         self.main_hybrid_denoised.setZValue(11)
         self._sync_legend()
 
@@ -325,7 +324,8 @@ class TracePlotWidget(QWidget):
         entries = [
             ("Raw", self.main_raw, self._show_raw and self._has_raw_baseline),
             ("Corrected", self.main_corrected, self._show_corrected),
-            ("Hybrid Denoised", self.main_hybrid_denoised, self._show_hybrid_denoised and self._has_hybrid_denoised),
+            ("High-pass", self.main_highpass, self._show_highpass and self._has_highpass),
+            ("State-Guided Denoised", self.main_hybrid_denoised, self._show_hybrid_denoised and self._has_hybrid_denoised),
             ("Long Plateau", self.main_plateau, True),
             ("Short Plateau", self.main_short_plateau, True),
             ("Raw Baseline", self.compare_raw_baseline, self._show_baseline and self._show_raw and self._has_raw_baseline),
@@ -425,6 +425,7 @@ class TracePlotWidget(QWidget):
         raw: np.ndarray,
         corrected: np.ndarray,
         hybrid_denoised: Optional[np.ndarray],
+        highpass: Optional[np.ndarray],
         raw_baseline: Optional[np.ndarray],
         corrected_baseline: Optional[np.ndarray],
     ) -> None:
@@ -432,6 +433,7 @@ class TracePlotWidget(QWidget):
             raw=raw,
             corrected=corrected,
             hybrid_denoised=hybrid_denoised,
+            highpass=highpass,
             raw_baseline=raw_baseline,
             corrected_baseline=corrected_baseline,
         )
@@ -450,6 +452,7 @@ class TracePlotWidget(QWidget):
         raw: np.ndarray,
         corrected: np.ndarray,
         hybrid_denoised: Optional[np.ndarray],
+        highpass: Optional[np.ndarray],
         raw_baseline: Optional[np.ndarray],
         corrected_baseline: Optional[np.ndarray],
     ) -> Optional[tuple[float, float]]:
@@ -466,6 +469,8 @@ class TracePlotWidget(QWidget):
             core_parts.append(_trim_start(corrected))
         if self._show_hybrid_denoised and hybrid_denoised is not None:
             core_parts.append(_trim_start(hybrid_denoised))
+        if self._show_highpass and highpass is not None:
+            core_parts.append(_trim_start(highpass))
         if self._show_raw and self._show_baseline and raw_baseline is not None:
             core_parts.append(_trim_start(raw_baseline))
             core_parts.append(_trim_start(raw))
@@ -539,16 +544,19 @@ class TracePlotWidget(QWidget):
         show_raw: bool,
         show_corrected: bool,
         show_baseline: bool,
+        show_highpass: bool = False,
         show_hybrid_denoised: bool = False,
     ) -> None:
         self._show_raw = bool(show_raw)
         self._show_corrected = bool(show_corrected)
         self._show_baseline = bool(show_baseline)
+        self._show_highpass = bool(show_highpass)
         self._show_hybrid_denoised = bool(show_hybrid_denoised)
         self.main_raw.setVisible(show_raw)
         self.main_corrected.setVisible(show_corrected)
         self.main_raw_baseline.setVisible(False)
         self.main_corrected_baseline.setVisible(show_baseline and show_corrected and self._has_corrected_baseline)
+        self.main_highpass.setVisible(show_highpass and self._has_highpass)
         self.main_hybrid_denoised.setVisible(show_hybrid_denoised and self._has_hybrid_denoised)
         self._sync_legend()
 
@@ -558,6 +566,7 @@ class TracePlotWidget(QWidget):
         raw: np.ndarray,
         corrected: np.ndarray,
         hybrid_denoised: Optional[np.ndarray],
+        highpass: Optional[np.ndarray],
         raw_baseline: Optional[np.ndarray],
         corrected_baseline: Optional[np.ndarray],
         spikes: Iterable[SpikeRecord],
@@ -586,6 +595,8 @@ class TracePlotWidget(QWidget):
                 corrected = np.asarray(corrected, dtype=float)[startup_idx:]
                 if hybrid_denoised is not None:
                     hybrid_denoised = np.asarray(hybrid_denoised, dtype=float)[startup_idx:]
+                if highpass is not None:
+                    highpass = np.asarray(highpass, dtype=float)[startup_idx:]
                 if raw_baseline is not None:
                     raw_baseline = np.asarray(raw_baseline, dtype=float)[startup_idx:]
                 if corrected_baseline is not None:
@@ -605,6 +616,7 @@ class TracePlotWidget(QWidget):
         raw_baseline_array = None if raw_baseline is None else np.asarray(raw_baseline, dtype=float)
         corrected_baseline_array = None if corrected_baseline is None else np.asarray(corrected_baseline, dtype=float)
         hybrid_array = None if hybrid_denoised is None else np.asarray(hybrid_denoised, dtype=float)
+        highpass_array = None if highpass is None else np.asarray(highpass, dtype=float)
         if (
             hybrid_array is not None
             and raw_baseline_array is not None
@@ -625,6 +637,7 @@ class TracePlotWidget(QWidget):
             corrected_baseline_array is not None and corrected_baseline_array.shape == corrected_array.shape
         )
         self._has_hybrid_denoised = bool(hybrid_array is not None and hybrid_array.shape == corrected_array.shape)
+        self._has_highpass = bool(highpass_array is not None and highpass_array.shape == corrected_array.shape)
 
         # The main plot is corrected-unit only. Raw-unit data stays in the lower
         # raw panel; if raw appears in the main plot, it is baseline-subtracted.
@@ -633,6 +646,10 @@ class TracePlotWidget(QWidget):
         self.main_raw.setData(self.time, raw_main)
         self.compare_raw.setData(self.time, raw)
         self.main_corrected.setData(self.time, corrected_array)
+        if self._has_highpass:
+            self.main_highpass.setData(self.time, highpass_array)
+        else:
+            self.main_highpass.setData([], [])
         if self._has_hybrid_denoised:
             self.main_hybrid_denoised.setData(self.time, hybrid_array)
         else:
@@ -652,6 +669,7 @@ class TracePlotWidget(QWidget):
         self.main_corrected_baseline.setVisible(
             self._show_baseline and self._show_corrected and self._has_corrected_baseline
         )
+        self.main_highpass.setVisible(self._show_highpass and self._has_highpass)
         self.main_hybrid_denoised.setVisible(self._show_hybrid_denoised and self._has_hybrid_denoised)
 
         self._set_plateau_regions(
@@ -662,26 +680,25 @@ class TracePlotWidget(QWidget):
 
         self._set_artifact_regions(artifact_mask)
 
-        by_status: Dict[str, List[tuple[float, float]]] = {k: [] for k in STATUS_COLORS}
+        spike_points: List[tuple[float, float]] = []
         marker_signal = hybrid_array if self._has_hybrid_denoised else corrected_array
         for spike in spikes:
             local_idx = int(spike.spike_index) - int(startup_idx)
             if 0 <= local_idx < len(self.time) and 0 <= local_idx < len(marker_signal):
-                by_status.setdefault(spike.status, []).append((self.time[local_idx], marker_signal[local_idx]))
+                spike_points.append((self.time[local_idx], marker_signal[local_idx]))
 
-        for status, scatter in self.scatter_items.items():
-            points = by_status.get(status, [])
-            if points:
-                xs = [p[0] for p in points]
-                ys = [p[1] for p in points]
-                scatter.setData(xs, ys)
-            else:
-                scatter.setData([], [])
+        if spike_points:
+            xs = [p[0] for p in spike_points]
+            ys = [p[1] for p in spike_points]
+            self.spike_scatter.setData(xs, ys)
+        else:
+            self.spike_scatter.setData([], [])
 
         y_extent = self._y_extent_from_data(
             raw=raw_main,
             corrected=corrected_array,
             hybrid_denoised=hybrid_array if self._has_hybrid_denoised else None,
+            highpass=highpass_array if self._has_highpass else None,
             raw_baseline=None,
             corrected_baseline=corrected_baseline_array if self._has_corrected_baseline else None,
         )
@@ -691,6 +708,7 @@ class TracePlotWidget(QWidget):
                 raw=raw_main,
                 corrected=corrected_array,
                 hybrid_denoised=hybrid_array if self._has_hybrid_denoised else None,
+                highpass=highpass_array if self._has_highpass else None,
                 raw_baseline=None,
                 corrected_baseline=corrected_baseline_array if self._has_corrected_baseline else None,
             )
@@ -730,6 +748,7 @@ class TracePlotWidget(QWidget):
                     raw=raw_main,
                     corrected=corrected_array,
                     hybrid_denoised=hybrid_array if self._has_hybrid_denoised else None,
+                    highpass=highpass_array if self._has_highpass else None,
                     raw_baseline=None,
                     corrected_baseline=corrected_baseline_array if self._has_corrected_baseline else None,
                 )
