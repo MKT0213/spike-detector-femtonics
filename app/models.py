@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -28,6 +28,18 @@ class DetectionParams:
     long_plateau_exit_fraction: float = 0.5
     long_plateau_enter_sustain_ms: float = 10.0
     long_plateau_exit_sustain_ms: float = 25.0
+    # Short-plateau detector controls for brief raised-floor events.
+    short_plateau_step_noise_k: float = 3.5
+    short_plateau_elevated_noise_k: float = 3.0
+    short_plateau_survival_noise_k: float = 2.0
+    short_plateau_loss_noise_k: float = 1.25
+    short_plateau_median_noise_k: float = 4.0
+    short_plateau_pre_quiet_noise_k: float = 1.75
+    short_plateau_min_support_fraction: float = 0.75
+    short_plateau_min_confidence: float = 0.65
+    short_plateau_early_dwell_ms: float = 30.0
+    short_plateau_min_support_ms: float = 15.0
+    short_plateau_min_duration_ms: float = 25.0
     # Flat horizontal threshold value (in signal units, same as centered signal).
     absolute_threshold: float = 250.0
     # When enabled, threshold is computed automatically from the no-event period as:
@@ -55,7 +67,7 @@ class DetectionParams:
 
     # State-guided denoising: Gonzalez adaptive wavelet on bridged low-state
     # samples, TV for plateau cores, raw corrected samples around boundaries.
-    low_state_denoiser: str = "gonzalez_adaptive_wavelet"
+    low_state_denoiser: str = "gonzalez_full_trace"
     gonzalez_threshold_sd: float = 2.0
     gonzalez_max_clusters: int = 20
     gonzalez_attenuation_min: float = 0.5
@@ -128,7 +140,9 @@ class DetectionParams:
                     value = value.replace(f"{prefix}_", "")
             if normalized_key == "low_state_denoiser" and isinstance(value, str):
                 mode = value.strip().lower()
-                if mode in {"gonzalez_full_trace", "full_trace_gonzalez", "full_gonzalez", "gonzalez_all_states"}:
+                if mode in {"gonzalez_full_trace_dff", "full_trace_dff", "full_trace_gonzalez_dff", "gonzalez_dff"}:
+                    value = "gonzalez_full_trace_dff"
+                elif mode in {"gonzalez_full_trace", "full_trace_gonzalez", "full_gonzalez", "gonzalez_all_states"}:
                     value = "gonzalez_full_trace"
                 elif mode in {"hybrid", "legacy", "legacy_hybrid"}:
                     value = "legacy_hybrid"
@@ -290,12 +304,15 @@ class TraceCuration:
     hybrid_denoised: Optional[np.ndarray] = None
     hybrid_denoised_cache_key: Optional[Tuple[object, ...]] = None
     hybrid_denoised_pending_key: Optional[Tuple[object, ...]] = None
+    gonzalez_cwt_debug: Optional[Dict[str, Any]] = None
+    gonzalez_cwt_debug_cache_key: Optional[Tuple[object, ...]] = None
     # Artifact mask from downward-artifact interpolation (True = interpolated region).
     artifact_mask: Optional[np.ndarray] = None
     # Combined plateau mask from long and short detectors (True = plateau region).
     plateau_mask: Optional[np.ndarray] = None
     # Existing long-plateau detector mask.
     long_plateau_mask: Optional[np.ndarray] = None
+    long_plateau_debug: Optional[Dict[str, Any]] = None
     # Complementary short-plateau detector mask.
     short_plateau_mask: Optional[np.ndarray] = None
     # Short detector event table:

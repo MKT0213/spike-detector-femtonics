@@ -54,3 +54,33 @@ def test_short_plateau_detector_rejects_noisy_and_spike_dominated_candidates() -
 
     assert spike_events.shape == (0, 6)
     assert not np.any(spike_mask)
+
+
+def test_short_plateau_detector_parameters_can_relax_duration_gate() -> None:
+    fs = 1000.0
+    n = 300
+    rng = np.random.default_rng(3)
+    trace = 0.04 * rng.standard_normal(n)
+    trace[120:142] += 8.0
+
+    default_mask, default_events = detection._detect_short_plateaus_baseline_corrected(trace, fs=fs)
+
+    tuned_mask, tuned_events = detection._detect_short_plateaus_baseline_corrected(
+        trace,
+        fs=fs,
+        step_noise_k=2.0,
+        elevated_noise_k=2.0,
+        median_noise_k=2.5,
+        pre_quiet_noise_k=2.5,
+        min_support_fraction=0.55,
+        min_confidence=0.25,
+        min_duration_ms=12.0,
+        min_support_ms=8.0,
+        early_dwell_ms=18.0,
+    )
+
+    assert default_events.shape == (0, 6)
+    assert not np.any(default_mask)
+    assert tuned_events.shape == (1, 6)
+    assert tuned_events[0, 2] >= 12.0
+    assert np.count_nonzero(tuned_mask) >= 12

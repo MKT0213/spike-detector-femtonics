@@ -317,12 +317,17 @@ def _gonzalez_dff_from_fluorescence(
     # rolling median baseline. The requested default window is 4 seconds.
     window = _odd_sample_window(rolling_baseline_seconds, fs, size=trace.size)
     f0 = median_filter(trace, size=window, mode="nearest")
+    denominator = _safe_f0_denominator(f0)
+    return (trace - f0) / denominator, f0
+
+
+def _safe_f0_denominator(f0: np.ndarray) -> np.ndarray:
+    f0 = np.asarray(f0, dtype=float)
     finite_scale = np.abs(f0[np.isfinite(f0)])
     reference = float(np.median(finite_scale)) if finite_scale.size else 1.0
     eps = max(1e-9, 1e-6 * reference)
     signs = np.where(f0 < 0.0, -1.0, 1.0)
-    denominator = np.where(np.abs(f0) < eps, signs * eps, f0)
-    return (trace - f0) / denominator, f0
+    return np.where(np.abs(f0) < eps, signs * eps, f0)
 
 
 def _gonzalez_pca_features(normalized_magnitude: np.ndarray) -> Tuple[np.ndarray, np.ndarray, int]:
@@ -759,6 +764,7 @@ def denoise_gonzalez_adaptive_wavelet(
         threshold = np.asarray(info["threshold"], dtype=float)
         activity = np.asarray(info["activity"], dtype=float)
         threshold_debug[int(cluster_id)] = {
+            "activity": activity.copy(),
             "threshold": threshold,
             "moving_average": np.asarray(info["moving_average"], dtype=float),
             "residual_std": float(info["residual_std"]),
@@ -894,6 +900,10 @@ def denoise_gonzalez_adaptive_wavelet(
         "denoiser_used": "gonzalez_adaptive_wavelet",
         "input_mode": mode,
         "input_mode_alias": mode_alias,
+        "wavelet": str(wavelet),
+        "threshold_sd": float(threshold_sd),
+        "attenuation_min": float(attenuation_min),
+        "attenuation_max": float(attenuation_max),
         "working_trace_label": working_label,
         "F0": None if f0 is None else f0.copy(),
         "working_trace": working_trace.copy(),
@@ -1435,6 +1445,44 @@ def _restore_low_state_event_amplitudes(
     return output, debug
 
 
+def _preserve_low_frequency_envelope(
+    raw: np.ndarray,
+    candidate: np.ndarray,
+    fs: float,
+    envelope_window_ms: float = 100.0,
+) -> Tuple[np.ndarray, dict]:
+    source = np.asarray(raw, dtype=float)
+    output = np.asarray(candidate, dtype=float)
+    debug: dict[str, Any] = {
+        "enabled": True,
+        "status": "not_evaluated",
+        "envelope_window_ms": float(envelope_window_ms),
+    }
+    if source.shape != output.shape or source.size == 0:
+        debug["status"] = "shape_mismatch_or_empty"
+        return output.copy(), debug
+
+    window = _bounded_odd_window_ms(float(envelope_window_ms), fs, source.size)
+    raw_envelope = median_filter(source, size=window, mode="nearest")
+    output_envelope = median_filter(output, size=window, mode="nearest")
+    correction = raw_envelope - output_envelope
+    restored = np.asarray(output + correction, dtype=float)
+    debug.update(
+        {
+            "status": "applied",
+            "envelope_window_samples": int(window),
+            "median_abs_envelope_correction": float(np.median(np.abs(correction))) if correction.size else float("nan"),
+            "max_abs_envelope_correction": float(np.max(np.abs(correction))) if correction.size else float("nan"),
+            "raw_envelope_median": float(np.median(raw_envelope)) if raw_envelope.size else float("nan"),
+            "output_envelope_median_before": float(np.median(output_envelope)) if output_envelope.size else float("nan"),
+            "output_envelope_median_after": (
+                float(np.median(median_filter(restored, size=window, mode="nearest"))) if restored.size else float("nan")
+            ),
+        }
+    )
+    return restored, debug
+
+
 def _apply_plateau_level_correction(output: np.ndarray, corrected: np.ndarray, plateau_mask: np.ndarray, fs: float) -> np.ndarray:
     """Blend median-matching offsets into plateaus for optional visualization."""
     result = np.asarray(output, dtype=float).copy()
@@ -1892,11 +1940,11 @@ def _tv_denoise_1d(values: np.ndarray, weight: float, max_iterations: int = 200)
 
 def _normalize_low_state_denoiser(value: str) -> str:
     method = str(value).strip().lower()
-    allowed = {"gonzalez_adaptive_wavelet", "gonzalez_full_trace", "legacy_hybrid", "none"}
+    allowed = {"gonzalez_adaptive_wavelet", "gonzalez_full_trace", "gonzalez_full_trace_dff", "legacy_hybrid", "none"}
     if method not in allowed:
         raise ValueError(
             "low_state_denoiser must be one of: gonzalez_adaptive_wavelet, "
-            "gonzalez_full_trace, legacy_hybrid, none"
+            "gonzalez_full_trace, gonzalez_full_trace_dff, legacy_hybrid, none"
         )
     return method
 
@@ -1909,7 +1957,7 @@ def denoise_trace_state_guided_low_plateau_tv(
     plateau_tv_min_duration_ms: float = 5.0,
     plateau_tv_max_weight_factor: float = 0.25,
     boundary_protect_ms: float = 20.0,
-    low_state_denoiser: str = "gonzalez_adaptive_wavelet",
+    low_state_denoiser: str = "gonzalez_full_trace",
     low_state_denoise_fn=None,
     hybrid_denoise_fn=None,
     enable_low_state_safety_gate: bool = False,
@@ -1917,6 +1965,7 @@ def denoise_trace_state_guided_low_plateau_tv(
     min_local_max_ratio: float = 0.95,
     min_reliable_low_state_fraction: float = 0.10,
     min_reliable_low_state_samples: int = 20,
+    normalization_baseline: np.ndarray | None = None,
     return_debug: bool = False,
     **low_state_kwargs: object,
 ) -> np.ndarray | dict:
@@ -1989,11 +2038,26 @@ def denoise_trace_state_guided_low_plateau_tv(
         )
         return kwargs
 
-    if low_state_method == "gonzalez_full_trace":
+    if low_state_method in {"gonzalez_full_trace", "gonzalez_full_trace_dff"}:
+        uses_dff = low_state_method == "gonzalez_full_trace_dff"
+        if uses_dff:
+            if normalization_baseline is None:
+                raise ValueError("normalization_baseline is required for gonzalez_full_trace_dff")
+            f0 = _validate_trace(np.asarray(normalization_baseline, dtype=float), fs)
+            if f0.shape != trace.shape:
+                raise ValueError("normalization_baseline must have the same shape as corrected")
+            safe_f0 = _safe_f0_denominator(f0)
+            gonzalez_input = trace / safe_f0
+            source_label = "gonzalez_full_trace_dff"
+        else:
+            f0 = None
+            safe_f0 = None
+            gonzalez_input = trace
+            source_label = "gonzalez_full_trace"
         gonzalez_debug = None
         low_state_exception = None
         low_state_safety: dict[str, Any] = {
-            "source": "gonzalez_full_trace",
+            "source": source_label,
             "fallback_triggered": False,
             "fallback_reasons": [],
             "safety_gate_enabled": bool(enable_low_state_safety_gate),
@@ -2001,21 +2065,27 @@ def denoise_trace_state_guided_low_plateau_tv(
         }
         try:
             gonzalez_result = denoise_gonzalez_adaptive_wavelet(
-                trace,
+                gonzalez_input,
                 fs=fs,
                 return_debug=return_debug,
                 **_gonzalez_low_state_kwargs(),
             )
             if return_debug:
                 gonzalez_debug = dict(gonzalez_result)
-                output = np.asarray(gonzalez_debug.get("output", trace), dtype=float)
+                gonzalez_output = np.asarray(gonzalez_debug.get("output", gonzalez_input), dtype=float)
             else:
-                output = np.asarray(gonzalez_result, dtype=float)
+                gonzalez_output = np.asarray(gonzalez_result, dtype=float)
+            output = np.asarray(gonzalez_output * safe_f0 if uses_dff else gonzalez_output, dtype=float)
             if output.shape != trace.shape or not np.all(np.isfinite(output)):
                 low_state_safety["fallback_triggered"] = True
                 low_state_safety["fallback_reasons"] = ["shape_mismatch" if output.shape != trace.shape else "non_finite_output"]
                 output = trace.copy()
             else:
+                output, envelope_restore = _preserve_low_frequency_envelope(
+                    trace,
+                    output,
+                    fs=fs,
+                )
                 output, amplitude_restore = _restore_low_state_event_amplitudes(
                     trace,
                     output,
@@ -2043,6 +2113,7 @@ def denoise_trace_state_guided_low_plateau_tv(
                             if trace.size
                             else float("nan")
                         ),
+                        "level_preservation_merge": envelope_restore,
                         "amplitude_preservation_merge": amplitude_restore,
                         "morphology_preservation": morphology,
                         "evaluation_mask_samples": int(trace.size),
@@ -2051,7 +2122,7 @@ def denoise_trace_state_guided_low_plateau_tv(
         except Exception as exc:
             low_state_exception = str(exc)
             low_state_safety = {
-                "source": "gonzalez_full_trace",
+                "source": source_label,
                 "fallback_triggered": True,
                 "fallback_reasons": ["gonzalez_exception"],
                 "exception": low_state_exception,
@@ -2063,7 +2134,7 @@ def denoise_trace_state_guided_low_plateau_tv(
         if not return_debug:
             return output
         return {
-            "denoiser_used": "gonzalez_full_trace",
+            "denoiser_used": source_label,
             "low_state_denoiser_used": low_state_method,
             "low_state_candidate_used": not bool(low_state_safety.get("fallback_triggered", False)),
             "low_state_fallback_triggered": bool(low_state_safety.get("fallback_triggered", False)),
@@ -2077,13 +2148,15 @@ def denoise_trace_state_guided_low_plateau_tv(
             "low_state_noise_reduction_fraction": float("nan"),
             "output": output,
             "low_state_output": output,
-            "low_state_input": trace.copy(),
+            "low_state_input": gonzalez_input.copy(),
             "hybrid_output": output,
-            "hybrid_input": trace.copy(),
+            "hybrid_input": gonzalez_input.copy(),
             "low_state_custom_fn_used": False,
             "low_state_safety": low_state_safety,
             "low_state_exception": low_state_exception,
             "gonzalez_debug": gonzalez_debug,
+            "normalization_baseline": None if f0 is None else f0.copy(),
+            "working_dff": gonzalez_input.copy() if uses_dff else None,
             "plateau_tv_output": "not_applied",
             "plateau_tv_status": "not_applied_full_trace_mode",
             "plateau_tv_segments": [],
@@ -2390,7 +2463,7 @@ def denoise_trace_hybrid_low_plateau_tv(
     if "low_state_denoiser" in hybrid_kwargs:
         low_state_denoiser = str(hybrid_kwargs.pop("low_state_denoiser"))
     if low_state_denoiser is None:
-        low_state_denoiser = "gonzalez_adaptive_wavelet"
+        low_state_denoiser = "gonzalez_full_trace"
     if low_state_denoise_fn is None and hybrid_denoise_fn is not None:
         low_state_denoise_fn = hybrid_denoise_fn
         if not explicit_method and low_state_denoiser == "gonzalez_adaptive_wavelet":

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 import math
 
 import numpy as np
@@ -578,6 +578,114 @@ def _filter_otsu_hysteresis_candidates(
     return kept & valid
 
 
+def _long_plateau_region_debug_rows(
+    *,
+    signal: np.ndarray,
+    detrended_proxy: np.ndarray,
+    valid_mask: np.ndarray,
+    excluded_mask: np.ndarray,
+    above_entry_mask: np.ndarray,
+    hysteresis_mask: np.ndarray,
+    otsu_candidate_mask: np.ndarray,
+    min_duration_mask: np.ndarray,
+    refined_mask: np.ndarray,
+    impulse_mask: np.ndarray,
+    merged_mask: np.ndarray,
+    rescued_mask: np.ndarray,
+    final_mask: np.ndarray,
+    high_threshold_line: np.ndarray,
+    low_threshold_line: np.ndarray,
+    fs: float,
+    min_len_samples: int,
+    enter_len_samples: int,
+) -> List[Dict[str, object]]:
+    n = int(min(signal.size, detrended_proxy.size, final_mask.size))
+    if n <= 0:
+        return []
+    candidate_source = np.asarray(above_entry_mask[:n], dtype=bool) | np.asarray(hysteresis_mask[:n], dtype=bool)
+    candidate_source |= np.asarray(otsu_candidate_mask[:n], dtype=bool)
+    candidate_source |= np.asarray(final_mask[:n], dtype=bool)
+    rows: List[Dict[str, object]] = []
+    for region_id, (start, end) in enumerate(_contiguous_regions(candidate_source), 1):
+        region = slice(start, end)
+        valid = np.asarray(valid_mask[:n], dtype=bool)[region]
+        excluded = np.asarray(excluded_mask[:n], dtype=bool)[region]
+        proxy = np.asarray(detrended_proxy[:n], dtype=float)[region]
+        raw = np.asarray(signal[:n], dtype=float)[region]
+        finite_valid = valid & np.isfinite(proxy)
+        proxy_valid = proxy[finite_valid]
+        raw_valid = raw[np.isfinite(raw)]
+        duration_samples = int(end - start)
+        duration_ms = 1000.0 * float(duration_samples) / max(float(fs), 1e-12)
+        entry_level = float(np.nanmedian(np.asarray(high_threshold_line[:n], dtype=float)[region]))
+        exit_level = float(np.nanmedian(np.asarray(low_threshold_line[:n], dtype=float)[region]))
+        median_signal = float(np.median(proxy_valid)) if proxy_valid.size else float("nan")
+        p25_signal = float(np.percentile(proxy_valid, 25.0)) if proxy_valid.size else float("nan")
+        peak_signal = float(np.max(proxy_valid)) if proxy_valid.size else float("nan")
+        raw_span = (
+            float(np.percentile(raw_valid, 95.0) - np.percentile(raw_valid, 5.0))
+            if raw_valid.size >= 8
+            else (float(np.max(raw_valid) - np.min(raw_valid)) if raw_valid.size else float("nan"))
+        )
+        accepted = bool(np.any(np.asarray(final_mask[:n], dtype=bool)[region]))
+        if accepted:
+            stage = "accepted"
+            reason = "accepted_final_long_plateau"
+        elif not np.any(valid) or np.any(excluded):
+            stage = "validity"
+            reason = "excluded_artifact_startup_or_invalid_region"
+        elif not np.any(np.asarray(above_entry_mask[:n], dtype=bool)[region]):
+            stage = "entry_threshold"
+            reason = "below_entry_threshold"
+        elif duration_samples < int(enter_len_samples):
+            stage = "entry_sustain"
+            reason = "entry_run_shorter_than_enter_sustain"
+        elif not np.any(np.asarray(hysteresis_mask[:n], dtype=bool)[region]):
+            stage = "hysteresis"
+            reason = "no_sustained_hysteresis_region"
+        elif not np.any(np.asarray(otsu_candidate_mask[:n], dtype=bool)[region]):
+            stage = "candidate_filter"
+            reason = "below_exit_or_plateau_support"
+        elif not np.any(np.asarray(min_duration_mask[:n], dtype=bool)[region]):
+            stage = "minimum_duration"
+            reason = "shorter_than_100_ms"
+        elif not np.any(np.asarray(refined_mask[:n], dtype=bool)[region]):
+            stage = "edge_refinement"
+            reason = "removed_during_onset_offset_refinement"
+        elif not np.any(np.asarray(impulse_mask[:n], dtype=bool)[region]):
+            stage = "impulse_suppression"
+            reason = "spike_like_impulse_region"
+        elif not np.any(np.asarray(merged_mask[:n], dtype=bool)[region]):
+            stage = "merge"
+            reason = "merged_or_removed_during_split_plateau_cleanup"
+        elif not np.any(np.asarray(rescued_mask[:n], dtype=bool)[region]):
+            stage = "overmask_rescue"
+            reason = "removed_during_overmask_rescue"
+        else:
+            stage = "final_min_duration"
+            reason = "removed_by_final_minimum_duration_filter"
+        rows.append(
+            {
+                "region_id": int(region_id),
+                "start_index": int(start),
+                "end_index_exclusive": int(end),
+                "duration_samples": duration_samples,
+                "duration_ms": float(duration_ms),
+                "median_detrended_proxy": median_signal,
+                "p25_detrended_proxy": p25_signal,
+                "peak_detrended_proxy": peak_signal,
+                "entry_threshold": entry_level,
+                "exit_threshold": exit_level,
+                "raw_span": raw_span,
+                "accepted": accepted,
+                "rejection_stage": stage,
+                "rejection_reason": reason,
+                "near_miss_score": float(max(0.0, peak_signal - entry_level)) if np.isfinite(peak_signal) else 0.0,
+            }
+        )
+    return rows
+
+
 def _estimate_baseline_simple(
     signal: np.ndarray,
     fs: float,
@@ -605,13 +713,27 @@ def _estimate_baseline_simple(
     if y.size == 0:
         empty_mask = np.zeros(y.shape, dtype=bool)
         empty_debug = {
+            "long_plateau_input_signal": y.copy(),
+            "long_plateau_plateau_proxy": y.copy(),
+            "long_plateau_valid_mask": empty_mask,
+            "long_plateau_excluded_mask": empty_mask,
             "long_plateau_slow_drift": y.copy(),
             "long_plateau_detrended_proxy": y.copy(),
             "long_plateau_high_threshold_line": y.copy(),
             "long_plateau_low_threshold_line": y.copy(),
             "long_plateau_otsu_threshold_line": y.copy(),
+            "long_plateau_above_entry_mask": empty_mask,
+            "long_plateau_below_exit_mask": empty_mask,
             "long_plateau_hysteresis_mask": empty_mask,
             "long_plateau_otsu_candidate_mask": empty_mask,
+            "long_plateau_after_min_duration_mask": empty_mask,
+            "long_plateau_after_refinement_mask": empty_mask,
+            "long_plateau_after_impulse_suppression_mask": empty_mask,
+            "long_plateau_after_merge_mask": empty_mask,
+            "long_plateau_after_overmask_rescue_mask": empty_mask,
+            "long_plateau_final_mask": empty_mask,
+            "long_plateau_region_debug_rows": [],
+            "long_plateau_debug_metrics": {},
         }
         return y.copy(), empty_mask, y.copy(), y.copy(), y.copy(), empty_debug
 
@@ -667,6 +789,8 @@ def _estimate_baseline_simple(
     otsu_threshold_line = np.full(detrended_proxy.shape, float(otsu_threshold), dtype=float)
     enter_len = _to_samples(float(long_plateau_enter_sustain_ms), fs, minimum=1)
     exit_len = _to_samples(float(long_plateau_exit_sustain_ms), fs, minimum=1)
+    above_entry_mask = (detrended_proxy > high_threshold_line) & valid_for_detection & np.isfinite(detrended_proxy)
+    below_exit_mask = (detrended_proxy <= low_threshold_line) & valid_for_detection & np.isfinite(detrended_proxy)
     hysteresis_mask = _hysteresis_plateau_mask(
         detrended_proxy,
         high_threshold_line,
@@ -682,17 +806,105 @@ def _estimate_baseline_simple(
         low_threshold_line,
         valid_mask=valid_for_detection,
     )
+    long_plateau_min_len = _to_samples(100.0, fs, minimum=1)
+    empty_stage_mask = np.zeros(y.shape, dtype=bool)
     plateau_debug = {
+        "long_plateau_input_signal": y.copy(),
+        "long_plateau_plateau_proxy": plateau_proxy,
+        "long_plateau_valid_mask": valid_for_detection,
+        "long_plateau_excluded_mask": excluded,
         "long_plateau_slow_drift": slow_drift,
         "long_plateau_detrended_proxy": detrended_proxy,
         "long_plateau_high_threshold_line": high_threshold_line,
         "long_plateau_low_threshold_line": low_threshold_line,
         "long_plateau_otsu_threshold_line": otsu_threshold_line,
+        "long_plateau_above_entry_mask": above_entry_mask,
+        "long_plateau_below_exit_mask": below_exit_mask,
         "long_plateau_hysteresis_mask": hysteresis_mask,
         "long_plateau_otsu_candidate_mask": otsu_candidate_mask,
+        "long_plateau_after_min_duration_mask": empty_stage_mask.copy(),
+        "long_plateau_after_refinement_mask": empty_stage_mask.copy(),
+        "long_plateau_after_impulse_suppression_mask": empty_stage_mask.copy(),
+        "long_plateau_after_merge_mask": empty_stage_mask.copy(),
+        "long_plateau_after_overmask_rescue_mask": empty_stage_mask.copy(),
+        "long_plateau_final_mask": empty_stage_mask.copy(),
+        "long_plateau_region_debug_rows": [],
+        "long_plateau_debug_metrics": {
+            "baseline_median": float(baseline_median),
+            "detrended_noise": float(detrended_noise),
+            "otsu_threshold": float(otsu_threshold),
+            "entry_threshold": float(entry_threshold_value),
+            "exit_threshold": float(exit_threshold_value),
+            "exit_threshold_by_noise": float(exit_by_noise),
+            "exit_threshold_by_fraction": float(exit_by_fraction),
+            "enter_sustain_samples": int(enter_len),
+            "exit_sustain_samples": int(exit_len),
+            "min_duration_samples": int(long_plateau_min_len),
+            "plateau_median_window_samples": int(plateau_win_odd),
+            "drift_window_ms": float(long_plateau_drift_window_ms),
+            "drift_percentile": float(long_plateau_drift_percentile),
+            "entry_noise_k": float(long_plateau_entry_noise_k),
+            "exit_noise_k": float(long_plateau_exit_noise_k),
+            "exit_fraction": float(long_plateau_exit_fraction),
+            "valid_samples": int(np.count_nonzero(valid_for_detection)),
+            "excluded_samples": int(np.count_nonzero(excluded)),
+        },
     }
 
+    def _finalize_plateau_debug(
+        final_mask: np.ndarray,
+        after_min: np.ndarray,
+        after_refined: np.ndarray | None = None,
+        after_impulse: np.ndarray | None = None,
+        after_merge: np.ndarray | None = None,
+        after_rescue: np.ndarray | None = None,
+    ) -> None:
+        refined = after_min if after_refined is None else np.asarray(after_refined, dtype=bool)
+        impulse = refined if after_impulse is None else np.asarray(after_impulse, dtype=bool)
+        merged = impulse if after_merge is None else np.asarray(after_merge, dtype=bool)
+        rescued = merged if after_rescue is None else np.asarray(after_rescue, dtype=bool)
+        final = np.asarray(final_mask, dtype=bool)
+        plateau_debug["long_plateau_after_min_duration_mask"] = np.asarray(after_min, dtype=bool)
+        plateau_debug["long_plateau_after_refinement_mask"] = refined
+        plateau_debug["long_plateau_after_impulse_suppression_mask"] = impulse
+        plateau_debug["long_plateau_after_merge_mask"] = merged
+        plateau_debug["long_plateau_after_overmask_rescue_mask"] = rescued
+        plateau_debug["long_plateau_final_mask"] = final
+        rows = _long_plateau_region_debug_rows(
+            signal=y,
+            detrended_proxy=detrended_proxy,
+            valid_mask=valid_for_detection,
+            excluded_mask=excluded,
+            above_entry_mask=above_entry_mask,
+            hysteresis_mask=hysteresis_mask,
+            otsu_candidate_mask=otsu_candidate_mask,
+            min_duration_mask=np.asarray(after_min, dtype=bool),
+            refined_mask=refined,
+            impulse_mask=impulse,
+            merged_mask=merged,
+            rescued_mask=rescued,
+            final_mask=final,
+            high_threshold_line=high_threshold_line,
+            low_threshold_line=low_threshold_line,
+            fs=fs,
+            min_len_samples=long_plateau_min_len,
+            enter_len_samples=enter_len,
+        )
+        plateau_debug["long_plateau_region_debug_rows"] = rows
+        metrics = dict(plateau_debug.get("long_plateau_debug_metrics", {}))
+        metrics.update(
+            {
+                "hysteresis_region_count": len(_contiguous_regions(hysteresis_mask)),
+                "otsu_candidate_region_count": len(_contiguous_regions(otsu_candidate_mask)),
+                "final_region_count": len(_contiguous_regions(final)),
+                "accepted_region_count": int(sum(1 for row in rows if bool(row.get("accepted", False)))),
+                "rejected_region_count": int(sum(1 for row in rows if not bool(row.get("accepted", False)))),
+            }
+        )
+        plateau_debug["long_plateau_debug_metrics"] = metrics
+
     if not np.any(valid_for_detection):
+        _finalize_plateau_debug(np.zeros(y.shape, dtype=bool), np.zeros(y.shape, dtype=bool))
         local_noise = _estimate_local_noise_mad(
             signal=y,
             baseline_reference=baseline_seed,
@@ -703,10 +915,11 @@ def _estimate_baseline_simple(
 
     plateau_mask = otsu_candidate_mask.copy()
     plateau_mask &= ~excluded
-    long_plateau_min_len = _to_samples(100.0, fs, minimum=1)
     plateau_mask = _filter_short_regions(plateau_mask, min_len=long_plateau_min_len)
+    after_min_duration_mask = plateau_mask.copy()
 
     if not np.any(plateau_mask):
+        _finalize_plateau_debug(plateau_mask, after_min_duration_mask)
         local_noise = _estimate_local_noise_mad(
             signal=y,
             baseline_reference=baseline_seed,
@@ -723,11 +936,23 @@ def _estimate_baseline_simple(
         fs=fs,
         noise_estimate=0.0,
     )
+    after_refinement_mask = plateau_mask.copy()
 
     plateau_mask = _suppress_short_impulse_regions(y, plateau_mask, fs=fs)
+    after_impulse_mask = plateau_mask.copy()
     plateau_mask = _merge_split_long_plateaus(plateau_mask, fs=fs)
+    after_merge_mask = plateau_mask.copy()
     plateau_mask = _rescue_overmasked_plateau(y, plateau_mask)
+    after_rescue_mask = plateau_mask.copy()
     plateau_mask = _filter_short_regions(plateau_mask, min_len=long_plateau_min_len)
+    _finalize_plateau_debug(
+        plateau_mask,
+        after_min_duration_mask,
+        after_refinement_mask,
+        after_impulse_mask,
+        after_merge_mask,
+        after_rescue_mask,
+    )
 
     # Pad plateau interpolation window so baseline stitching does not start/end too close
     # to the detected edges when onset/offset are slightly early/late.
@@ -919,6 +1144,17 @@ def _detect_short_plateaus_baseline_corrected(
     fs: float,
     excluded_mask: np.ndarray | None = None,
     long_plateau_mask: np.ndarray | None = None,
+    step_noise_k: float = 3.5,
+    elevated_noise_k: float = 3.0,
+    survival_noise_k: float = 2.0,
+    loss_noise_k: float = 1.25,
+    median_noise_k: float = 4.0,
+    pre_quiet_noise_k: float = 1.75,
+    min_support_fraction: float = 0.75,
+    min_confidence: float = 0.65,
+    early_dwell_ms: float = 30.0,
+    min_support_ms: float = 15.0,
+    min_duration_ms: float = 25.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Detect brief raised-floor plateaus on a baseline-corrected trace."""
     y_in = np.asarray(corrected_trace, dtype=float)
@@ -985,18 +1221,27 @@ def _detect_short_plateaus_baseline_corrected(
         if pre.size and post_down.size:
             step_down_score[idx] = float(np.median(post_down) - np.median(pre))
 
-    step_threshold = max(3.5 * noise, 1e-9)
-    elevated_threshold = max(3.0 * noise, 1e-9)
-    survival_threshold = max(2.0 * noise, 1e-9)
-    loss_threshold = max(1.25 * noise, 1e-9)
-    median_threshold = max(4.0 * noise, 1e-9)
-    pre_quiet_threshold = max(1.75 * noise, 1e-9)
+    step_k = max(0.0, float(step_noise_k))
+    elevated_k = max(0.0, float(elevated_noise_k))
+    survival_k = max(0.0, float(survival_noise_k))
+    loss_k = max(0.0, float(loss_noise_k))
+    median_k = max(0.0, float(median_noise_k))
+    pre_quiet_k = max(0.0, float(pre_quiet_noise_k))
+    support_fraction_min = float(np.clip(float(min_support_fraction), 0.0, 1.0))
+    confidence_min = float(np.clip(float(min_confidence), 0.0, 1.0))
+
+    step_threshold = max(step_k * noise, 1e-9)
+    elevated_threshold = max(elevated_k * noise, 1e-9)
+    survival_threshold = max(survival_k * noise, 1e-9)
+    loss_threshold = max(loss_k * noise, 1e-9)
+    median_threshold = max(median_k * noise, 1e-9)
+    pre_quiet_threshold = max(pre_quiet_k * noise, 1e-9)
     pre_quiet_window = _to_samples(12.0, fs, minimum=3)
-    early_dwell = _to_samples(30.0, fs, minimum=4)
-    min_support = _to_samples(15.0, fs, minimum=2)
+    early_dwell = _to_samples(float(early_dwell_ms), fs, minimum=4)
+    min_support = _to_samples(float(min_support_ms), fs, minimum=2)
     loss_len = _to_samples(7.0, fs, minimum=2)
     survival_len = _to_samples(12.0, fs, minimum=2)
-    min_duration = _to_samples(25.0, fs, minimum=3)
+    min_duration = _to_samples(float(min_duration_ms), fs, minimum=3)
     min_step_gap = _to_samples(8.0, fs, minimum=1)
     large_drop_threshold = max(3.0 * noise, 1e-9)
     support_mask = (floor > elevated_threshold) & valid
@@ -1113,7 +1358,7 @@ def _detect_short_plateaus_baseline_corrected(
         if early_support.size < min_support:
             continue
         floor_support_fraction, longest_early_support = _support_stats(early_support)
-        if floor_support_fraction < 0.75:
+        if floor_support_fraction < support_fraction_min:
             continue
         if longest_early_support < min_support:
             continue
@@ -1178,15 +1423,15 @@ def _detect_short_plateaus_baseline_corrected(
         # conservative: random or structured noise can pass the rough step-up
         # screen, but should not pass stable raised-floor checks.
         duration_ms = float((offset - onset) * 1000.0 / max(float(fs), 1e-9))
-        event_floor_support = ((floor[onset:offset] > (3.0 * effective_noise)) & valid[onset:offset])[event_valid]
+        event_floor_support = ((floor[onset:offset] > (elevated_k * effective_noise)) & valid[onset:offset])[event_valid]
         floor_support_fraction, longest_event_support = _support_stats(event_floor_support)
-        if floor_support_fraction < 0.75:
+        if floor_support_fraction < support_fraction_min:
             continue
         if longest_event_support < min_support:
             continue
-        if (not np.isfinite(median_level)) or median_level < (4.0 * effective_noise):
+        if (not np.isfinite(median_level)) or median_level < (median_k * effective_noise):
             continue
-        if floor_median < (3.0 * effective_noise):
+        if floor_median < (elevated_k * effective_noise):
             continue
 
         post_event_median, _post_valid_count, post_truncated = _post_event_level(offset)
@@ -1208,14 +1453,14 @@ def _detect_short_plateaus_baseline_corrected(
         if (peak_level - median_level) > (5.0 * effective_noise) and floor_support_fraction < 0.85:
             continue
 
-        step_score = min(1.0, max(0.0, ((step_up_score[onset] / effective_noise) - 3.5) / 6.0))
-        level_score = min(1.0, max(0.0, ((median_level / effective_noise) - 4.0) / 6.0))
-        support_score = min(1.0, max(0.0, (floor_support_fraction - 0.75) / 0.25))
-        duration_score = min(1.0, max(0.0, (duration_ms - 25.0) / 75.0))
+        step_score = min(1.0, max(0.0, ((step_up_score[onset] / effective_noise) - step_k) / 6.0))
+        level_score = min(1.0, max(0.0, ((median_level / effective_noise) - median_k) / 6.0))
+        support_score = min(1.0, max(0.0, (floor_support_fraction - support_fraction_min) / max(1.0 - support_fraction_min, 1e-9)))
+        duration_score = min(1.0, max(0.0, (duration_ms - float(min_duration_ms)) / 75.0))
         confidence = float(
             min(1.0, max(0.0, (0.30 * step_score) + (0.30 * level_score) + (0.25 * support_score) + (0.15 * duration_score)))
         )
-        if confidence < 0.65:
+        if confidence < confidence_min:
             continue
 
         mask[onset:offset] = True
@@ -1770,6 +2015,17 @@ def detect_spikes(
             fs=fs,
             excluded_mask=blocked,
             long_plateau_mask=long_plateau_mask,
+            step_noise_k=float(params.short_plateau_step_noise_k),
+            elevated_noise_k=float(params.short_plateau_elevated_noise_k),
+            survival_noise_k=float(params.short_plateau_survival_noise_k),
+            loss_noise_k=float(params.short_plateau_loss_noise_k),
+            median_noise_k=float(params.short_plateau_median_noise_k),
+            pre_quiet_noise_k=float(params.short_plateau_pre_quiet_noise_k),
+            min_support_fraction=float(params.short_plateau_min_support_fraction),
+            min_confidence=float(params.short_plateau_min_confidence),
+            early_dwell_ms=float(params.short_plateau_early_dwell_ms),
+            min_support_ms=float(params.short_plateau_min_support_ms),
+            min_duration_ms=float(params.short_plateau_min_duration_ms),
         )
         short_plateau_mask &= ~long_plateau_mask
     else:

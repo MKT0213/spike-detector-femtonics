@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import app.gui_main as gui_main  # noqa: E402
 from app.gui_main import SpikeCurationMainWindow  # noqa: E402
 from app.hybrid_denoising import (  # noqa: E402
     denoise_gonzalez_adaptive_wavelet,
@@ -19,7 +20,7 @@ from app.hybrid_denoising import (  # noqa: E402
     denoise_trace_state_guided_low_plateau_tv,
     gonzalez_adaptive_wavelet_validation_metrics,
 )
-from app.models import DetectionParams  # noqa: E402
+from app.models import ArtifactParams, DetectionParams  # noqa: E402
 
 
 def _synthetic_trace() -> tuple[np.ndarray, np.ndarray, float]:
@@ -161,6 +162,116 @@ def test_gonzalez_full_trace_mode_ignores_plateau_mask() -> None:
     assert np.allclose(np.asarray(debug["gonzalez_debug"]["output"], dtype=float), np.asarray(direct, dtype=float))
     assert debug["low_state_safety"]["amplitude_preservation_merge"]["status"] in {"evaluated", "no_events_evaluated"}
     assert np.asarray(debug["output"], dtype=float).shape == trace.shape
+
+
+def test_gonzalez_full_trace_preserves_low_frequency_plateau_level() -> None:
+    fs = 1000.0
+    n = 700
+    rng = np.random.default_rng(123)
+    t = np.arange(n, dtype=float) / fs
+    trace = 0.03 * rng.standard_normal(n)
+    plateau = np.zeros(n, dtype=bool)
+    plateau[180:520] = True
+    trace[plateau] += 1.4 + 0.08 * np.sin(2.0 * np.pi * 4.0 * t[plateau])
+    for idx in [230, 340, 455]:
+        trace += 0.5 * np.exp(-0.5 * ((np.arange(n) - idx) / 2.0) ** 2)
+
+    debug = denoise_trace_state_guided_low_plateau_tv(
+        trace,
+        fs=fs,
+        plateau_mask=np.zeros_like(plateau, dtype=bool),
+        low_state_denoiser="gonzalez_full_trace",
+        return_debug=True,
+        n_freqs=12,
+        max_clusters=4,
+        attenuation_min=1.0,
+        attenuation_max=1.0,
+    )
+
+    core = np.asarray(debug["gonzalez_debug"]["output"], dtype=float)
+    output = np.asarray(debug["output"], dtype=float)
+    raw_level = float(np.median(trace[plateau]))
+    core_error = abs(float(np.median(core[plateau])) - raw_level)
+    output_error = abs(float(np.median(output[plateau])) - raw_level)
+
+    assert debug["low_state_safety"]["level_preservation_merge"]["status"] == "applied"
+    assert output_error < core_error
+    assert output_error < 0.05
+
+
+def test_gonzalez_full_trace_dff_uses_supplied_baseline_and_returns_corrected_units() -> None:
+    fs = 1000.0
+    n = 420
+    idx = np.arange(n, dtype=float)
+    baseline = 120.0 + 5.0 * np.sin(2.0 * np.pi * idx / n)
+    corrected = 0.04 * np.sin(2.0 * np.pi * 6.0 * idx / fs)
+    corrected += 0.7 * np.exp(-0.5 * ((idx - 170.0) / 2.5) ** 2)
+    plateau = np.zeros(n, dtype=bool)
+    plateau[220:290] = True
+
+    debug = denoise_trace_state_guided_low_plateau_tv(
+        corrected,
+        fs=fs,
+        plateau_mask=plateau,
+        low_state_denoiser="gonzalez_full_trace_dff",
+        normalization_baseline=baseline,
+        return_debug=True,
+        n_freqs=12,
+        max_clusters=4,
+    )
+
+    output = np.asarray(debug["output"], dtype=float)
+    working_dff = np.asarray(debug["working_dff"], dtype=float)
+
+    assert debug["denoiser_used"] == "gonzalez_full_trace_dff"
+    assert debug["low_state_denoiser_used"] == "gonzalez_full_trace_dff"
+    assert debug["gonzalez_debug"]["input_mode"] == "corrected"
+    assert debug["plateau_tv_status"] == "not_applied_full_trace_mode"
+    assert not np.any(np.asarray(debug["plateau_mask"], dtype=bool))
+    assert np.allclose(debug["normalization_baseline"], baseline)
+    assert np.allclose(working_dff, corrected / baseline)
+    assert np.allclose(debug["gonzalez_debug"]["working_trace"], working_dff)
+    assert output.shape == corrected.shape
+    assert np.all(np.isfinite(output))
+    assert float(np.nanmax(np.abs(output))) > 10.0 * float(np.nanmax(np.abs(working_dff)))
+
+
+def test_analysis_passes_first_pass_baseline_to_full_trace_dff(monkeypatch) -> None:
+    fs = 1000.0
+    n = 600
+    time = np.arange(n, dtype=float) / fs
+    baseline = 150.0 + 0.5 * np.sin(2.0 * np.pi * 1.5 * time)
+    signal = baseline.copy()
+    signal += 2.0 * np.exp(-0.5 * ((np.arange(n, dtype=float) - 250.0) / 2.0) ** 2)
+    params = DetectionParams()
+    params.low_state_denoiser = "gonzalez_full_trace_dff"
+    captured: dict[str, np.ndarray] = {}
+
+    def spy_denoise(corrected, fs, plateau_mask, normalization_baseline=None, **_kwargs):
+        captured["corrected"] = np.asarray(corrected, dtype=float).copy()
+        captured["normalization_baseline"] = np.asarray(normalization_baseline, dtype=float).copy()
+        captured["plateau_mask"] = np.asarray(plateau_mask, dtype=bool).copy()
+        return np.asarray(corrected, dtype=float).copy()
+
+    monkeypatch.setattr(gui_main, "denoise_trace_state_guided_low_plateau_tv", spy_denoise)
+    request = gui_main.TraceAnalysisRequest(
+        trace_name="synthetic",
+        time=time,
+        raw=signal.copy(),
+        corrected_source=signal.copy(),
+        sampling_rate_hz=fs,
+        detection_params=params,
+        artifact_params=ArtifactParams(),
+        generation=0,
+    )
+
+    result = gui_main.analyze_trace_data(request)
+
+    assert "normalization_baseline" in captured
+    assert captured["normalization_baseline"].shape == signal.shape
+    assert np.allclose(captured["normalization_baseline"], result.correction_baseline)
+    assert np.allclose(captured["corrected"], result.corrected)
+    assert np.all(np.isfinite(captured["normalization_baseline"]))
 
 
 def test_state_guided_default_preserves_plateaus_boundaries_and_spikes() -> None:
@@ -437,6 +548,12 @@ def test_saved_config_migrates_risky_gonzalez_cleanup_off() -> None:
     assert params.gonzalez_enable_noise_cluster_rejection is False
 
 
+def test_saved_config_accepts_full_trace_dff_mode() -> None:
+    params = DetectionParams.from_dict({"low_state_denoiser": "gonzalez_full_trace_dff"})
+
+    assert params.low_state_denoiser == "gonzalez_full_trace_dff"
+
+
 def test_gonzalez_dff_alias_is_corrected_mode() -> None:
     trace, _plateau, fs = _synthetic_trace()
 
@@ -487,13 +604,18 @@ def test_ui_defaults_to_gonzalez_without_hybrid_default_label() -> None:
     app = QApplication.instance() or QApplication([])
     window = SpikeCurationMainWindow()
     try:
-        assert window.param_low_state_denoiser.currentData() == "gonzalez_adaptive_wavelet"
-        assert window.param_low_state_denoiser.currentText() == "Gonzalez adaptive wavelet"
+        assert DetectionParams().low_state_denoiser == "gonzalez_full_trace"
+        assert window.param_low_state_denoiser.currentData() == "gonzalez_full_trace"
+        assert window.param_low_state_denoiser.currentText() == "Gonzalez full trace (no plateau mask)"
         assert not window.param_gonzalez_event_template_rejection.isChecked()
+        assert not window.param_plateau_tv_weight.isEnabled()
+        assert not window.param_low_state_boundary_protect_ms.isEnabled()
+        assert "Gonzalez full-trace" in window.chk_show_hybrid_denoised.text()
+        window.param_low_state_denoiser.setCurrentIndex(window.param_low_state_denoiser.findData("gonzalez_adaptive_wavelet"))
         assert window.param_plateau_tv_weight.isEnabled()
         assert window.param_low_state_boundary_protect_ms.isEnabled()
-        window.param_low_state_denoiser.setCurrentIndex(window.param_low_state_denoiser.findData("gonzalez_full_trace"))
-        assert window.param_low_state_denoiser.currentText() == "Gonzalez full trace (no plateau mask)"
+        window.param_low_state_denoiser.setCurrentIndex(window.param_low_state_denoiser.findData("gonzalez_full_trace_dff"))
+        assert window.param_low_state_denoiser.currentText() == "Gonzalez full trace dF/F0"
         assert not window.param_plateau_tv_weight.isEnabled()
         assert not window.param_low_state_boundary_protect_ms.isEnabled()
         window.param_low_state_denoiser.setCurrentIndex(window.param_low_state_denoiser.findData("legacy_hybrid"))

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import datetime
 from pathlib import Path
 import sys
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -37,7 +37,11 @@ import PySide6.QtWidgets as QtWidgets
 import PySide6.QtGui as QtGui
 
 from .detection import DETECTOR_BUILD_TAG, detect_spikes
-from .hybrid_denoising import denoise_hybrid_fluorescence_trace, denoise_trace_state_guided_low_plateau_tv
+from .hybrid_denoising import (
+    denoise_gonzalez_adaptive_wavelet,
+    denoise_hybrid_fluorescence_trace,
+    denoise_trace_state_guided_low_plateau_tv,
+)
 from .io import estimate_sampling_rate_hz, load_excel_traces
 from .models import AppSession, ArtifactParams, DetectionParams, SpikeRecord, TraceCuration
 from .plot_widget import TracePlotWidget
@@ -190,6 +194,73 @@ def _spike_export_dimensions(half_window_ms: float) -> Tuple[int, int, int, int]
     row_height = int(np.clip(round(180.0 * (scale ** 0.35)), 160, 280))
     combined_width = int(np.clip(round(700.0 * scale), 650, 2800))
     return single_width, single_height, row_height, combined_width
+
+
+def _startup_exclusion_index(time: np.ndarray, startup_exclusion_ms: float) -> int:
+    time_arr = np.asarray(time, dtype=float)
+    if time_arr.size <= 1 or not np.isfinite(startup_exclusion_ms) or startup_exclusion_ms <= 0.0:
+        return 0
+    fs = _sampling_rate_hz(time_arr)
+    if not np.isfinite(fs) or fs <= 0.0:
+        return 0
+    idx = int(round((float(startup_exclusion_ms) / 1000.0) * fs))
+    return idx if 0 < idx < time_arr.size else 0
+
+
+def _trim_1d_for_startup(values: Optional[np.ndarray], startup_idx: int, n: int, dtype: object = float) -> Optional[np.ndarray]:
+    if values is None:
+        return None
+    arr = np.asarray(values, dtype=dtype)
+    if arr.ndim != 1:
+        return arr
+    out = np.zeros(max(0, n - startup_idx), dtype=arr.dtype)
+    source = arr[:n]
+    trimmed = source[startup_idx:]
+    if trimmed.size:
+        out[: trimmed.size] = trimmed
+    return out
+
+
+def _adjust_spikes_for_startup(spikes: List[SpikeRecord], startup_idx: int, n: int) -> List[SpikeRecord]:
+    if startup_idx <= 0:
+        return list(spikes)
+    adjusted: List[SpikeRecord] = []
+    for spike in spikes:
+        spike_index = int(spike.spike_index)
+        if spike_index < startup_idx or spike_index >= n:
+            continue
+        candidate_index = int(spike.candidate_index)
+        adjusted.append(
+            replace(
+                spike,
+                spike_index=spike_index - startup_idx,
+                candidate_index=max(0, candidate_index - startup_idx),
+            )
+        )
+    return adjusted
+
+
+def _startup_trimmed_trace_export_data(state: TraceCuration, startup_exclusion_ms: float) -> Dict[str, Any]:
+    time = np.asarray(state.time, dtype=float)
+    corrected = np.asarray(state.corrected, dtype=float)
+    n = min(time.size, corrected.size)
+    time = time[:n]
+    corrected = corrected[:n]
+    startup_idx = _startup_exclusion_index(time, startup_exclusion_ms)
+
+    return {
+        "startup_idx": startup_idx,
+        "time": time[startup_idx:],
+        "corrected": corrected[startup_idx:],
+        "raw": _trim_1d_for_startup(state.raw, startup_idx, n, dtype=float),
+        "hybrid_denoised": _trim_1d_for_startup(state.hybrid_denoised, startup_idx, n, dtype=float),
+        "baseline": _trim_1d_for_startup(state.baseline, startup_idx, n, dtype=float),
+        "debug_threshold": _trim_1d_for_startup(state.debug_threshold, startup_idx, n, dtype=float),
+        "plateau_mask": _trim_1d_for_startup(state.plateau_mask, startup_idx, n, dtype=bool),
+        "long_plateau_mask": _trim_1d_for_startup(state.long_plateau_mask, startup_idx, n, dtype=bool),
+        "short_plateau_mask": _trim_1d_for_startup(state.short_plateau_mask, startup_idx, n, dtype=bool),
+        "spikes": _adjust_spikes_for_startup(state.spikes, startup_idx, n),
+    }
 
 
 def _render_spike_png(
@@ -2692,6 +2763,909 @@ def _save_spike_statistics_summary(
     plt.close(fig)
 
 
+def _debug_array(values: object, dtype: object = float) -> Optional[np.ndarray]:
+    if values is None or isinstance(values, dict):
+        return None
+    try:
+        return np.asarray(values, dtype=dtype)
+    except (TypeError, ValueError):
+        return None
+
+
+def _downsample_1d_for_debug(x: np.ndarray, y: np.ndarray, max_points: int = 5000) -> tuple[np.ndarray, np.ndarray]:
+    x_arr = np.asarray(x, dtype=float)
+    y_arr = np.asarray(y, dtype=float)
+    n = min(x_arr.size, y_arr.size)
+    if n <= 0:
+        return x_arr[:0], y_arr[:0]
+    x_arr = x_arr[:n]
+    y_arr = y_arr[:n]
+    if n <= int(max_points):
+        return x_arr, y_arr
+    idx = np.linspace(0, n - 1, int(max_points)).astype(int)
+    return x_arr[idx], y_arr[idx]
+
+
+def _downsample_heatmap_for_debug(matrix: np.ndarray, max_cols: int = 2000) -> np.ndarray:
+    arr = np.asarray(matrix)
+    if arr.ndim != 2 or arr.shape[1] <= int(max_cols):
+        return arr
+    idx = np.linspace(0, arr.shape[1] - 1, int(max_cols)).astype(int)
+    return arr[:, idx]
+
+
+def _json_safe(value: object) -> object:
+    if isinstance(value, np.ndarray):
+        if value.ndim == 0:
+            return _json_safe(value.item())
+        summary: Dict[str, object] = {
+            "shape": [int(v) for v in value.shape],
+            "dtype": str(value.dtype),
+        }
+        if value.size and np.issubdtype(value.dtype, np.number):
+            if np.iscomplexobj(value):
+                magnitude = np.abs(value)
+                summary["magnitude_min"] = _json_safe(np.nanmin(magnitude))
+                summary["magnitude_max"] = _json_safe(np.nanmax(magnitude))
+            else:
+                summary["min"] = _json_safe(np.nanmin(value))
+                summary["max"] = _json_safe(np.nanmax(value))
+        return summary
+    if isinstance(value, np.generic):
+        return _json_safe(value.item())
+    if isinstance(value, complex):
+        return {"real": float(np.real(value)), "imag": float(np.imag(value))}
+    if isinstance(value, float):
+        return value if np.isfinite(value) else str(value)
+    if isinstance(value, (str, int, bool)) or value is None:
+        return value
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return str(value)
+
+
+def _save_debug_line_plot(
+    path: Path,
+    title: str,
+    time: np.ndarray,
+    series: List[tuple],
+    ylabel: str = "Signal",
+) -> bool:
+    import matplotlib.pyplot as plt
+
+    if not series:
+        return False
+    fig, ax = plt.subplots(figsize=(14, 4.5))
+    plotted = False
+    for item in series:
+        label, values, color = item[:3]
+        linestyle = item[3] if len(item) > 3 else "-"
+        linewidth = float(item[4]) if len(item) > 4 else 1.1
+        zorder = int(item[5]) if len(item) > 5 else 2
+        x_plot, y_plot = _downsample_1d_for_debug(time, values)
+        if x_plot.size and y_plot.size:
+            ax.plot(x_plot, y_plot, label=label, linewidth=linewidth, color=color, linestyle=linestyle, zorder=zorder)
+            plotted = True
+    if not plotted:
+        plt.close(fig)
+        return False
+    ax.set_title(title)
+    ax.set_xlabel(_time_axis_label(time))
+    ax.set_ylabel(ylabel)
+    ax.grid(True, alpha=0.25)
+    ax.legend(loc="best")
+    fig.savefig(path, dpi=160, facecolor="white", bbox_inches="tight")
+    plt.close(fig)
+    return True
+
+
+def _save_debug_heatmap(
+    path: Path,
+    title: str,
+    time: np.ndarray,
+    frequencies: np.ndarray,
+    matrix: np.ndarray,
+    colorbar_label: str,
+) -> bool:
+    import matplotlib.pyplot as plt
+
+    data = np.asarray(matrix)
+    freqs = np.asarray(frequencies, dtype=float)
+    if data.ndim != 2 or data.size == 0 or freqs.size != data.shape[0] or time.size == 0:
+        return False
+    render_data = np.asarray(_downsample_heatmap_for_debug(data), dtype=float)
+    finite = render_data[np.isfinite(render_data)]
+    if finite.size == 0:
+        return False
+    vmin, vmax = np.nanpercentile(finite, [1.0, 99.0])
+    if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin == vmax:
+        vmin, vmax = float(np.nanmin(finite)), float(np.nanmax(finite))
+    fig, ax = plt.subplots(figsize=(14, 5.5))
+    extent = [float(time[0]), float(time[-1]), float(freqs[0]), float(freqs[-1])]
+    im = ax.imshow(
+        render_data,
+        aspect="auto",
+        origin="lower",
+        extent=extent,
+        interpolation="nearest",
+        vmin=vmin,
+        vmax=vmax,
+        cmap="viridis",
+    )
+    ax.set_title(title)
+    ax.set_xlabel(_time_axis_label(time))
+    ax.set_ylabel("Frequency (Hz)")
+    if np.all(freqs > 0) and float(np.max(freqs)) / max(float(np.min(freqs)), 1e-12) > 10.0:
+        ax.set_yscale("log")
+    fig.colorbar(im, ax=ax, label=colorbar_label)
+    fig.savefig(path, dpi=160, facecolor="white", bbox_inches="tight")
+    plt.close(fig)
+    return True
+
+
+def _save_frequency_clusters_png(path: Path, frequencies: np.ndarray, labels: np.ndarray) -> bool:
+    import matplotlib.pyplot as plt
+
+    freqs = np.asarray(frequencies, dtype=float)
+    cluster_labels = np.asarray(labels, dtype=int)
+    if freqs.size == 0 or freqs.shape != cluster_labels.shape:
+        return False
+    unique = sorted(int(v) for v in np.unique(cluster_labels))
+    cmap = plt.get_cmap("tab20")
+    fig, ax = plt.subplots(figsize=(9, 7))
+    for i, cluster_id in enumerate(unique):
+        mask = cluster_labels == cluster_id
+        ax.scatter(
+            np.full(int(np.count_nonzero(mask)), int(cluster_id)),
+            freqs[mask],
+            s=26,
+            color=cmap(i % 20),
+            label=f"cluster {cluster_id}: {float(np.min(freqs[mask])):.3g}-{float(np.max(freqs[mask])):.3g} Hz",
+        )
+    ax.set_title("Ward Frequency Clusters")
+    ax.set_xlabel("Cluster")
+    ax.set_ylabel("Frequency (Hz)")
+    if np.all(freqs > 0) and float(np.max(freqs)) / max(float(np.min(freqs)), 1e-12) > 10.0:
+        ax.set_yscale("log")
+    ax.grid(True, alpha=0.25)
+    ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), fontsize=8)
+    fig.savefig(path, dpi=160, facecolor="white", bbox_inches="tight")
+    plt.close(fig)
+    return True
+
+
+def _save_cluster_thresholds_png(path: Path, time: np.ndarray, threshold_debug: Dict[object, object]) -> bool:
+    import matplotlib.pyplot as plt
+
+    cluster_items = []
+    for cluster_id, info in threshold_debug.items():
+        if not isinstance(info, dict):
+            continue
+        activity = _debug_array(info.get("activity"))
+        threshold = _debug_array(info.get("threshold"))
+        moving = _debug_array(info.get("moving_average"))
+        if activity is None or threshold is None or moving is None:
+            continue
+        cluster_items.append((int(cluster_id), activity, moving, threshold, info))
+    if not cluster_items:
+        return False
+    cluster_items.sort(key=lambda item: item[0])
+    rows = len(cluster_items)
+    fig, axes = plt.subplots(rows, 1, figsize=(14, max(3.0, 2.2 * rows)), sharex=True)
+    axes = np.atleast_1d(axes)
+    for ax, (cluster_id, activity, moving, threshold, info) in zip(axes, cluster_items):
+        x_a, y_a = _downsample_1d_for_debug(time, activity)
+        x_m, y_m = _downsample_1d_for_debug(time, moving)
+        x_t, y_t = _downsample_1d_for_debug(time, threshold)
+        ax.plot(x_a, y_a, label="activity", color="#1f77b4", linewidth=1.0)
+        ax.plot(x_m, y_m, label="moving average", color="#ff7f0e", linewidth=1.0)
+        ax.plot(x_t, y_t, label="threshold", color="#d62728", linewidth=1.0)
+        max_freq = info.get("max_frequency", float("nan"))
+        ax.set_title(f"Cluster {cluster_id} activity and threshold | max frequency {float(max_freq):.3g} Hz")
+        ax.grid(True, alpha=0.22)
+        ax.legend(loc="upper right", fontsize=8)
+    axes[-1].set_xlabel(_time_axis_label(time))
+    fig.savefig(path, dpi=160, facecolor="white", bbox_inches="tight")
+    plt.close(fig)
+    return True
+
+
+def _save_noise_classification_png(path: Path, decisions: List[dict], retained: List[int]) -> bool:
+    import matplotlib.pyplot as plt
+
+    if not decisions and not retained:
+        return False
+    rows = []
+    for decision in decisions:
+        rows.append(
+            {
+                "cluster_id": int(decision.get("cluster_id", 0)),
+                "score": float(decision.get("score", 0.0)),
+                "rejected": bool(decision.get("rejected", False)),
+                "reason": str(decision.get("reason", "")),
+            }
+        )
+    known = {row["cluster_id"] for row in rows}
+    for cluster_id in retained:
+        if int(cluster_id) not in known:
+            rows.append({"cluster_id": int(cluster_id), "score": 0.0, "rejected": False, "reason": "retained"})
+    rows.sort(key=lambda row: row["cluster_id"])
+    colors = ["#c62828" if row["rejected"] else "#2e7d32" for row in rows]
+    fig, ax = plt.subplots(figsize=(11, 5))
+    x = np.arange(len(rows))
+    ax.bar(x, [row["score"] for row in rows], color=colors)
+    ax.set_xticks(x, [f"C{row['cluster_id']}" for row in rows])
+    ax.set_ylabel("Noise-candidate score")
+    ax.set_title("Frequency Cluster Noise Classification")
+    for xpos, row in zip(x, rows):
+        label = "rejected" if row["rejected"] else row["reason"]
+        ax.text(xpos, row["score"], label, rotation=45, ha="left", va="bottom", fontsize=8)
+    ax.grid(True, axis="y", alpha=0.25)
+    fig.savefig(path, dpi=160, facecolor="white", bbox_inches="tight")
+    plt.close(fig)
+    return True
+
+
+def _save_attenuation_masks_png(path: Path, time: np.ndarray, masks: Dict[object, object]) -> bool:
+    import matplotlib.pyplot as plt
+
+    rows = []
+    for cluster_id, mask in masks.items():
+        arr = _debug_array(mask)
+        if arr is not None and arr.ndim == 1:
+            rows.append((int(cluster_id), arr))
+    if not rows:
+        return False
+    rows.sort(key=lambda item: item[0])
+    fig, ax = plt.subplots(figsize=(14, 5.5))
+    for cluster_id, values in rows:
+        x_plot, y_plot = _downsample_1d_for_debug(time, values)
+        ax.plot(x_plot, y_plot, label=f"cluster {cluster_id}", linewidth=1.0)
+    ax.set_title("Coefficient Gain / Attenuation Masks")
+    ax.set_xlabel(_time_axis_label(time))
+    ax.set_ylabel("Gain (1 = retained, lower = suppressed)")
+    ax.set_ylim(-0.05, 1.05)
+    ax.grid(True, alpha=0.25)
+    ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), fontsize=8)
+    fig.savefig(path, dpi=160, facecolor="white", bbox_inches="tight")
+    plt.close(fig)
+    return True
+
+
+def _save_reconstructed_cluster_traces_png(path: Path, time: np.ndarray, traces: Dict[object, object]) -> bool:
+    import matplotlib.pyplot as plt
+
+    rows = []
+    for cluster_id, trace in traces.items():
+        arr = _debug_array(trace)
+        if arr is not None and arr.ndim == 1:
+            rows.append((int(cluster_id), arr))
+    if not rows:
+        return False
+    rows.sort(key=lambda item: item[0])
+    fig, ax = plt.subplots(figsize=(14, 5.5))
+    for cluster_id, values in rows:
+        x_plot, y_plot = _downsample_1d_for_debug(time, values)
+        ax.plot(x_plot, y_plot, label=f"cluster {cluster_id}", linewidth=1.0)
+    ax.set_title("Reconstructed Cluster Contributions")
+    ax.set_xlabel(_time_axis_label(time))
+    ax.set_ylabel("Reconstructed signal")
+    ax.grid(True, alpha=0.25)
+    ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), fontsize=8)
+    fig.savefig(path, dpi=160, facecolor="white", bbox_inches="tight")
+    plt.close(fig)
+    return True
+
+
+def _write_gonzalez_cwt_debug_export(
+    trace_name: str,
+    time: np.ndarray,
+    corrected: np.ndarray,
+    debug: Dict[str, Any],
+    out_dir: Path,
+    startup_exclusion_ms: float = 0.0,
+) -> List[Path]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    written: List[Path] = []
+    skipped: Dict[str, str] = {}
+    time_arr = np.asarray(time, dtype=float)
+    corrected_arr = np.asarray(corrected, dtype=float)
+    n = min(time_arr.size, corrected_arr.size)
+    time_arr = time_arr[:n]
+    corrected_arr = corrected_arr[:n]
+    startup_idx = _startup_exclusion_index(time_arr, startup_exclusion_ms)
+    full_n = n
+    if startup_idx > 0:
+        time_arr = time_arr[startup_idx:]
+        corrected_arr = corrected_arr[startup_idx:]
+        n = time_arr.size
+
+    def _trim_debug_time_axis(values: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        if values is None:
+            return None
+        arr = np.asarray(values)
+        if startup_idx <= 0:
+            return arr
+        if arr.ndim == 1 and arr.size >= full_n:
+            return arr[startup_idx:full_n]
+        if arr.ndim == 2 and arr.shape[1] >= full_n:
+            return arr[:, startup_idx:full_n]
+        return arr
+
+    def _trim_nested_time_values(values: object) -> object:
+        if startup_idx <= 0:
+            return values
+        if isinstance(values, dict):
+            return {key: _trim_nested_time_values(value) for key, value in values.items()}
+        arr = _debug_array(values)
+        if arr is not None:
+            trimmed = _trim_debug_time_axis(arr)
+            return trimmed
+        return values
+
+    frequencies = _debug_array(debug.get("frequency_vector"))
+    raw_coeffs = _trim_debug_time_axis(_debug_array(debug.get("original_complex_cwt_coefficients"), dtype=complex))
+    cleaned_coeffs = _trim_debug_time_axis(_debug_array(debug.get("cleaned_complex_cwt_coefficients"), dtype=complex))
+    normalized = _trim_debug_time_axis(_debug_array(debug.get("normalized_coefficient_magnitudes")))
+    labels = _debug_array(debug.get("ward_cluster_labels"), dtype=int)
+    output = _trim_debug_time_axis(_debug_array(debug.get("output")))
+    wrapper_output = _trim_debug_time_axis(_debug_array(debug.get("wrapper_output")))
+    wrapper_correction = _trim_debug_time_axis(_debug_array(debug.get("wrapper_correction_component")))
+
+    def _record(name: str, ok: bool, reason: str = "source data unavailable") -> None:
+        if ok:
+            written.append(out_dir / name)
+        else:
+            skipped[name] = reason
+
+    _record(
+        "01_input_trace.png",
+        _save_debug_line_plot(
+            out_dir / "01_input_trace.png",
+            f"{trace_name} | Gonzalez input trace",
+            time_arr,
+            [("corrected input", corrected_arr, "#1f77b4")],
+        ),
+    )
+    _record(
+        "02_morlet_cwt_scalogram_raw.png",
+        bool(
+            frequencies is not None
+            and raw_coeffs is not None
+            and _save_debug_heatmap(
+                out_dir / "02_morlet_cwt_scalogram_raw.png",
+                f"{trace_name} | Morlet CWT coefficient magnitude",
+                time_arr,
+                frequencies,
+                np.abs(raw_coeffs),
+                "|CWT coefficient|",
+            )
+        ),
+    )
+    _record(
+        "03_morlet_cwt_scalogram_normalized.png",
+        bool(
+            frequencies is not None
+            and normalized is not None
+            and _save_debug_heatmap(
+                out_dir / "03_morlet_cwt_scalogram_normalized.png",
+                f"{trace_name} | Normalized CWT coefficient magnitude",
+                time_arr,
+                frequencies,
+                normalized,
+                "normalized magnitude",
+            )
+        ),
+    )
+    _record(
+        "04_frequency_clusters.png",
+        bool(
+            frequencies is not None
+            and labels is not None
+            and _save_frequency_clusters_png(out_dir / "04_frequency_clusters.png", frequencies, labels)
+        ),
+    )
+    threshold_debug = debug.get("threshold_per_cluster", {})
+    if isinstance(threshold_debug, dict):
+        threshold_debug = _trim_nested_time_values(threshold_debug)
+    _record(
+        "05_cluster_activity_thresholds.png",
+        isinstance(threshold_debug, dict)
+        and _save_cluster_thresholds_png(out_dir / "05_cluster_activity_thresholds.png", time_arr, threshold_debug),
+    )
+    decisions = debug.get("rejected_frequency_clusters", [])
+    retained = debug.get("retained_frequency_clusters", [])
+    _record(
+        "06_noise_classification.png",
+        _save_noise_classification_png(
+            out_dir / "06_noise_classification.png",
+            decisions if isinstance(decisions, list) else [],
+            retained if isinstance(retained, list) else [],
+        ),
+    )
+    masks = debug.get("attenuation_mask_per_cluster", {})
+    if isinstance(masks, dict):
+        masks = _trim_nested_time_values(masks)
+    _record(
+        "07_attenuation_masks.png",
+        isinstance(masks, dict) and _save_attenuation_masks_png(out_dir / "07_attenuation_masks.png", time_arr, masks),
+    )
+    before_after_path = out_dir / "08_coefficients_before_after.png"
+    if frequencies is not None and raw_coeffs is not None and cleaned_coeffs is not None and time_arr.size:
+        import matplotlib.pyplot as plt
+
+        fig, axes = plt.subplots(2, 1, figsize=(14, 9), sharex=True)
+        for ax, title, matrix in [
+            (axes[0], "Before attenuation", np.abs(raw_coeffs)),
+            (axes[1], "After attenuation", np.abs(cleaned_coeffs)),
+        ]:
+            render = np.asarray(_downsample_heatmap_for_debug(matrix), dtype=float)
+            finite = render[np.isfinite(render)]
+            vmin, vmax = np.nanpercentile(finite, [1.0, 99.0]) if finite.size else (0.0, 1.0)
+            extent = [float(time_arr[0]), float(time_arr[-1]), float(frequencies[0]), float(frequencies[-1])]
+            im = ax.imshow(
+                render,
+                aspect="auto",
+                origin="lower",
+                extent=extent,
+                interpolation="nearest",
+                vmin=vmin,
+                vmax=vmax,
+                cmap="viridis",
+            )
+            ax.set_title(title)
+            ax.set_ylabel("Frequency (Hz)")
+            if np.all(frequencies > 0) and float(np.max(frequencies)) / max(float(np.min(frequencies)), 1e-12) > 10.0:
+                ax.set_yscale("log")
+            fig.colorbar(im, ax=ax, label="|CWT coefficient|")
+        axes[-1].set_xlabel(_time_axis_label(time_arr))
+        fig.suptitle(f"{trace_name} | CWT coefficients before vs after suppression")
+        fig.savefig(before_after_path, dpi=160, facecolor="white", bbox_inches="tight")
+        plt.close(fig)
+        _record("08_coefficients_before_after.png", True)
+    else:
+        _record("08_coefficients_before_after.png", False, "coefficient matrix stored as summary-only or unavailable")
+    reconstructed = debug.get("reconstructed_cluster_traces", {})
+    if isinstance(reconstructed, dict):
+        reconstructed = _trim_nested_time_values(reconstructed)
+    _record(
+        "09_reconstructed_cluster_traces.png",
+        isinstance(reconstructed, dict)
+        and _save_reconstructed_cluster_traces_png(out_dir / "09_reconstructed_cluster_traces.png", time_arr, reconstructed),
+    )
+    output_for_plot = output[:n] if output is not None and output.size >= n else None
+    wrapper_for_plot = wrapper_output[:n] if wrapper_output is not None and wrapper_output.size >= n else None
+    final_for_plot = wrapper_for_plot if wrapper_for_plot is not None else output_for_plot
+    overlay_series = [("input", corrected_arr, "#1f77b4")]
+    if output_for_plot is not None:
+        overlay_series.append(("raw Gonzalez", output_for_plot, "#ff7f0e"))
+    if wrapper_for_plot is not None:
+        overlay_series.append(("Gonzalez full-trace wrapper output", wrapper_for_plot, "#d62728"))
+    _record(
+        "10_final_overlay.png",
+        len(overlay_series) > 1
+        and _save_debug_line_plot(
+            out_dir / "10_final_overlay.png",
+            f"{trace_name} | Gonzalez input, raw CWT output, and wrapper output",
+            time_arr,
+            overlay_series,
+        ),
+    )
+    _record(
+        "11_removed_component.png",
+        final_for_plot is not None
+        and _save_debug_line_plot(
+            out_dir / "11_removed_component.png",
+            f"{trace_name} | Suppressed component (input - final output)",
+            time_arr,
+            [("removed component", corrected_arr - final_for_plot, "#6a3d9a")],
+            ylabel="Input - final output",
+        ),
+    )
+    correction_for_plot = (
+        wrapper_correction[:n]
+        if wrapper_correction is not None and wrapper_correction.size >= n
+        else (
+            wrapper_for_plot - output_for_plot
+            if wrapper_for_plot is not None and output_for_plot is not None
+            else None
+        )
+    )
+    _record(
+        "12_wrapper_correction_component.png",
+        correction_for_plot is not None
+        and _save_debug_line_plot(
+            out_dir / "12_wrapper_correction_component.png",
+            f"{trace_name} | Wrapper correction component",
+            time_arr,
+            [("wrapper output - raw Gonzalez", correction_for_plot, "#0f766e")],
+            ylabel="Wrapper correction",
+        ),
+    )
+
+    metrics = {
+        "trace_name": trace_name,
+        "startup_exclusion_ms": float(startup_exclusion_ms),
+        "startup_exclusion_samples": int(startup_idx),
+        "denoiser_used": debug.get("denoiser_used"),
+        "input_mode": debug.get("input_mode"),
+        "wavelet": debug.get("wavelet", "cmor1.5-1.0"),
+        "frequency_min_hz": float(np.nanmin(frequencies)) if frequencies is not None and frequencies.size else float("nan"),
+        "frequency_max_hz": float(np.nanmax(frequencies)) if frequencies is not None and frequencies.size else float("nan"),
+        "frequency_count": int(frequencies.size) if frequencies is not None else 0,
+        "chosen_cluster_count": debug.get("chosen_cluster_count"),
+        "selected_pc_count": debug.get("selected_pc_count"),
+        "retained_frequency_clusters": debug.get("retained_frequency_clusters"),
+        "rejected_frequency_clusters": debug.get("rejected_frequency_clusters"),
+        "threshold_per_cluster": threshold_debug,
+        "enable_noise_cluster_rejection": debug.get("enable_noise_cluster_rejection"),
+        "enable_event_template_rejection": debug.get("enable_event_template_rejection"),
+        "safety_metrics": debug.get("safety_metrics"),
+        "warnings": debug.get("warnings"),
+        "amplitude_preservation_diagnostics": debug.get("amplitude_preservation_diagnostics"),
+        "wrapper_output_mode": debug.get("wrapper_output_mode"),
+        "has_wrapper_output": wrapper_output is not None,
+        "has_wrapper_correction_component": correction_for_plot is not None,
+        "skipped_images": skipped,
+    }
+    metrics_path = out_dir / "gonzalez_cwt_debug_metrics.json"
+    metrics_path.write_text(json.dumps(_json_safe(metrics), indent=2), encoding="utf-8")
+    written.append(metrics_path)
+    return written
+
+
+def _debug_mask(values: object, n: int) -> np.ndarray:
+    arr = _debug_array(values, dtype=bool)
+    if arr is None:
+        return np.zeros(int(max(0, n)), dtype=bool)
+    out = np.zeros(int(max(0, n)), dtype=bool)
+    m = min(out.size, arr.size)
+    if m > 0:
+        out[:m] = np.asarray(arr[:m], dtype=bool)
+    return out
+
+
+def _plot_mask_bands(ax: object, time: np.ndarray, masks: List[tuple[str, np.ndarray, str]]) -> None:
+    import matplotlib.patches as patches
+
+    ax.set_ylim(-0.5, len(masks) - 0.5)
+    ax.set_yticks(np.arange(len(masks)), [label for label, _mask, _color in masks])
+    ax.set_xlabel(_time_axis_label(time))
+    ax.grid(axis="x", alpha=0.2)
+    if time.size == 0:
+        return
+    for row_idx, (_label, mask, color) in enumerate(masks):
+        for start, end in _contiguous_true_regions(np.asarray(mask, dtype=bool)):
+            s = max(0, min(int(start), time.size - 1))
+            e = max(s, min(int(end) - 1, time.size - 1))
+            ax.add_patch(
+                patches.Rectangle(
+                    (float(time[s]), row_idx - 0.35),
+                    max(float(time[e] - time[s]), 1e-12),
+                    0.7,
+                    color=color,
+                    alpha=0.75,
+                )
+            )
+
+
+def _shade_mask_regions(ax: object, time: np.ndarray, mask: np.ndarray, color: str, alpha: float = 0.18) -> None:
+    if time.size == 0:
+        return
+    for start, end in _contiguous_true_regions(np.asarray(mask, dtype=bool)):
+        s = max(0, min(int(start), time.size - 1))
+        e = max(s, min(int(end) - 1, time.size - 1))
+        ax.axvspan(float(time[s]), float(time[e]), color=color, alpha=alpha, linewidth=0)
+
+
+def _write_long_plateau_debug_export(
+    trace_name: str,
+    time: np.ndarray,
+    corrected: np.ndarray,
+    debug: Dict[str, Any],
+    out_dir: Path,
+    max_rejected_zooms: int = 50,
+    startup_exclusion_ms: float = 0.0,
+) -> List[Path]:
+    import matplotlib.pyplot as plt
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    written: List[Path] = []
+    skipped: Dict[str, str] = {}
+    time_arr = np.asarray(time, dtype=float)
+    corrected_arr = np.asarray(corrected, dtype=float)
+    n = min(time_arr.size, corrected_arr.size)
+    time_arr = time_arr[:n]
+    corrected_arr = corrected_arr[:n]
+    full_n = n
+    startup_idx = _startup_exclusion_index(time_arr, startup_exclusion_ms)
+    if startup_idx > 0:
+        time_arr = time_arr[startup_idx:]
+        corrected_arr = corrected_arr[startup_idx:]
+        n = time_arr.size
+    if n <= 0:
+        return written
+
+    def _trim_line(values: object, fallback: np.ndarray) -> np.ndarray:
+        arr = _debug_array(values)
+        if arr is None:
+            return np.asarray(fallback, dtype=float)
+        arr = np.asarray(arr, dtype=float)
+        out = np.zeros(n, dtype=float)
+        if startup_idx > 0 and arr.size >= full_n:
+            source = arr[startup_idx:full_n]
+        else:
+            source = arr[:n]
+        m = min(out.size, source.size)
+        if m > 0:
+            out[:m] = source[:m]
+        return out
+
+    def _trim_mask(values: object) -> np.ndarray:
+        arr = _debug_array(values, dtype=bool)
+        out = np.zeros(n, dtype=bool)
+        if arr is None:
+            return out
+        if startup_idx > 0 and arr.size >= full_n:
+            source = np.asarray(arr[startup_idx:full_n], dtype=bool)
+        else:
+            source = np.asarray(arr[:n], dtype=bool)
+        m = min(out.size, source.size)
+        if m > 0:
+            out[:m] = source[:m]
+        return out
+
+    input_signal = _trim_line(debug.get("long_plateau_input_signal"), corrected_arr)
+    proxy = _trim_line(debug.get("long_plateau_plateau_proxy"), input_signal)
+    drift = _trim_line(debug.get("long_plateau_slow_drift"), np.zeros(n, dtype=float))
+    detrended = _trim_line(debug.get("long_plateau_detrended_proxy"), proxy - drift)
+    high = _trim_line(debug.get("long_plateau_high_threshold_line"), np.zeros(n, dtype=float))
+    low = _trim_line(debug.get("long_plateau_low_threshold_line"), np.zeros(n, dtype=float))
+    otsu = _trim_line(debug.get("long_plateau_otsu_threshold_line"), np.zeros(n, dtype=float))
+
+    valid = _trim_mask(debug.get("long_plateau_valid_mask"))
+    excluded = _trim_mask(debug.get("long_plateau_excluded_mask"))
+    above = _trim_mask(debug.get("long_plateau_above_entry_mask"))
+    below = _trim_mask(debug.get("long_plateau_below_exit_mask"))
+    hysteresis = _trim_mask(debug.get("long_plateau_hysteresis_mask"))
+    otsu_candidate = _trim_mask(debug.get("long_plateau_otsu_candidate_mask"))
+    after_min = _trim_mask(debug.get("long_plateau_after_min_duration_mask"))
+    after_refine = _trim_mask(debug.get("long_plateau_after_refinement_mask"))
+    after_impulse = _trim_mask(debug.get("long_plateau_after_impulse_suppression_mask"))
+    after_merge = _trim_mask(debug.get("long_plateau_after_merge_mask"))
+    after_rescue = _trim_mask(debug.get("long_plateau_after_overmask_rescue_mask"))
+    final_mask = _trim_mask(debug.get("long_plateau_final_mask"))
+
+    def _record(name: str, ok: bool, reason: str = "source data unavailable") -> None:
+        if ok:
+            written.append(out_dir / name)
+        else:
+            skipped[name] = reason
+
+    path = out_dir / "01_input_and_proxy.png"
+    fig, ax = plt.subplots(figsize=(14, 4.8))
+    _shade_mask_regions(ax, time_arr, final_mask, "#dc2626", alpha=0.16)
+    ax.plot(*_downsample_1d_for_debug(time_arr, input_signal), label="detector input", color="#2563eb", linewidth=1.0)
+    ax.plot(*_downsample_1d_for_debug(time_arr, proxy), label="median plateau proxy", color="#f97316", linewidth=1.0)
+    ax.set_title(f"{trace_name} | Long plateau input and median proxy")
+    ax.set_xlabel(_time_axis_label(time_arr))
+    ax.set_ylabel("Signal")
+    ax.grid(True, alpha=0.22)
+    ax.legend(loc="best")
+    fig.savefig(path, dpi=160, facecolor="white", bbox_inches="tight")
+    plt.close(fig)
+    _record(path.name, True)
+
+    path = out_dir / "02_drift_correction.png"
+    fig, axes = plt.subplots(2, 1, figsize=(14, 7), sharex=True)
+    axes[0].plot(*_downsample_1d_for_debug(time_arr, proxy), label="plateau proxy", color="#f97316", linewidth=1.0)
+    axes[0].plot(*_downsample_1d_for_debug(time_arr, drift), label="slow drift", color="#475569", linewidth=1.0)
+    axes[0].set_title("Proxy and slow drift")
+    axes[0].legend(loc="best")
+    axes[0].grid(True, alpha=0.22)
+    axes[1].plot(*_downsample_1d_for_debug(time_arr, detrended), label="detrended proxy", color="#16a34a", linewidth=1.0)
+    axes[1].set_title("Detrended proxy")
+    axes[1].set_xlabel(_time_axis_label(time_arr))
+    axes[1].grid(True, alpha=0.22)
+    fig.suptitle(f"{trace_name} | Long plateau drift correction")
+    fig.savefig(path, dpi=160, facecolor="white", bbox_inches="tight")
+    plt.close(fig)
+    _record(path.name, True)
+
+    def _constant_line_value(values: np.ndarray) -> float:
+        arr = np.asarray(values, dtype=float)
+        finite = arr[np.isfinite(arr)]
+        return float(np.median(finite)) if finite.size else float("nan")
+
+    otsu_label = "Otsu threshold"
+    otsu_value = _constant_line_value(otsu)
+    high_value = _constant_line_value(high)
+    low_value = _constant_line_value(low)
+    overlap_tol = max(1e-9, 1e-6 * max(1.0, abs(otsu_value), abs(high_value), abs(low_value)))
+    if np.isfinite(otsu_value) and np.isfinite(high_value) and abs(otsu_value - high_value) <= overlap_tol:
+        otsu_label = "Otsu threshold (overlaps entry/high)"
+    elif np.isfinite(otsu_value) and np.isfinite(low_value) and abs(otsu_value - low_value) <= overlap_tol:
+        otsu_label = "Otsu threshold (overlaps exit/low)"
+
+    path = out_dir / "03_thresholds_overlay.png"
+    _record(
+        path.name,
+        _save_debug_line_plot(
+            path,
+            f"{trace_name} | Long plateau thresholds",
+            time_arr,
+            [
+                ("detrended proxy", detrended, "#16a34a", "-", 1.1, 2),
+                ("entry/high threshold", high, "#dc2626", "-", 1.5, 3),
+                ("exit/low threshold", low, "#0891b2", "-", 1.5, 3),
+                (otsu_label, otsu, "#7c3aed", "--", 2.3, 5),
+            ],
+            ylabel="Detrended signal",
+        ),
+    )
+
+    path = out_dir / "04_hysteresis_logic.png"
+    fig, ax = plt.subplots(figsize=(14, 4.8))
+    _plot_mask_bands(
+        ax,
+        time_arr,
+        [
+            ("valid", valid, "#94a3b8"),
+            ("excluded", excluded, "#111827"),
+            ("above entry", above, "#dc2626"),
+            ("below exit", below, "#0891b2"),
+            ("hysteresis", hysteresis, "#f97316"),
+        ],
+    )
+    ax.set_title(f"{trace_name} | Long plateau hysteresis logic")
+    fig.savefig(path, dpi=160, facecolor="white", bbox_inches="tight")
+    plt.close(fig)
+    _record(path.name, True)
+
+    path = out_dir / "05_candidate_filtering.png"
+    fig, ax = plt.subplots(figsize=(14, 4.8))
+    _plot_mask_bands(
+        ax,
+        time_arr,
+        [
+            ("hysteresis", hysteresis, "#f97316"),
+            ("region-filter candidate", otsu_candidate, "#7c3aed"),
+            ("min duration", after_min, "#16a34a"),
+            ("final long plateau", final_mask, "#dc2626"),
+        ],
+    )
+    ax.set_title(f"{trace_name} | Candidate filtering")
+    fig.savefig(path, dpi=160, facecolor="white", bbox_inches="tight")
+    plt.close(fig)
+    _record(path.name, True)
+
+    path = out_dir / "06_pipeline_masks.png"
+    fig, ax = plt.subplots(figsize=(14, 6.5))
+    _plot_mask_bands(
+        ax,
+        time_arr,
+        [
+            ("above entry", above, "#dc2626"),
+            ("hysteresis", hysteresis, "#f97316"),
+            ("candidate", otsu_candidate, "#7c3aed"),
+            ("min duration", after_min, "#16a34a"),
+            ("refined", after_refine, "#0d9488"),
+            ("impulse filtered", after_impulse, "#0891b2"),
+            ("merged", after_merge, "#2563eb"),
+            ("overmask rescue", after_rescue, "#4f46e5"),
+            ("final", final_mask, "#991b1b"),
+        ],
+    )
+    ax.set_title(f"{trace_name} | Long plateau pipeline masks")
+    fig.savefig(path, dpi=160, facecolor="white", bbox_inches="tight")
+    plt.close(fig)
+    _record(path.name, True)
+
+    rows = debug.get("long_plateau_region_debug_rows", [])
+    if not isinstance(rows, list):
+        rows = []
+    display_rows: List[Dict[str, Any]] = []
+    omitted_startup_region_count = 0
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        original_start = int(row.get("start_index", 0))
+        original_end = int(row.get("end_index_exclusive", original_start + 1))
+        if original_end <= startup_idx:
+            omitted_startup_region_count += 1
+            continue
+        display_row = dict(row)
+        display_start = max(0, original_start - startup_idx)
+        display_end = max(display_start + 1, original_end - startup_idx)
+        display_end = min(display_end, n)
+        display_row["display_start_index"] = int(display_start)
+        display_row["display_end_index_exclusive"] = int(display_end)
+        display_row["startup_exclusion_ms"] = float(startup_exclusion_ms)
+        display_rows.append(display_row)
+    rows = display_rows
+    accepted_rows = [row for row in rows if bool(row.get("accepted", False))]
+    rejected_rows = [row for row in rows if not bool(row.get("accepted", False))]
+    path = out_dir / "07_final_overlap.png"
+    fig, ax = plt.subplots(figsize=(14, 5.2))
+    _shade_mask_regions(ax, time_arr, final_mask, "#dc2626", alpha=0.16)
+    ax.plot(*_downsample_1d_for_debug(time_arr, input_signal), label="detector input", color="#2563eb", linewidth=1.0)
+    y_text = float(np.nanmax(input_signal)) if np.any(np.isfinite(input_signal)) else 0.0
+    for row in accepted_rows:
+        s = int(row.get("display_start_index", row.get("start_index", 0)))
+        e = int(row.get("display_end_index_exclusive", s + 1)) - 1
+        if 0 <= s < n and 0 <= e < n:
+            ax.text(float(time_arr[s]), y_text, f"A{row.get('region_id')}", color="#991b1b", fontsize=8)
+    for row in rejected_rows[:50]:
+        s = int(row.get("display_start_index", row.get("start_index", 0)))
+        e = int(row.get("display_end_index_exclusive", s + 1)) - 1
+        if 0 <= s < n and 0 <= e < n:
+            ax.axvspan(float(time_arr[s]), float(time_arr[e]), color="#64748b", alpha=0.10, linewidth=0)
+            ax.text(float(time_arr[s]), y_text, f"R{row.get('region_id')}", color="#334155", fontsize=8, rotation=45)
+    ax.set_title(f"{trace_name} | Accepted long plateaus and rejected candidates")
+    ax.set_xlabel(_time_axis_label(time_arr))
+    ax.set_ylabel("Signal")
+    ax.grid(True, alpha=0.22)
+    ax.legend(loc="best")
+    fig.savefig(path, dpi=160, facecolor="white", bbox_inches="tight")
+    plt.close(fig)
+    _record(path.name, True)
+
+    regions_path = out_dir / "long_plateau_debug_regions.csv"
+    pd.DataFrame(rows).to_csv(regions_path, index=False)
+    written.append(regions_path)
+
+    rejected_sorted = sorted(rejected_rows, key=lambda row: float(row.get("near_miss_score", 0.0)), reverse=True)
+    for row in rejected_sorted[: int(max_rejected_zooms)]:
+        region_id = int(row.get("region_id", 0))
+        start = int(row.get("display_start_index", row.get("start_index", 0)))
+        end = int(row.get("display_end_index_exclusive", start + 1))
+        pad = max(10, int(round(0.05 * n)))
+        lo = max(0, start - pad)
+        hi = min(n, end + pad)
+        if hi <= lo:
+            continue
+        path = out_dir / f"rejected_candidate_{region_id:03d}_zoom.png"
+        fig, axes = plt.subplots(2, 1, figsize=(12, 7), sharex=True)
+        axes[0].plot(time_arr[lo:hi], input_signal[lo:hi], color="#2563eb", linewidth=1.0, label="input")
+        axes[0].axvspan(float(time_arr[start]), float(time_arr[max(start, end - 1)]), color="#64748b", alpha=0.18)
+        axes[0].set_title(f"Rejected candidate {region_id}: {row.get('rejection_reason', '')}")
+        axes[0].legend(loc="best")
+        axes[0].grid(True, alpha=0.22)
+        axes[1].plot(time_arr[lo:hi], detrended[lo:hi], color="#16a34a", linewidth=1.0, label="detrended proxy")
+        axes[1].plot(time_arr[lo:hi], high[lo:hi], color="#dc2626", linewidth=1.0, label="entry")
+        axes[1].plot(time_arr[lo:hi], low[lo:hi], color="#0891b2", linewidth=1.0, label="exit")
+        axes[1].plot(time_arr[lo:hi], otsu[lo:hi], color="#7c3aed", linewidth=1.0, label="Otsu")
+        axes[1].axvspan(float(time_arr[start]), float(time_arr[max(start, end - 1)]), color="#64748b", alpha=0.18)
+        axes[1].set_xlabel(_time_axis_label(time_arr))
+        axes[1].legend(loc="best")
+        axes[1].grid(True, alpha=0.22)
+        fig.savefig(path, dpi=160, facecolor="white", bbox_inches="tight")
+        plt.close(fig)
+        written.append(path)
+
+    metrics = dict(debug.get("long_plateau_debug_metrics", {}) if isinstance(debug.get("long_plateau_debug_metrics"), dict) else {})
+    metrics.update(
+        {
+            "trace_name": trace_name,
+            "startup_exclusion_ms": float(startup_exclusion_ms),
+            "startup_exclusion_samples": int(startup_idx),
+            "startup_excluded_region_count": int(omitted_startup_region_count),
+            "accepted_region_count": len(accepted_rows),
+            "rejected_region_count": len(rejected_rows),
+            "final_plateau_count": len(_contiguous_true_regions(final_mask)),
+            "rejected_zoom_count": min(len(rejected_sorted), int(max_rejected_zooms)),
+            "omitted_rejected_zoom_count": max(0, len(rejected_sorted) - int(max_rejected_zooms)),
+            "skipped_images": skipped,
+        }
+    )
+    metrics_path = out_dir / "long_plateau_debug_metrics.json"
+    metrics_path.write_text(json.dumps(_json_safe(metrics), indent=2), encoding="utf-8")
+    written.append(metrics_path)
+    return written
+
+
 
 
 def _safe_excel_sheet_name(name: str, used_names: set[str]) -> str:
@@ -2748,6 +3722,8 @@ def _spike_record_from_event_stats_row(row: pd.Series, trace_name: str) -> Spike
 class TraceAnalysisResult:
     corrected: np.ndarray
     hybrid_denoised: np.ndarray
+    gonzalez_cwt_debug: Dict[str, Any]
+    long_plateau_debug: Dict[str, Any]
     correction_baseline: np.ndarray
     detection: object
     artifact_mask: np.ndarray
@@ -2792,6 +3768,20 @@ def _analysis_low_state_kwargs(params: DetectionParams) -> Dict[str, object]:
     }
 
 
+def _analysis_gonzalez_cwt_debug_kwargs(params: DetectionParams) -> Dict[str, object]:
+    return {
+        "threshold_sd": float(params.gonzalez_threshold_sd),
+        "max_clusters": int(params.gonzalez_max_clusters),
+        "attenuation_min": float(params.gonzalez_attenuation_min),
+        "attenuation_max": float(params.gonzalez_attenuation_max),
+        "enable_noise_cluster_rejection": bool(params.gonzalez_enable_noise_cluster_rejection),
+        "enable_event_template_rejection": bool(params.gonzalez_enable_event_template_rejection),
+        "enable_low_state_safety_gate": bool(params.enable_low_state_safety_gate),
+        "min_event_peak_preservation": float(params.min_event_peak_preservation),
+        "min_local_max_ratio": float(params.min_local_max_ratio),
+    }
+
+
 def analyze_trace_data(
     request: TraceAnalysisRequest,
     legacy_denoise_fn: Callable[..., np.ndarray] = denoise_hybrid_fluorescence_trace,
@@ -2821,11 +3811,11 @@ def analyze_trace_data(
     baseline = np.asarray(baseline_result.baseline, dtype=float)
     computation_source = np.asarray(baseline_result.processed_signal, dtype=float)
     plateau_mask = _detection_mask(baseline_result, "long_plateau_mask")
-    low_state_denoiser = str(request.detection_params.low_state_denoiser or "gonzalez_adaptive_wavelet")
+    low_state_denoiser = str(request.detection_params.low_state_denoiser or "gonzalez_full_trace")
     corrected_baseline_corrected = computation_source - baseline
-    # State-guided denoising is used as a detection aid. The returned
-    # corrected trace below remains the preferred source for quantitative
-    # amplitude, width, area, plateau level, and export summary measurements.
+    # Denoising is used as a detection aid. The returned corrected trace below
+    # remains the preferred source for quantitative amplitude, width, area,
+    # plateau level, and export summary measurements.
     denoised_baseline_corrected = np.asarray(
         denoise_trace_state_guided_low_plateau_tv(
             corrected_baseline_corrected,
@@ -2835,10 +3825,25 @@ def analyze_trace_data(
             boundary_protect_ms=float(request.detection_params.low_state_boundary_protect_ms),
             low_state_denoiser=low_state_denoiser,
             low_state_denoise_fn=legacy_denoise_fn if low_state_denoiser == "legacy_hybrid" else None,
+            normalization_baseline=baseline,
             **_analysis_low_state_kwargs(request.detection_params),
         ),
         dtype=float,
     )
+    gonzalez_cwt_debug = dict(
+        denoise_gonzalez_adaptive_wavelet(
+            corrected_baseline_corrected,
+            fs=sampling_rate_hz,
+            input_mode="corrected",
+            return_debug=True,
+            **_analysis_gonzalez_cwt_debug_kwargs(request.detection_params),
+        )
+    )
+    gonzalez_cwt_debug["wrapper_output"] = denoised_baseline_corrected.copy()
+    raw_gonzalez_output = np.asarray(gonzalez_cwt_debug.get("output", denoised_baseline_corrected), dtype=float)
+    if raw_gonzalez_output.shape == denoised_baseline_corrected.shape:
+        gonzalez_cwt_debug["wrapper_correction_component"] = denoised_baseline_corrected - raw_gonzalez_output
+    gonzalez_cwt_debug["wrapper_output_mode"] = low_state_denoiser
     detection = detect_spikes(
         request.trace_name,
         time,
@@ -2857,6 +3862,12 @@ def analyze_trace_data(
     return TraceAnalysisResult(
         corrected=corrected_baseline_corrected,
         hybrid_denoised=denoised_baseline_corrected,
+        gonzalez_cwt_debug=gonzalez_cwt_debug,
+        long_plateau_debug={
+            str(key): value
+            for key, value in baseline_result.qc_plot_data.items()
+            if str(key).startswith("long_plateau_")
+        },
         correction_baseline=baseline,
         detection=detection,
         artifact_mask=np.asarray(artifact_mask, dtype=bool),
@@ -2961,6 +3972,7 @@ class _HybridDenoiseTask(QRunnable):
         plateau_tv_weight: float,
         boundary_protect_ms: float,
         legacy_denoise_fn: Callable[..., np.ndarray],
+        normalization_baseline: Optional[np.ndarray] = None,
     ) -> None:
         super().__init__()
         self.trace_name = trace_name
@@ -2974,6 +3986,9 @@ class _HybridDenoiseTask(QRunnable):
         self.plateau_tv_weight = float(plateau_tv_weight)
         self.boundary_protect_ms = float(boundary_protect_ms)
         self.legacy_denoise_fn = legacy_denoise_fn
+        self.normalization_baseline = (
+            None if normalization_baseline is None else np.asarray(normalization_baseline, dtype=float).copy()
+        )
         self.signals = _HybridWorkerSignals()
 
     def run(self) -> None:
@@ -2993,6 +4008,7 @@ class _HybridDenoiseTask(QRunnable):
                     boundary_protect_ms=self.boundary_protect_ms,
                     low_state_denoiser=self.low_state_denoiser,
                     low_state_denoise_fn=self.legacy_denoise_fn if self.low_state_denoiser == "legacy_hybrid" else None,
+                    normalization_baseline=self.normalization_baseline,
                     **self.low_state_kwargs,
                 ),
                 dtype=float,
@@ -3105,6 +4121,17 @@ class SpikeCurationMainWindow(QMainWindow):
         self.param_highpass_cutoff_hz = self._make_double_spin(0.001, 1000.0, self.detection_params.highpass_cutoff_hz, 0.1)
         self.param_highpass_order = self._make_int_spin(1, 10, self.detection_params.highpass_order)
         self.param_plateau_median_window_ms = self._make_double_spin(5.0, 500.0, self.detection_params.plateau_median_window_ms, 1.0)
+        self.param_short_plateau_step_noise_k = self._make_double_spin(0.0, 20.0, self.detection_params.short_plateau_step_noise_k, 0.1)
+        self.param_short_plateau_elevated_noise_k = self._make_double_spin(0.0, 20.0, self.detection_params.short_plateau_elevated_noise_k, 0.1)
+        self.param_short_plateau_survival_noise_k = self._make_double_spin(0.0, 20.0, self.detection_params.short_plateau_survival_noise_k, 0.1)
+        self.param_short_plateau_loss_noise_k = self._make_double_spin(0.0, 20.0, self.detection_params.short_plateau_loss_noise_k, 0.1)
+        self.param_short_plateau_median_noise_k = self._make_double_spin(0.0, 20.0, self.detection_params.short_plateau_median_noise_k, 0.1)
+        self.param_short_plateau_pre_quiet_noise_k = self._make_double_spin(0.0, 20.0, self.detection_params.short_plateau_pre_quiet_noise_k, 0.1)
+        self.param_short_plateau_min_support_fraction = self._make_double_spin(0.0, 1.0, self.detection_params.short_plateau_min_support_fraction, 0.05)
+        self.param_short_plateau_min_confidence = self._make_double_spin(0.0, 1.0, self.detection_params.short_plateau_min_confidence, 0.05)
+        self.param_short_plateau_early_dwell_ms = self._make_double_spin(1.0, 500.0, self.detection_params.short_plateau_early_dwell_ms, 1.0)
+        self.param_short_plateau_min_support_ms = self._make_double_spin(1.0, 500.0, self.detection_params.short_plateau_min_support_ms, 1.0)
+        self.param_short_plateau_min_duration_ms = self._make_double_spin(1.0, 1000.0, self.detection_params.short_plateau_min_duration_ms, 1.0)
         self.param_spike_noise_k = self._make_double_spin(0.1, 100.0, self.detection_params.spike_noise_k, 0.1)
         self.param_spike_prominence_k = self._make_double_spin(0.0, 100.0, self.detection_params.spike_prominence_k, 0.1)
         self.param_min_separation_ms = self._make_double_spin(1.0, 1000.0, self.detection_params.min_separation_ms, 1.0)
@@ -3121,6 +4148,17 @@ class SpikeCurationMainWindow(QMainWindow):
         params_layout.addRow("highpass_cutoff_hz", self.param_highpass_cutoff_hz)
         params_layout.addRow("highpass_order", self.param_highpass_order)
         params_layout.addRow("plateau_median_window_ms", self.param_plateau_median_window_ms)
+        params_layout.addRow("short_step_noise_k", self.param_short_plateau_step_noise_k)
+        params_layout.addRow("short_elevated_noise_k", self.param_short_plateau_elevated_noise_k)
+        params_layout.addRow("short_survival_noise_k", self.param_short_plateau_survival_noise_k)
+        params_layout.addRow("short_loss_noise_k", self.param_short_plateau_loss_noise_k)
+        params_layout.addRow("short_median_noise_k", self.param_short_plateau_median_noise_k)
+        params_layout.addRow("short_pre_quiet_noise_k", self.param_short_plateau_pre_quiet_noise_k)
+        params_layout.addRow("short_min_support_fraction", self.param_short_plateau_min_support_fraction)
+        params_layout.addRow("short_min_confidence", self.param_short_plateau_min_confidence)
+        params_layout.addRow("short_early_dwell_ms", self.param_short_plateau_early_dwell_ms)
+        params_layout.addRow("short_min_support_ms", self.param_short_plateau_min_support_ms)
+        params_layout.addRow("short_min_duration_ms", self.param_short_plateau_min_duration_ms)
         params_layout.addRow("spike_threshold_k", self.param_spike_noise_k)
         params_layout.addRow("spike_prominence_k", self.param_spike_prominence_k)
         params_layout.addRow("min_separation_ms", self.param_min_separation_ms)
@@ -3146,7 +4184,7 @@ class SpikeCurationMainWindow(QMainWindow):
         self.chk_show_corrected = QCheckBox("Show corrected")
         self.chk_show_baseline = QCheckBox("Show baseline")
         self.chk_show_highpass = QCheckBox("Show high-pass")
-        self.chk_show_hybrid_denoised = QCheckBox("Show state-guided denoised")
+        self.chk_show_hybrid_denoised = QCheckBox("Show Gonzalez full-trace denoised")
 
         self.chk_show_raw.setChecked(True)
         self.chk_show_corrected.setChecked(True)
@@ -3161,11 +4199,12 @@ class SpikeCurationMainWindow(QMainWindow):
         overlay_layout.addRow(self.chk_show_hybrid_denoised)
         left_layout.addWidget(overlay_group)
 
-        denoise_group = QGroupBox("State-Guided Denoising")
+        denoise_group = QGroupBox("Denoising")
         denoise_layout = QFormLayout(denoise_group)
         self.param_low_state_denoiser = QComboBox()
         self.param_low_state_denoiser.addItem("Gonzalez adaptive wavelet", "gonzalez_adaptive_wavelet")
         self.param_low_state_denoiser.addItem("Gonzalez full trace (no plateau mask)", "gonzalez_full_trace")
+        self.param_low_state_denoiser.addItem("Gonzalez full trace dF/F0", "gonzalez_full_trace_dff")
         self.param_low_state_denoiser.addItem("Legacy Hybrid", "legacy_hybrid")
         self.param_low_state_denoiser.addItem("No low-state denoising", "none")
         low_state_index = self.param_low_state_denoiser.findData(str(self.detection_params.low_state_denoiser))
@@ -3327,12 +4366,23 @@ class SpikeCurationMainWindow(QMainWindow):
         self.detection_params.highpass_cutoff_hz = float(self.param_highpass_cutoff_hz.value())
         self.detection_params.highpass_order = int(self.param_highpass_order.value())
         self.detection_params.plateau_median_window_ms = float(self.param_plateau_median_window_ms.value())
+        self.detection_params.short_plateau_step_noise_k = float(self.param_short_plateau_step_noise_k.value())
+        self.detection_params.short_plateau_elevated_noise_k = float(self.param_short_plateau_elevated_noise_k.value())
+        self.detection_params.short_plateau_survival_noise_k = float(self.param_short_plateau_survival_noise_k.value())
+        self.detection_params.short_plateau_loss_noise_k = float(self.param_short_plateau_loss_noise_k.value())
+        self.detection_params.short_plateau_median_noise_k = float(self.param_short_plateau_median_noise_k.value())
+        self.detection_params.short_plateau_pre_quiet_noise_k = float(self.param_short_plateau_pre_quiet_noise_k.value())
+        self.detection_params.short_plateau_min_support_fraction = float(self.param_short_plateau_min_support_fraction.value())
+        self.detection_params.short_plateau_min_confidence = float(self.param_short_plateau_min_confidence.value())
+        self.detection_params.short_plateau_early_dwell_ms = float(self.param_short_plateau_early_dwell_ms.value())
+        self.detection_params.short_plateau_min_support_ms = float(self.param_short_plateau_min_support_ms.value())
+        self.detection_params.short_plateau_min_duration_ms = float(self.param_short_plateau_min_duration_ms.value())
         self.detection_params.spike_noise_k = float(self.param_spike_noise_k.value())
         self.detection_params.spike_prominence_k = float(self.param_spike_prominence_k.value())
         self.detection_params.min_separation_ms = float(self.param_min_separation_ms.value())
         self.detection_params.spike_zoom_half_window_ms = float(self.param_spike_zoom_half_window_ms.value())
         self.detection_params.low_state_denoiser = str(
-            self.param_low_state_denoiser.currentData() or "gonzalez_adaptive_wavelet"
+            self.param_low_state_denoiser.currentData() or "gonzalez_full_trace"
         )
         self.detection_params.gonzalez_threshold_sd = float(self.param_gonzalez_threshold_sd.value())
         self.detection_params.gonzalez_max_clusters = int(self.param_gonzalez_max_clusters.value())
@@ -3364,6 +4414,17 @@ class SpikeCurationMainWindow(QMainWindow):
         self.param_highpass_cutoff_hz.setValue(float(self.detection_params.highpass_cutoff_hz))
         self.param_highpass_order.setValue(int(self.detection_params.highpass_order))
         self.param_plateau_median_window_ms.setValue(self.detection_params.plateau_median_window_ms)
+        self.param_short_plateau_step_noise_k.setValue(float(self.detection_params.short_plateau_step_noise_k))
+        self.param_short_plateau_elevated_noise_k.setValue(float(self.detection_params.short_plateau_elevated_noise_k))
+        self.param_short_plateau_survival_noise_k.setValue(float(self.detection_params.short_plateau_survival_noise_k))
+        self.param_short_plateau_loss_noise_k.setValue(float(self.detection_params.short_plateau_loss_noise_k))
+        self.param_short_plateau_median_noise_k.setValue(float(self.detection_params.short_plateau_median_noise_k))
+        self.param_short_plateau_pre_quiet_noise_k.setValue(float(self.detection_params.short_plateau_pre_quiet_noise_k))
+        self.param_short_plateau_min_support_fraction.setValue(float(self.detection_params.short_plateau_min_support_fraction))
+        self.param_short_plateau_min_confidence.setValue(float(self.detection_params.short_plateau_min_confidence))
+        self.param_short_plateau_early_dwell_ms.setValue(float(self.detection_params.short_plateau_early_dwell_ms))
+        self.param_short_plateau_min_support_ms.setValue(float(self.detection_params.short_plateau_min_support_ms))
+        self.param_short_plateau_min_duration_ms.setValue(float(self.detection_params.short_plateau_min_duration_ms))
         self.param_spike_noise_k.setValue(self.detection_params.spike_noise_k)
         self.param_spike_prominence_k.setValue(self.detection_params.spike_prominence_k)
         self.param_min_separation_ms.setValue(self.detection_params.min_separation_ms)
@@ -3388,9 +4449,14 @@ class SpikeCurationMainWindow(QMainWindow):
         self.param_artifact_drop_start.setValue(self.artifact_params.drop_start_abs)
 
     def _update_denoise_control_state(self, *_args: object) -> None:
-        low_state_denoiser = str(self.param_low_state_denoiser.currentData() or "gonzalez_adaptive_wavelet")
+        low_state_denoiser = str(self.param_low_state_denoiser.currentData() or "gonzalez_full_trace")
         state_aware_mode = low_state_denoiser in {"gonzalez_adaptive_wavelet", "legacy_hybrid"}
-        full_trace_mode = low_state_denoiser == "gonzalez_full_trace"
+        full_trace_mode = low_state_denoiser in {"gonzalez_full_trace", "gonzalez_full_trace_dff"}
+        self.chk_show_hybrid_denoised.setText(
+            "Show Gonzalez full-trace denoised"
+            if low_state_denoiser == "gonzalez_full_trace"
+            else "Show denoised"
+        )
         self.param_plateau_tv_weight.setEnabled(state_aware_mode)
         self.param_plateau_tv_weight.setToolTip(
             "Used by state-aware Gonzalez and Legacy Hybrid modes."
@@ -3772,27 +4838,61 @@ class SpikeCurationMainWindow(QMainWindow):
         images_dir = out_dir / "images"
         spikes_dir = images_dir / "spikes"
         plateaus_dir = images_dir / "plateaus"
+        denoising_debug_dir = images_dir / "denoising_debug"
+        long_plateau_debug_dir = images_dir / "plateau_debug" / "long"
         summary_dir = images_dir / "summary"
         spikes_dir.mkdir(parents=True, exist_ok=True)
         plateaus_dir.mkdir(parents=True, exist_ok=True)
+        denoising_debug_dir.mkdir(parents=True, exist_ok=True)
+        long_plateau_debug_dir.mkdir(parents=True, exist_ok=True)
         summary_dir.mkdir(parents=True, exist_ok=True)
 
         pg.setConfigOptions(antialias=True)
         exported_traces = 0
+        denoising_debug_traces = 0
+        long_plateau_debug_traces = 0
         all_trace_aligned_pixmaps: List[QtGui.QPixmap] = []
         all_trace_superimposed_pixmaps: List[QtGui.QPixmap] = []
         all_trace_plateau_superimposed_pixmaps: List[QtGui.QPixmap] = []
         all_trace_data_for_combined: List[Tuple[str, np.ndarray, np.ndarray, List[SpikeRecord]]] = []
         all_trace_plateau_data_for_combined: List[Tuple[str, np.ndarray, np.ndarray, np.ndarray]] = []
+        startup_exclusion_ms = float(self.detection_params.startup_exclusion_ms)
         for trace_name in self.trace_names:
             state = self.traces[trace_name]
+            export_view = _startup_trimmed_trace_export_data(state, startup_exclusion_ms)
+            safe_name = "".join(c if c.isalnum() else "_" for c in state.trace_name)
+            debug = self._gonzalez_cwt_debug_for_export(state)
+            written_debug = _write_gonzalez_cwt_debug_export(
+                trace_name=state.trace_name,
+                time=state.time,
+                corrected=state.corrected,
+                debug=debug,
+                out_dir=denoising_debug_dir / safe_name,
+                startup_exclusion_ms=startup_exclusion_ms,
+            )
+            if written_debug:
+                denoising_debug_traces += 1
+            if state.long_plateau_debug is not None:
+                written_plateau_debug = _write_long_plateau_debug_export(
+                    trace_name=state.trace_name,
+                    time=state.time,
+                    corrected=state.corrected,
+                    debug=dict(state.long_plateau_debug),
+                    out_dir=long_plateau_debug_dir / safe_name,
+                    startup_exclusion_ms=startup_exclusion_ms,
+                )
+                if written_plateau_debug:
+                    long_plateau_debug_traces += 1
             exported_count, aligned_pix, superimposed_pix = self._export_trace_spike_bundle(
                 state,
                 out_dir,
                 spikes_dir=spikes_dir,
                 plateaus_dir=plateaus_dir,
             )
-            has_plateau_map = bool(state.plateau_mask is not None and np.any(np.asarray(state.plateau_mask, dtype=bool)))
+            plateau_mask_for_export = export_view["plateau_mask"]
+            has_plateau_map = bool(
+                plateau_mask_for_export is not None and np.any(np.asarray(plateau_mask_for_export, dtype=bool))
+            )
             if exported_count <= 0 and not has_plateau_map:
                 continue
             exported_traces += 1
@@ -3800,22 +4900,24 @@ class SpikeCurationMainWindow(QMainWindow):
                 all_trace_aligned_pixmaps.append(aligned_pix)
             if not superimposed_pix.isNull():
                 all_trace_superimposed_pixmaps.append(superimposed_pix)
-            if state.plateau_mask is not None and np.any(np.asarray(state.plateau_mask, dtype=bool)):
+            if has_plateau_map:
                 plateau_superimposed_pix = _render_superimposed_plateaus_png(
                     trace_name=state.trace_name,
-                    time=state.time,
-                    corrected=state.corrected,
-                    plateau_mask=np.asarray(state.plateau_mask, dtype=bool),
+                    time=export_view["time"],
+                    corrected=export_view["corrected"],
+                    plateau_mask=np.asarray(plateau_mask_for_export, dtype=bool),
                     width=1400,
                     height=450,
                 )
                 if not plateau_superimposed_pix.isNull():
                     all_trace_plateau_superimposed_pixmaps.append(plateau_superimposed_pix)
-            if state.spikes:
-                all_trace_data_for_combined.append((trace_name, state.time, state.corrected, state.spikes))
-            if state.plateau_mask is not None and np.any(np.asarray(state.plateau_mask, dtype=bool)):
+            if export_view["spikes"]:
+                all_trace_data_for_combined.append(
+                    (trace_name, export_view["time"], export_view["corrected"], export_view["spikes"])
+                )
+            if has_plateau_map:
                 all_trace_plateau_data_for_combined.append(
-                    (trace_name, state.time, state.corrected, np.asarray(state.plateau_mask, dtype=bool))
+                    (trace_name, export_view["time"], export_view["corrected"], np.asarray(plateau_mask_for_export, dtype=bool))
                 )
 
         if exported_traces > 0:
@@ -3866,7 +4968,7 @@ class SpikeCurationMainWindow(QMainWindow):
         self._write_export_manifest(out_dir, "all", self.trace_names)
         image_note = f" and images for {exported_traces} traces" if exported_traces > 0 else "; no spike/plateau images were available"
         self.status_label.setText(
-            f"Exported all tables, reports, reload files{image_note} to {out_dir}"
+            f"Exported all tables, reports, reload files{image_note}; denoising debug for {denoising_debug_traces} traces and long-plateau debug for {long_plateau_debug_traces} traces to {out_dir}"
         )
 
     def export_current_dialog(self) -> None:
@@ -3877,8 +4979,13 @@ class SpikeCurationMainWindow(QMainWindow):
             return
         self._pull_params_from_widgets()
 
-        has_spikes = bool(state.spikes)
-        has_plateau_map = bool(state.plateau_mask is not None and np.any(np.asarray(state.plateau_mask, dtype=bool)))
+        startup_exclusion_ms = float(self.detection_params.startup_exclusion_ms)
+        export_view = _startup_trimmed_trace_export_data(state, startup_exclusion_ms)
+        has_spikes = bool(export_view["spikes"])
+        plateau_mask_for_export = export_view["plateau_mask"]
+        has_plateau_map = bool(
+            plateau_mask_for_export is not None and np.any(np.asarray(plateau_mask_for_export, dtype=bool))
+        )
 
         safe_name = "".join(c if c.isalnum() else "_" for c in state.trace_name)
         out_dir = self._make_export_dir(f"export_current_{safe_name}")
@@ -3888,12 +4995,34 @@ class SpikeCurationMainWindow(QMainWindow):
         images_dir = out_dir / "images"
         spikes_dir = images_dir / "spikes"
         plateaus_dir = images_dir / "plateaus"
+        denoising_debug_dir = images_dir / "denoising_debug"
+        long_plateau_debug_dir = images_dir / "plateau_debug" / "long"
         summary_dir = images_dir / "summary"
         spikes_dir.mkdir(parents=True, exist_ok=True)
         plateaus_dir.mkdir(parents=True, exist_ok=True)
+        denoising_debug_dir.mkdir(parents=True, exist_ok=True)
+        long_plateau_debug_dir.mkdir(parents=True, exist_ok=True)
         summary_dir.mkdir(parents=True, exist_ok=True)
 
         pg.setConfigOptions(antialias=True)
+        debug = self._gonzalez_cwt_debug_for_export(state)
+        _write_gonzalez_cwt_debug_export(
+            trace_name=state.trace_name,
+            time=state.time,
+            corrected=state.corrected,
+            debug=debug,
+            out_dir=denoising_debug_dir / safe_name,
+            startup_exclusion_ms=startup_exclusion_ms,
+        )
+        if state.long_plateau_debug is not None:
+            _write_long_plateau_debug_export(
+                trace_name=state.trace_name,
+                time=state.time,
+                corrected=state.corrected,
+                debug=dict(state.long_plateau_debug),
+                out_dir=long_plateau_debug_dir / safe_name,
+                startup_exclusion_ms=startup_exclusion_ms,
+            )
         exported_count = 0
         if has_spikes or has_plateau_map:
             exported_count, _aligned_pix, _superimposed_pix = self._export_trace_spike_bundle(
@@ -3905,7 +5034,7 @@ class SpikeCurationMainWindow(QMainWindow):
         self._write_export_manifest(out_dir, "current", [state.trace_name])
         image_note = " with images" if exported_count > 0 or has_plateau_map else "; no spike/plateau images were available"
         self.status_label.setText(
-            f"Exported current trace tables, reports, reload files{image_note} to {out_dir}"
+            f"Exported current trace tables, reports, reload files{image_note}; denoising debug images to {out_dir}"
         )
 
     def export_png_dialog(self) -> None:
@@ -3929,21 +5058,28 @@ class SpikeCurationMainWindow(QMainWindow):
         safe_name = "".join(c if c.isalnum() else "_" for c in state.trace_name)
         spike_out = spikes_dir if spikes_dir is not None else out_dir
         plateau_out = plateaus_dir if plateaus_dir is not None else out_dir
+        export_view = _startup_trimmed_trace_export_data(state, float(self.detection_params.startup_exclusion_ms))
+        time = export_view["time"]
+        corrected = export_view["corrected"]
+        hybrid_denoised = export_view["hybrid_denoised"]
+        baseline = export_view["baseline"]
+        debug_threshold = export_view["debug_threshold"]
+        spikes = export_view["spikes"]
         spike_pixmaps: List[QtGui.QPixmap] = []
         half_window_ms = float(self.detection_params.spike_zoom_half_window_ms)
         single_w, single_h, aligned_row_h, _ = _spike_export_dimensions(half_window_ms)
 
-        for spike_idx, spike in enumerate(state.spikes, 1):
+        for spike_idx, spike in enumerate(spikes, 1):
             pix = _render_spike_png(
-                time=state.time,
-                corrected=state.corrected,
-                hybrid_denoised=state.hybrid_denoised,
-                baseline=state.baseline,
-                threshold_line=state.debug_threshold,
+                time=time,
+                corrected=corrected,
+                hybrid_denoised=hybrid_denoised,
+                baseline=baseline,
+                threshold_line=debug_threshold,
                 spike=spike,
                 half_window_ms=half_window_ms,
                 width=single_w,
-                height=single_h * 2 if state.hybrid_denoised is not None else single_h,
+                height=single_h * 2 if hybrid_denoised is not None else single_h,
             )
             if pix.isNull():
                 continue
@@ -3952,9 +5088,9 @@ class SpikeCurationMainWindow(QMainWindow):
 
         # Render superimposed (overlaid) spikes
         superimposed_pix = _render_superimposed_spikes_png(
-            time=state.time,
-            corrected=state.corrected,
-            spikes=state.spikes,
+            time=time,
+            corrected=corrected,
+            spikes=spikes,
             half_window_ms=half_window_ms,
             width=single_w,
             height=single_h,
@@ -3970,26 +5106,26 @@ class SpikeCurationMainWindow(QMainWindow):
         if not aligned_pix.isNull():
             aligned_pix.save(str(spike_out / f"{safe_name}_aligned.png"))
 
-        if state.plateau_mask is not None and np.any(np.asarray(state.plateau_mask, dtype=bool)):
-            plateau_mask = np.asarray(state.plateau_mask, dtype=bool)
+        if export_view["plateau_mask"] is not None and np.any(np.asarray(export_view["plateau_mask"], dtype=bool)):
+            plateau_mask = np.asarray(export_view["plateau_mask"], dtype=bool)
             long_plateau_mask = (
-                np.asarray(state.long_plateau_mask, dtype=bool)
-                if state.long_plateau_mask is not None
+                np.asarray(export_view["long_plateau_mask"], dtype=bool)
+                if export_view["long_plateau_mask"] is not None
                 else plateau_mask
             )
             short_plateau_mask = (
-                np.asarray(state.short_plateau_mask, dtype=bool)
-                if state.short_plateau_mask is not None
+                np.asarray(export_view["short_plateau_mask"], dtype=bool)
+                if export_view["short_plateau_mask"] is not None
                 else np.zeros_like(plateau_mask, dtype=bool)
             )
             full_trace_plateau_pix = _render_full_trace_plateau_png(
                 trace_name=state.trace_name,
-                time=state.time,
-                corrected=state.corrected,
+                time=time,
+                corrected=corrected,
                 plateau_mask=plateau_mask,
                 long_plateau_mask=long_plateau_mask,
                 short_plateau_mask=short_plateau_mask,
-                spikes=state.spikes,
+                spikes=spikes,
                 width=1800,
                 height=500,
             )
@@ -3998,8 +5134,8 @@ class SpikeCurationMainWindow(QMainWindow):
 
             plateau_superimposed_pix = _render_superimposed_plateaus_png(
                 trace_name=state.trace_name,
-                time=state.time,
-                corrected=state.corrected,
+                time=time,
+                corrected=corrected,
                 plateau_mask=plateau_mask,
                 width=1400,
                 height=450,
@@ -4009,7 +5145,7 @@ class SpikeCurationMainWindow(QMainWindow):
 
             plateau_rows = _plateau_code_rows(
                 trace_name=state.trace_name,
-                time=state.time,
+                time=time,
                 plateau_mask=plateau_mask,
                 long_plateau_mask=long_plateau_mask,
                 short_plateau_mask=short_plateau_mask,
@@ -4024,12 +5160,12 @@ class SpikeCurationMainWindow(QMainWindow):
                     zoom_pix = _render_plateau_zoom_png(
                         trace_name=state.trace_name,
                         plateau_code=plateau_code,
-                        time=state.time,
-                        corrected=state.corrected,
+                        time=time,
+                        corrected=corrected,
                         start_idx=int(start),
                         end_idx_exclusive=int(end),
                         plateau_source=plateau_source,
-                        spikes=state.spikes,
+                        spikes=spikes,
                         width=1400,
                         height=420,
                     )
@@ -4123,12 +5259,15 @@ class SpikeCurationMainWindow(QMainWindow):
             state.hybrid_denoised = None
             state.hybrid_denoised_cache_key = None
             state.hybrid_denoised_pending_key = None
+            state.gonzalez_cwt_debug = None
+            state.gonzalez_cwt_debug_cache_key = None
             state.baseline = np.zeros_like(state.corrected, dtype=float)
             state.correction_baseline = None
             state.highpass_trace = None
             state.artifact_mask = None
             state.plateau_mask = None
             state.long_plateau_mask = None
+            state.long_plateau_debug = None
             state.short_plateau_mask = None
             state.short_plateau_events = None
             state.debug_threshold = None
@@ -4169,6 +5308,8 @@ class SpikeCurationMainWindow(QMainWindow):
         state.corrected = result.corrected
         state.sampling_rate_hz = result.sampling_rate_hz
         state.hybrid_denoised = result.hybrid_denoised
+        state.gonzalez_cwt_debug = dict(result.gonzalez_cwt_debug)
+        state.gonzalez_cwt_debug_cache_key = self._gonzalez_cwt_debug_cache_key()
         state.hybrid_denoised_cache_key = self._hybrid_cache_key()
         state.hybrid_denoised_pending_key = None
         state.smoothed = detection.smoothed
@@ -4180,6 +5321,7 @@ class SpikeCurationMainWindow(QMainWindow):
         state.candidate_windows = detection.candidate_windows
         state.plateau_mask = _detection_mask(detection, "baseline_mask")
         state.long_plateau_mask = _detection_mask(detection, "long_plateau_mask")
+        state.long_plateau_debug = dict(result.long_plateau_debug)
         state.short_plateau_mask = _detection_mask(detection, "short_plateau_mask", fallback_key="")
         state.short_plateau_events = _detection_short_events(detection)
         state.analysis_status = "done"
@@ -4298,7 +5440,9 @@ class SpikeCurationMainWindow(QMainWindow):
             short_count = len(_contiguous_true_regions(np.asarray(state.short_plateau_mask, dtype=bool)))
         hybrid_status = ""
         if self.chk_show_hybrid_denoised.isChecked():
-            hybrid_status = " | state-guided denoised: shown" if state.hybrid_denoised is not None else ""
+            mode = str(self.param_low_state_denoiser.currentData() or "gonzalez_full_trace")
+            label = "Gonzalez full-trace denoised" if mode == "gonzalez_full_trace" else "denoised"
+            hybrid_status = f" | {label}: shown" if state.hybrid_denoised is not None else ""
         fs_status = f" | fs: {_trace_sampling_rate_hz(state):.3g} Hz"
         self.status_label.setText(
             f"Trace: {state.trace_name}{fs_status} | plateaus: {plateau_count} (short: {short_count}) | spikes: {len(state.spikes)}{hybrid_status}"
@@ -4322,7 +5466,7 @@ class SpikeCurationMainWindow(QMainWindow):
         }
 
     def _hybrid_cache_key(self) -> Tuple[object, ...]:
-        low_state_denoiser = str(self.param_low_state_denoiser.currentData() or "gonzalez_adaptive_wavelet")
+        low_state_denoiser = str(self.param_low_state_denoiser.currentData() or "gonzalez_full_trace")
         state_aware_mode = low_state_denoiser in {"gonzalez_adaptive_wavelet", "legacy_hybrid"}
         plateau_tv_weight = (
             float(self.param_plateau_tv_weight.value()) if state_aware_mode else None
@@ -4349,6 +5493,57 @@ class SpikeCurationMainWindow(QMainWindow):
             boundary_protect_ms,
         )
 
+    def _gonzalez_cwt_debug_cache_key(self) -> Tuple[object, ...]:
+        return (
+            "gonzalez_full_trace_cwt_debug",
+            str(self.param_low_state_denoiser.currentData() or "gonzalez_full_trace"),
+            float(self.param_gonzalez_threshold_sd.value()),
+            int(self.param_gonzalez_max_clusters.value()),
+            float(self.param_gonzalez_attenuation_min.value()),
+            float(self.param_gonzalez_attenuation_max.value()),
+            bool(self.param_gonzalez_noise_cluster_rejection.isChecked()),
+            bool(self.param_gonzalez_event_template_rejection.isChecked()),
+            bool(self.detection_params.enable_low_state_safety_gate),
+            float(self.detection_params.min_event_peak_preservation),
+            float(self.detection_params.min_local_max_ratio),
+        )
+
+    def _gonzalez_cwt_debug_for_export(self, state: TraceCuration) -> Dict[str, Any]:
+        cache_key = self._gonzalez_cwt_debug_cache_key()
+        if (
+            state.gonzalez_cwt_debug is not None
+            and state.gonzalez_cwt_debug_cache_key == cache_key
+        ):
+            return dict(state.gonzalez_cwt_debug)
+        debug = dict(
+            denoise_gonzalez_adaptive_wavelet(
+                np.asarray(state.corrected, dtype=float),
+                fs=_trace_sampling_rate_hz(state),
+                input_mode="corrected",
+                return_debug=True,
+                threshold_sd=float(self.param_gonzalez_threshold_sd.value()),
+                max_clusters=int(self.param_gonzalez_max_clusters.value()),
+                attenuation_min=float(self.param_gonzalez_attenuation_min.value()),
+                attenuation_max=float(self.param_gonzalez_attenuation_max.value()),
+                enable_noise_cluster_rejection=bool(self.param_gonzalez_noise_cluster_rejection.isChecked()),
+                enable_event_template_rejection=bool(self.param_gonzalez_event_template_rejection.isChecked()),
+                enable_low_state_safety_gate=bool(self.detection_params.enable_low_state_safety_gate),
+                min_event_peak_preservation=float(self.detection_params.min_event_peak_preservation),
+                min_local_max_ratio=float(self.detection_params.min_local_max_ratio),
+            )
+        )
+        if state.hybrid_denoised is not None:
+            wrapper_output = np.asarray(state.hybrid_denoised, dtype=float)
+            if wrapper_output.shape == np.asarray(state.corrected, dtype=float).shape:
+                debug["wrapper_output"] = wrapper_output.copy()
+                raw_output = np.asarray(debug.get("output", wrapper_output), dtype=float)
+                if raw_output.shape == wrapper_output.shape:
+                    debug["wrapper_correction_component"] = wrapper_output - raw_output
+                debug["wrapper_output_mode"] = str(self.param_low_state_denoiser.currentData() or "gonzalez_full_trace")
+        state.gonzalez_cwt_debug = debug
+        state.gonzalez_cwt_debug_cache_key = cache_key
+        return dict(debug)
+
     def _ensure_hybrid_denoised(self, state: TraceCuration) -> None:
         cache_key = self._hybrid_cache_key()
         if (
@@ -4360,7 +5555,7 @@ class SpikeCurationMainWindow(QMainWindow):
         if state.hybrid_denoised_pending_key == cache_key:
             return
         state.hybrid_denoised_pending_key = cache_key
-        low_state_denoiser = str(self.param_low_state_denoiser.currentData() or "gonzalez_adaptive_wavelet")
+        low_state_denoiser = str(self.param_low_state_denoiser.currentData() or "gonzalez_full_trace")
         plateau_mask = state.long_plateau_mask if state.long_plateau_mask is not None else state.plateau_mask
         task = _HybridDenoiseTask(
             trace_name=state.trace_name,
@@ -4374,6 +5569,7 @@ class SpikeCurationMainWindow(QMainWindow):
             plateau_tv_weight=float(self.param_plateau_tv_weight.value()),
             boundary_protect_ms=float(self.param_low_state_boundary_protect_ms.value()),
             legacy_denoise_fn=self._hybrid_denoise_fn,
+            normalization_baseline=state.correction_baseline,
         )
         task.signals.finished.connect(self._on_hybrid_denoise_finished)
         self._hybrid_tasks.append(task)
@@ -4433,7 +5629,7 @@ class SpikeCurationMainWindow(QMainWindow):
             state.hybrid_denoised_cache_key = None
             if self.current_trace_name == trace_name:
                 self.chk_show_hybrid_denoised.setChecked(False)
-                QMessageBox.warning(self, "State-Guided Denoising Error", str(error or "Unknown error"))
+                QMessageBox.warning(self, "Denoising Error", str(error or "Unknown error"))
             return
         result_array = np.asarray(result, dtype=float)
         normalized_result = _as_corrected_units(
