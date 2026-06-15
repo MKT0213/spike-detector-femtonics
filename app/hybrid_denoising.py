@@ -624,9 +624,9 @@ def denoise_gonzalez_adaptive_wavelet(
     attenuation_max=1.0,
     enable_noise_cluster_rejection=False,
     enable_event_template_rejection=False,
-    enable_low_state_safety_gate=True,
-    min_event_peak_preservation=0.80,
-    min_local_max_ratio=0.80,
+    enable_low_state_safety_gate=False,
+    min_event_peak_preservation=0.95,
+    min_local_max_ratio=0.95,
     return_debug=False,
 ):
     """Denoise with Gonzalez adaptive wavelet thresholding.
@@ -863,7 +863,7 @@ def denoise_gonzalez_adaptive_wavelet(
         fallback_triggered = True
         warnings.extend(morphology_reasons)
         morphology_metrics["fallback_triggered"] = True
-    elif bool(enable_noise_cluster_rejection) and bool(morphology_reasons):
+    elif bool(enable_low_state_safety_gate) and bool(enable_noise_cluster_rejection) and bool(morphology_reasons):
         denoised_working_trace = working_trace.copy()
         output = values.copy()
         fallback_triggered = True
@@ -1187,8 +1187,8 @@ def _low_state_event_preservation_metrics(
     candidate: np.ndarray,
     fs: float,
     evaluation_mask: np.ndarray,
-    min_event_peak_preservation: float = 0.80,
-    min_local_max_ratio: float = 0.80,
+    min_event_peak_preservation: float = 0.95,
+    min_local_max_ratio: float = 0.95,
     baseline_window_ms: float = 50.0,
     local_window_ms: float = 5.0,
     min_peak_distance_ms: float = 2.0,
@@ -1319,6 +1319,120 @@ def _low_state_event_preservation_metrics(
         "local_window_samples": int(half_window),
     }
     return metrics
+
+
+def _restore_low_state_event_amplitudes(
+    raw: np.ndarray,
+    candidate: np.ndarray,
+    fs: float,
+    evaluation_mask: np.ndarray,
+    min_event_peak_preservation: float = 0.95,
+    min_local_max_ratio: float = 0.95,
+    baseline_window_ms: float = 50.0,
+    local_window_ms: float = 5.0,
+    min_peak_distance_ms: float = 2.0,
+) -> Tuple[np.ndarray, dict]:
+    source = np.asarray(raw, dtype=float)
+    output = np.asarray(candidate, dtype=float).copy()
+    mask = np.asarray(evaluation_mask, dtype=bool)
+    debug: dict[str, Any] = {
+        "enabled": True,
+        "status": "not_evaluated",
+        "restored_event_count": 0,
+        "restored_events": [],
+    }
+    if source.shape != output.shape or mask.shape != source.shape or source.size == 0:
+        debug["status"] = "shape_mismatch_or_empty"
+        return output, debug
+    finite = np.isfinite(source) & np.isfinite(output) & mask
+    if np.count_nonzero(finite) < 3:
+        debug["status"] = "no_events_evaluated"
+        return output, debug
+
+    hp_window = _odd_window_ms(baseline_window_ms, fs)
+    hp_window = min(hp_window, source.size if source.size % 2 == 1 else max(1, source.size - 1))
+    if hp_window < 3:
+        raw_high = source - float(np.median(source[finite]))
+        cand_high = output - float(np.median(output[finite]))
+    else:
+        raw_high = source - median_filter(source, size=hp_window, mode="nearest")
+        cand_high = output - median_filter(output, size=hp_window, mode="nearest")
+
+    selected = raw_high[finite]
+    noise = max(_robust_sigma(selected), 1e-12)
+    max_abs = float(np.max(np.abs(selected))) if selected.size else 0.0
+    peak_threshold = max(4.0 * noise, 0.20 * max_abs, 1e-12)
+    distance = max(1, int(round(float(min_peak_distance_ms) * float(fs) / 1000.0)))
+    masked_abs_raw = np.where(finite, np.abs(raw_high), 0.0)
+    raw_peaks, _ = find_peaks(masked_abs_raw, height=peak_threshold, distance=distance)
+    raw_peaks = np.asarray([int(p) for p in raw_peaks if finite[int(p)]], dtype=int)
+    if raw_peaks.size == 0:
+        debug["status"] = "no_events_evaluated"
+        return output, debug
+
+    half_window = max(1, int(round(float(local_window_ms) * float(fs) / 1000.0)))
+    restored_events: List[dict] = []
+    for peak in raw_peaks:
+        start = max(0, int(peak) - half_window)
+        stop = min(source.size, int(peak) + half_window + 1)
+        local_mask = finite[start:stop]
+        if not np.any(local_mask):
+            continue
+        raw_local = raw_high[start:stop][local_mask]
+        cand_local = cand_high[start:stop][local_mask]
+        raw_peak_amp = abs(float(raw_high[int(peak)]))
+        cand_peak_amp = abs(float(cand_high[int(peak)]))
+        raw_local_max = float(np.max(np.abs(raw_local))) if raw_local.size else 0.0
+        cand_local_max = float(np.max(np.abs(cand_local))) if cand_local.size else 0.0
+        peak_ratio = cand_peak_amp / max(raw_peak_amp, 1e-12)
+        local_ratio = cand_local_max / max(raw_local_max, 1e-12)
+        polarity_flipped = (
+            raw_peak_amp > 1e-12
+            and cand_peak_amp > 0.25 * raw_peak_amp
+            and np.sign(float(cand_high[int(peak)])) != np.sign(float(raw_high[int(peak)]))
+        )
+        if (
+            peak_ratio >= float(min_event_peak_preservation)
+            and local_ratio >= float(min_local_max_ratio)
+            and not polarity_flipped
+        ):
+            continue
+
+        width = stop - start
+        if width <= 1:
+            output[start:stop] = source[start:stop]
+        else:
+            x = np.linspace(-1.0, 1.0, width)
+            weights = 0.5 * (1.0 + np.cos(np.pi * np.clip(x, -1.0, 1.0)))
+            weights[~local_mask] = 0.0
+            output[start:stop] = (weights * source[start:stop]) + ((1.0 - weights) * output[start:stop])
+        restored_events.append(
+            {
+                "peak": int(peak),
+                "start": int(start),
+                "stop": int(stop),
+                "peak_ratio_before": float(peak_ratio),
+                "local_ratio_before": float(local_ratio),
+                "polarity_flipped": bool(polarity_flipped),
+            }
+        )
+
+    debug.update(
+        {
+            "status": "evaluated",
+            "event_count_before": int(raw_peaks.size),
+            "restored_event_count": int(len(restored_events)),
+            "restored_events": restored_events,
+            "thresholds": {
+                "min_event_peak_preservation": float(min_event_peak_preservation),
+                "min_local_max_ratio": float(min_local_max_ratio),
+                "peak_detection_threshold": float(peak_threshold),
+                "baseline_window_samples": int(hp_window),
+                "local_window_samples": int(half_window),
+            },
+        }
+    )
+    return output, debug
 
 
 def _apply_plateau_level_correction(output: np.ndarray, corrected: np.ndarray, plateau_mask: np.ndarray, fs: float) -> np.ndarray:
@@ -1778,9 +1892,12 @@ def _tv_denoise_1d(values: np.ndarray, weight: float, max_iterations: int = 200)
 
 def _normalize_low_state_denoiser(value: str) -> str:
     method = str(value).strip().lower()
-    allowed = {"gonzalez_adaptive_wavelet", "legacy_hybrid", "none"}
+    allowed = {"gonzalez_adaptive_wavelet", "gonzalez_full_trace", "legacy_hybrid", "none"}
     if method not in allowed:
-        raise ValueError("low_state_denoiser must be one of: gonzalez_adaptive_wavelet, legacy_hybrid, none")
+        raise ValueError(
+            "low_state_denoiser must be one of: gonzalez_adaptive_wavelet, "
+            "gonzalez_full_trace, legacy_hybrid, none"
+        )
     return method
 
 
@@ -1795,9 +1912,9 @@ def denoise_trace_state_guided_low_plateau_tv(
     low_state_denoiser: str = "gonzalez_adaptive_wavelet",
     low_state_denoise_fn=None,
     hybrid_denoise_fn=None,
-    enable_low_state_safety_gate: bool = True,
-    min_event_peak_preservation: float = 0.80,
-    min_local_max_ratio: float = 0.80,
+    enable_low_state_safety_gate: bool = False,
+    min_event_peak_preservation: float = 0.95,
+    min_local_max_ratio: float = 0.95,
     min_reliable_low_state_fraction: float = 0.10,
     min_reliable_low_state_samples: int = 20,
     return_debug: bool = False,
@@ -1835,6 +1952,165 @@ def denoise_trace_state_guided_low_plateau_tv(
     low_state_kwargs.pop("return_debug", None)
     if low_state_denoise_fn is None and hybrid_denoise_fn is not None:
         low_state_denoise_fn = hybrid_denoise_fn
+
+    def _gonzalez_low_state_kwargs() -> dict[str, object]:
+        allowed = {
+            "rolling_baseline_seconds",
+            "wavelet",
+            "min_freq",
+            "max_freq",
+            "n_freqs",
+            "max_clusters",
+            "threshold_sd",
+            "attenuation_min",
+            "attenuation_max",
+            "enable_noise_cluster_rejection",
+            "enable_event_template_rejection",
+            "enable_low_state_safety_gate",
+            "min_event_peak_preservation",
+            "min_local_max_ratio",
+        }
+        kwargs = {key: value for key, value in low_state_kwargs.items() if key in allowed}
+        kwargs.update(
+            {
+                "input_mode": "corrected",
+                "enable_noise_cluster_rejection": bool(
+                    kwargs.get("enable_noise_cluster_rejection", False)
+                ),
+                "enable_event_template_rejection": bool(
+                    kwargs.get("enable_event_template_rejection", False)
+                ),
+                "enable_low_state_safety_gate": bool(enable_low_state_safety_gate),
+                "min_event_peak_preservation": float(min_event_peak_preservation),
+                "min_local_max_ratio": float(min_local_max_ratio),
+                "attenuation_min": float(kwargs.get("attenuation_min", 0.5)),
+                "attenuation_max": float(kwargs.get("attenuation_max", 1.0)),
+            }
+        )
+        return kwargs
+
+    if low_state_method == "gonzalez_full_trace":
+        gonzalez_debug = None
+        low_state_exception = None
+        low_state_safety: dict[str, Any] = {
+            "source": "gonzalez_full_trace",
+            "fallback_triggered": False,
+            "fallback_reasons": [],
+            "safety_gate_enabled": bool(enable_low_state_safety_gate),
+            "amplitude_preservation_merge": {"enabled": False, "status": "not_run"},
+        }
+        try:
+            gonzalez_result = denoise_gonzalez_adaptive_wavelet(
+                trace,
+                fs=fs,
+                return_debug=return_debug,
+                **_gonzalez_low_state_kwargs(),
+            )
+            if return_debug:
+                gonzalez_debug = dict(gonzalez_result)
+                output = np.asarray(gonzalez_debug.get("output", trace), dtype=float)
+            else:
+                output = np.asarray(gonzalez_result, dtype=float)
+            if output.shape != trace.shape or not np.all(np.isfinite(output)):
+                low_state_safety["fallback_triggered"] = True
+                low_state_safety["fallback_reasons"] = ["shape_mismatch" if output.shape != trace.shape else "non_finite_output"]
+                output = trace.copy()
+            else:
+                output, amplitude_restore = _restore_low_state_event_amplitudes(
+                    trace,
+                    output,
+                    fs=fs,
+                    evaluation_mask=np.ones(trace.shape, dtype=bool),
+                    min_event_peak_preservation=float(min_event_peak_preservation),
+                    min_local_max_ratio=float(min_local_max_ratio),
+                )
+                morphology = _low_state_event_preservation_metrics(
+                    trace,
+                    output,
+                    fs=fs,
+                    evaluation_mask=np.ones(trace.shape, dtype=bool),
+                    min_event_peak_preservation=float(min_event_peak_preservation),
+                    min_local_max_ratio=float(min_local_max_ratio),
+                )
+                low_state_safety.update(
+                    {
+                        "shape_matches_input": True,
+                        "output_is_finite": True,
+                        "input_std": float(np.std(trace)) if trace.size else float("nan"),
+                        "output_std": float(np.std(output)) if output.size else float("nan"),
+                        "output_input_std_ratio": (
+                            float(np.std(output)) / max(float(np.std(trace)), 1e-12)
+                            if trace.size
+                            else float("nan")
+                        ),
+                        "amplitude_preservation_merge": amplitude_restore,
+                        "morphology_preservation": morphology,
+                        "evaluation_mask_samples": int(trace.size),
+                    }
+                )
+        except Exception as exc:
+            low_state_exception = str(exc)
+            low_state_safety = {
+                "source": "gonzalez_full_trace",
+                "fallback_triggered": True,
+                "fallback_reasons": ["gonzalez_exception"],
+                "exception": low_state_exception,
+                "safety_gate_enabled": bool(enable_low_state_safety_gate),
+            }
+            if return_debug:
+                gonzalez_debug = {"error": low_state_exception}
+            output = trace.copy()
+        if not return_debug:
+            return output
+        return {
+            "denoiser_used": "gonzalez_full_trace",
+            "low_state_denoiser_used": low_state_method,
+            "low_state_candidate_used": not bool(low_state_safety.get("fallback_triggered", False)),
+            "low_state_fallback_triggered": bool(low_state_safety.get("fallback_triggered", False)),
+            "low_state_fallback_reasons": list(low_state_safety.get("fallback_reasons", [])),
+            "low_state_input_output_max_abs_diff": (
+                float(np.max(np.abs(output - trace))) if output.shape == trace.shape and output.size else float("nan")
+            ),
+            "low_state_input_output_residual_std": (
+                float(np.std(output - trace)) if output.shape == trace.shape and output.size else float("nan")
+            ),
+            "low_state_noise_reduction_fraction": float("nan"),
+            "output": output,
+            "low_state_output": output,
+            "low_state_input": trace.copy(),
+            "hybrid_output": output,
+            "hybrid_input": trace.copy(),
+            "low_state_custom_fn_used": False,
+            "low_state_safety": low_state_safety,
+            "low_state_exception": low_state_exception,
+            "gonzalez_debug": gonzalez_debug,
+            "plateau_tv_output": "not_applied",
+            "plateau_tv_status": "not_applied_full_trace_mode",
+            "plateau_tv_segments": [],
+            "plateau_mask": np.zeros(trace.shape, dtype=bool),
+            "protected_plateau_mask": np.zeros(trace.shape, dtype=bool),
+            "plateau_core_mask": np.zeros(trace.shape, dtype=bool),
+            "low_mask": np.ones(trace.shape, dtype=bool),
+            "boundary_mask": np.zeros(trace.shape, dtype=bool),
+            "plateau_replace_mask": np.zeros(trace.shape, dtype=bool),
+            "plateau_tv_weight": float(plateau_tv_weight),
+            "plateau_tv_min_duration_ms": float(plateau_tv_min_duration_ms),
+            "plateau_tv_max_weight_factor": float(plateau_tv_max_weight_factor),
+            "reliable_low_state_samples": int(trace.size),
+            "minimum_reliable_low_state_samples": int(minimum_reliable),
+            "low_state_safety_gate_enabled": bool(enable_low_state_safety_gate),
+            "quantitative_measurement_note": (
+                "Full-trace Gonzalez denoising is a detection aid; raw corrected trace is preferred for "
+                "quantitative amplitude, peak height, width, area, plateau level, and summary statistics."
+            ),
+            "plateau_high_frequency_noise_before": float("nan"),
+            "plateau_high_frequency_noise_after": float("nan"),
+            "plateau_noise_reduction_fraction": float("nan"),
+            "nonplateau_high_frequency_noise_before": float("nan"),
+            "nonplateau_high_frequency_noise_after": float("nan"),
+            "nonplateau_noise_reduction_fraction": float("nan"),
+            "plateau_median_bias": float("nan"),
+        }
 
     apply_plateau_tv = low_state_method != "none" and bool(np.any(plateau_core_mask))
     low_state_safety: dict[str, Any] = {
@@ -1874,6 +2150,16 @@ def denoise_trace_state_guided_low_plateau_tv(
             fallback_reasons.append("shape_mismatch")
         if candidate_arr.size and not np.all(np.isfinite(candidate_arr)):
             fallback_reasons.append("non_finite_output")
+        amplitude_restore: dict[str, Any] = {"enabled": False, "status": "not_run"}
+        if not fallback_reasons and candidate_arr.shape == trace.shape:
+            candidate_arr, amplitude_restore = _restore_low_state_event_amplitudes(
+                trace,
+                candidate_arr,
+                fs=fs,
+                evaluation_mask=low_state_eval_mask,
+                min_event_peak_preservation=float(min_event_peak_preservation),
+                min_local_max_ratio=float(min_local_max_ratio),
+            )
         input_std = float(np.std(low_state_input)) if low_state_input.size else float("nan")
         output_std = float(np.std(candidate_arr)) if candidate_arr.shape == low_state_input.shape else float("nan")
         std_ratio = output_std / max(input_std, 1e-12) if np.isfinite(input_std) else float("nan")
@@ -1899,6 +2185,7 @@ def denoise_trace_state_guided_low_plateau_tv(
             "input_std": input_std,
             "output_std": output_std,
             "output_input_std_ratio": std_ratio,
+            "amplitude_preservation_merge": amplitude_restore,
             "morphology_preservation": morphology,
             "fallback_triggered": not valid,
             "fallback_reasons": fallback_reasons,
@@ -1920,45 +2207,12 @@ def denoise_trace_state_guided_low_plateau_tv(
             source_label="legacy_hybrid",
         )
     else:
-        gonzalez_allowed = {
-            "rolling_baseline_seconds",
-            "wavelet",
-            "min_freq",
-            "max_freq",
-            "n_freqs",
-            "max_clusters",
-            "threshold_sd",
-            "attenuation_min",
-            "attenuation_max",
-            "enable_noise_cluster_rejection",
-            "enable_event_template_rejection",
-            "enable_low_state_safety_gate",
-            "min_event_peak_preservation",
-            "min_local_max_ratio",
-        }
-        gonzalez_kwargs = {key: value for key, value in low_state_kwargs.items() if key in gonzalez_allowed}
-        gonzalez_kwargs.update(
-            {
-                "input_mode": "corrected",
-                "enable_noise_cluster_rejection": bool(
-                    gonzalez_kwargs.get("enable_noise_cluster_rejection", False)
-                ),
-                "enable_event_template_rejection": bool(
-                    gonzalez_kwargs.get("enable_event_template_rejection", False)
-                ),
-                "enable_low_state_safety_gate": bool(enable_low_state_safety_gate),
-                "min_event_peak_preservation": float(min_event_peak_preservation),
-                "min_local_max_ratio": float(min_local_max_ratio),
-                "attenuation_min": float(gonzalez_kwargs.get("attenuation_min", 0.5)),
-                "attenuation_max": float(gonzalez_kwargs.get("attenuation_max", 1.0)),
-            }
-        )
         try:
             gonzalez_result = denoise_gonzalez_adaptive_wavelet(
                 low_state_input,
                 fs=fs,
                 return_debug=return_debug,
-                **gonzalez_kwargs,
+                **_gonzalez_low_state_kwargs(),
             )
             if return_debug:
                 gonzalez_debug = dict(gonzalez_result)
@@ -1971,7 +2225,11 @@ def denoise_trace_state_guided_low_plateau_tv(
             )
             if isinstance(gonzalez_debug, dict):
                 gonzalez_safety = gonzalez_debug.get("safety_metrics", {})
-                if isinstance(gonzalez_safety, dict) and bool(gonzalez_safety.get("fallback_triggered", False)):
+                if (
+                    bool(enable_low_state_safety_gate)
+                    and isinstance(gonzalez_safety, dict)
+                    and bool(gonzalez_safety.get("fallback_triggered", False))
+                ):
                     morphology = gonzalez_safety.get("morphology_preservation", {})
                     reasons = []
                     if isinstance(morphology, dict):

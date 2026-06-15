@@ -3165,6 +3165,7 @@ class SpikeCurationMainWindow(QMainWindow):
         denoise_layout = QFormLayout(denoise_group)
         self.param_low_state_denoiser = QComboBox()
         self.param_low_state_denoiser.addItem("Gonzalez adaptive wavelet", "gonzalez_adaptive_wavelet")
+        self.param_low_state_denoiser.addItem("Gonzalez full trace (no plateau mask)", "gonzalez_full_trace")
         self.param_low_state_denoiser.addItem("Legacy Hybrid", "legacy_hybrid")
         self.param_low_state_denoiser.addItem("No low-state denoising", "none")
         low_state_index = self.param_low_state_denoiser.findData(str(self.detection_params.low_state_denoiser))
@@ -3389,13 +3390,26 @@ class SpikeCurationMainWindow(QMainWindow):
     def _update_denoise_control_state(self, *_args: object) -> None:
         low_state_denoiser = str(self.param_low_state_denoiser.currentData() or "gonzalez_adaptive_wavelet")
         state_aware_mode = low_state_denoiser in {"gonzalez_adaptive_wavelet", "legacy_hybrid"}
+        full_trace_mode = low_state_denoiser == "gonzalez_full_trace"
         self.param_plateau_tv_weight.setEnabled(state_aware_mode)
         self.param_plateau_tv_weight.setToolTip(
-            "Used by state-aware Gonzalez and Legacy Hybrid modes." if state_aware_mode else "Ignored when denoising is disabled."
+            "Used by state-aware Gonzalez and Legacy Hybrid modes."
+            if state_aware_mode
+            else (
+                "Ignored by full-trace Gonzalez mode."
+                if full_trace_mode
+                else "Ignored when denoising is disabled."
+            )
         )
         self.param_low_state_boundary_protect_ms.setEnabled(state_aware_mode)
         self.param_low_state_boundary_protect_ms.setToolTip(
-            "Used by state-aware Gonzalez and Legacy Hybrid modes." if state_aware_mode else "Ignored when denoising is disabled."
+            "Used by state-aware Gonzalez and Legacy Hybrid modes."
+            if state_aware_mode
+            else (
+                "Ignored by full-trace Gonzalez mode."
+                if full_trace_mode
+                else "Ignored when denoising is disabled."
+            )
         )
 
     def _result_root(self) -> Path:

@@ -64,9 +64,9 @@ class DetectionParams:
     gonzalez_enable_event_template_rejection: bool = False
     plateau_tv_weight: float = 2.0
     low_state_boundary_protect_ms: float = 20.0
-    enable_low_state_safety_gate: bool = True
-    min_event_peak_preservation: float = 0.80
-    min_local_max_ratio: float = 0.80
+    enable_low_state_safety_gate: bool = False
+    min_event_peak_preservation: float = 0.95
+    min_local_max_ratio: float = 0.95
     min_reliable_low_state_fraction: float = 0.10
     min_reliable_low_state_samples: int = 20
     plateau_tv_min_duration_ms: float = 5.0
@@ -128,7 +128,9 @@ class DetectionParams:
                     value = value.replace(f"{prefix}_", "")
             if normalized_key == "low_state_denoiser" and isinstance(value, str):
                 mode = value.strip().lower()
-                if mode in {"hybrid", "legacy", "legacy_hybrid"}:
+                if mode in {"gonzalez_full_trace", "full_trace_gonzalez", "full_gonzalez", "gonzalez_all_states"}:
+                    value = "gonzalez_full_trace"
+                elif mode in {"hybrid", "legacy", "legacy_hybrid"}:
                     value = "legacy_hybrid"
                 elif mode in {"none", "off", "disabled"}:
                     value = "none"

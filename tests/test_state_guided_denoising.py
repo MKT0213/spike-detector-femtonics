@@ -132,6 +132,37 @@ def test_old_hybrid_wrapper_uses_state_guided_default() -> None:
     assert np.asarray(debug["output"]).shape == trace.shape
 
 
+def test_gonzalez_full_trace_mode_ignores_plateau_mask() -> None:
+    trace, plateau, fs = _synthetic_trace()
+
+    debug = denoise_trace_state_guided_low_plateau_tv(
+        trace,
+        fs=fs,
+        plateau_mask=plateau,
+        low_state_denoiser="gonzalez_full_trace",
+        return_debug=True,
+        n_freqs=12,
+        max_clusters=4,
+    )
+    direct = denoise_gonzalez_adaptive_wavelet(
+        trace,
+        fs=fs,
+        input_mode="corrected",
+        return_debug=False,
+        n_freqs=12,
+        max_clusters=4,
+    )
+
+    assert debug["denoiser_used"] == "gonzalez_full_trace"
+    assert debug["low_state_denoiser_used"] == "gonzalez_full_trace"
+    assert debug["plateau_tv_status"] == "not_applied_full_trace_mode"
+    assert not np.any(np.asarray(debug["plateau_mask"], dtype=bool))
+    assert not np.any(np.asarray(debug["protected_plateau_mask"], dtype=bool))
+    assert np.allclose(np.asarray(debug["gonzalez_debug"]["output"], dtype=float), np.asarray(direct, dtype=float))
+    assert debug["low_state_safety"]["amplitude_preservation_merge"]["status"] in {"evaluated", "no_events_evaluated"}
+    assert np.asarray(debug["output"], dtype=float).shape == trace.shape
+
+
 def test_state_guided_default_preserves_plateaus_boundaries_and_spikes() -> None:
     fs = 1000.0
     n = 1000
@@ -266,7 +297,7 @@ def test_state_guided_gonzalez_does_not_reenable_noise_cluster_rejection_by_defa
     assert debug["gonzalez_debug"]["enable_noise_cluster_rejection"] is False
 
 
-def test_collapsed_low_state_spikes_trigger_safety_fallback() -> None:
+def test_collapsed_low_state_spikes_are_restored_without_safety_fallback() -> None:
     fs = 1000.0
     n = 220
     idx = np.arange(n, dtype=float)
@@ -286,9 +317,39 @@ def test_collapsed_low_state_spikes_trigger_safety_fallback() -> None:
         return_debug=True,
     )
 
-    assert debug["low_state_fallback_triggered"] is True
-    assert "event_peak_preservation_below_floor" in debug["low_state_fallback_reasons"]
-    assert np.allclose(debug["low_state_output"], debug["low_state_input"])
+    restore = debug["low_state_safety"]["amplitude_preservation_merge"]
+
+    assert debug["low_state_fallback_triggered"] is False
+    assert debug["low_state_candidate_used"] is True
+    assert restore["restored_event_count"] >= 1
+    assert np.max(np.asarray(debug["low_state_output"], dtype=float)) > 0.75
+
+
+def test_low_state_candidate_is_visible_by_default_without_safety_gate() -> None:
+    fs = 1000.0
+    n = 220
+    idx = np.arange(n, dtype=float)
+    trace = 0.01 * np.sin(0.1 * idx)
+    trace += 1.0 * np.exp(-0.5 * ((idx - 90) / 1.5) ** 2)
+    plateau = np.zeros(n, dtype=bool)
+    plateau[150:180] = True
+    trace[plateau] += 0.6
+
+    debug = denoise_trace_state_guided_low_plateau_tv(
+        trace,
+        fs=fs,
+        plateau_mask=plateau,
+        low_state_denoiser="legacy_hybrid",
+        low_state_denoise_fn=lambda values, fs, **_: np.zeros_like(values),
+        boundary_protect_ms=2.0,
+        return_debug=True,
+    )
+
+    assert debug["low_state_safety_gate_enabled"] is False
+    assert debug["low_state_candidate_used"] is True
+    assert debug["low_state_fallback_triggered"] is False
+    assert debug["low_state_safety"]["amplitude_preservation_merge"]["restored_event_count"] >= 1
+    assert np.max(np.asarray(debug["low_state_output"], dtype=float)) > 0.75
 
 
 def test_short_plateau_segment_is_not_over_smoothed_by_tv() -> None:
@@ -431,6 +492,10 @@ def test_ui_defaults_to_gonzalez_without_hybrid_default_label() -> None:
         assert not window.param_gonzalez_event_template_rejection.isChecked()
         assert window.param_plateau_tv_weight.isEnabled()
         assert window.param_low_state_boundary_protect_ms.isEnabled()
+        window.param_low_state_denoiser.setCurrentIndex(window.param_low_state_denoiser.findData("gonzalez_full_trace"))
+        assert window.param_low_state_denoiser.currentText() == "Gonzalez full trace (no plateau mask)"
+        assert not window.param_plateau_tv_weight.isEnabled()
+        assert not window.param_low_state_boundary_protect_ms.isEnabled()
         window.param_low_state_denoiser.setCurrentIndex(window.param_low_state_denoiser.findData("legacy_hybrid"))
         assert window.param_plateau_tv_weight.isEnabled()
         assert window.param_low_state_boundary_protect_ms.isEnabled()
