@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from app.gui_main import (  # noqa: E402
+from detector.core.gui_main import (  # noqa: E402
     _add_event_qc_flags,
     _add_trace_qc_flags,
     _build_all_trace_summary_row,
@@ -25,7 +25,7 @@ from app.gui_main import (  # noqa: E402
     _save_spike_statistics_summary,
     _spike_record_from_event_stats_row,
 )
-from app.models import SpikeRecord, TraceCuration  # noqa: E402
+from detector.core.models import SpikeRecord, TraceCuration  # noqa: E402
 
 
 def _state(name: str, mask: np.ndarray, values: np.ndarray | None = None) -> TraceCuration:
@@ -256,6 +256,50 @@ def test_plateau_sd_uses_baseline_subtracted_amplitude() -> None:
     assert event["plateau_sd"] == 0.0
 
 
+def test_plateau_event_onset_uses_absolute_time_axis() -> None:
+    mask = np.zeros(30, dtype=bool)
+    mask[10:20] = True
+    state = _state("offset_time", mask)
+    state.time = 250.0 + np.arange(30, dtype=float)
+
+    event = _build_plateau_event_rows(["offset_time"], {"offset_time": state})[0]
+
+    assert event["start_index"] == 10
+    assert event["start_time"] == 260.0
+    assert event["onset_time_ms"] == 260.0
+    assert event["duration_ms"] == 10.0
+
+
+def test_plateau_event_rows_include_signal_classification_metrics() -> None:
+    mask = np.zeros(30, dtype=bool)
+    mask[10:20] = True
+    state = _state("classified", mask)
+    state.plateau_signal_classification = [
+        {
+            "start_index": 10,
+            "end_index_exclusive": 20,
+            "duration_ms": 10.0,
+            "detector_source": "long",
+            "signal_type": "spike_like",
+            "signal_confidence": 0.81,
+            "raw_highfreq_rms": 2.0,
+            "denoised_highfreq_rms": 1.8,
+            "residual_rms": 0.2,
+            "residual_fraction": 0.1,
+            "noise_reduction_fraction": 0.1,
+            "raw_peak_density_hz": 200.0,
+            "denoised_peak_density_hz": 180.0,
+            "preserved_peak_fraction": 0.9,
+        }
+    ]
+
+    event = _build_plateau_event_rows(["classified"], {"classified": state})[0]
+
+    assert event["signal_type"] == "spike_like"
+    assert event["signal_confidence"] == 0.81
+    assert event["raw_peak_density_hz"] == 200.0
+
+
 def test_trace_with_no_plateaus_is_kept_and_flagged() -> None:
     mask = np.zeros(100, dtype=bool)
     traces = {"empty": _state("empty", mask)}
@@ -342,11 +386,12 @@ def test_export_dataframes_include_tables_reload_data_and_stable_columns() -> No
     mask[10:20] = True
     values = np.full(50, 100.0, dtype=float)
     values[10:20] += 5.0
-    state = _state("trace", mask, values)
+    trace_name = "Recording A | ROI 1"
+    state = _state(trace_name, mask, values)
     state.baseline = np.full(50, 100.0, dtype=float)
     state.spikes = [_spike(15, 15.0, 5.0)]
 
-    export_tables = _build_export_dataframes(["trace"], {"trace": state})
+    export_tables = _build_export_dataframes([trace_name], {trace_name: state})
 
     assert set(export_tables) == {
         "plateau_events",
@@ -356,10 +401,14 @@ def test_export_dataframes_include_tables_reload_data_and_stable_columns() -> No
         "spike_summary",
         "corrected_traces",
     }
-    assert list(export_tables["corrected_traces"].columns) == ["time", "trace"]
+    assert list(export_tables["corrected_traces"].columns) == ["time", trace_name]
     assert "plateau_id" in export_tables["plateau_events"].columns
+    assert export_tables["plateau_events"].loc[0, "recording_id"] == "Recording A"
+    assert export_tables["plateau_events"].loc[0, "roi_id"] == "ROI 1"
+    assert export_tables["trace_summary"].loc[0, "recording_id"] == "Recording A"
+    assert export_tables["spike_events"].loc[0, "roi_id"] == "ROI 1"
     assert "qc_status" in export_tables["trace_qc"].columns
-    assert export_tables["spike_events"].loc[0, "spike_id"] == "S0001"
+    assert export_tables["spike_events"].loc[0, "spike_id"] == "0001"
     assert export_tables["trace_summary"].iloc[-1]["trace_id"] == "ALL"
 
 

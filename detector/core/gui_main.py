@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Qt, Signal
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QCheckBox,
     QComboBox,
     QFileDialog,
@@ -18,6 +19,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
@@ -36,18 +38,68 @@ import pyqtgraph as pg
 import PySide6.QtWidgets as QtWidgets
 import PySide6.QtGui as QtGui
 
-from .detection import DETECTOR_BUILD_TAG, detect_spikes
-from .hybrid_denoising import (
+from .detection import DETECTOR_BUILD_TAG, _butterworth_highpass, _butterworth_lowpass, detect_spikes
+from .gonzalez_denoising import (
     denoise_gonzalez_adaptive_wavelet,
-    denoise_hybrid_fluorescence_trace,
-    denoise_trace_state_guided_low_plateau_tv,
+    denoise_trace_gonzalez_full_trace,
 )
-from .io import estimate_sampling_rate_hz, load_excel_traces
+from .io import estimate_sampling_rate_hz, is_ignored_trace_column, load_excel_traces
 from .models import AppSession, ArtifactParams, DetectionParams, SpikeRecord, TraceCuration
+from .plateau_signal_classification import SIGNAL_TYPE_COLUMNS, classify_plateau_signals
+from .pipeline import (
+    ADDABLE_PIPELINE_STEP_IDS,
+    PIPELINE_ORDER_POLICY_LABELS,
+    PIPELINE_ORDER_SUMMARY,
+    PIPELINE_PRESETS,
+    PIPELINE_STEP_DEFINITIONS,
+    PipelineConfig,
+)
 from .plot_widget import TracePlotWidget
 from .preprocessing import apply_artifact_interpolation
+from .render_normalization import (
+    NORMALIZATION_NATIVE,
+    NORMALIZATION_PERCENT_DFF,
+    f0_values_for_trace,
+    normalize_trace_values,
+    normalize_values_with_f0,
+)
 from .session_io import apply_session_to_traces, load_session, save_session
 from .shortcuts import bind_shortcuts
+from .trace_identity import recording_groups, split_trace_identity, trace_identity_columns
+
+
+PLATEAU_EXPORT_X_RANGE = (-100.0, 500.0)
+DISPLAY_RENDER_SOURCE_DENOISED = "denoised"
+DISPLAY_RENDER_SOURCE_CORRECTED = "corrected"
+DISPLAY_RENDER_SOURCE_RAW = "raw"
+DISPLAY_RENDER_SOURCE_NORMALIZED_DENOISED = "normalized_denoised"
+DISPLAY_RENDER_SOURCE_HIGHPASS = "highpass"
+DISPLAY_RENDER_SOURCE_LOWPASS = "lowpass"
+DISPLAY_RENDER_SOURCE_ITEMS = [
+    ("Denoised trace", DISPLAY_RENDER_SOURCE_DENOISED),
+    ("Baseline corrected", DISPLAY_RENDER_SOURCE_CORRECTED),
+    ("Raw baseline-subtracted", DISPLAY_RENDER_SOURCE_RAW),
+    ("Denoised dF/F0", DISPLAY_RENDER_SOURCE_NORMALIZED_DENOISED),
+    ("High-pass", DISPLAY_RENDER_SOURCE_HIGHPASS),
+    ("Low-pass", DISPLAY_RENDER_SOURCE_LOWPASS),
+]
+
+
+def _denoising_input_normalization_label(method: str) -> str:
+    if str(method) == "gonzalez_s7_dff":
+        return "dF/F0 using detector baseline + S7 low-frequency branch"
+    if str(method) == "gonzalez_full_trace_dff":
+        return "dF/F0 using detector baseline"
+    if str(method) == "none":
+        return "Off"
+    return "Corrected trace"
+
+
+def _render_source_label(source: str) -> str:
+    for label, value in DISPLAY_RENDER_SOURCE_ITEMS:
+        if str(value) == str(source):
+            return str(label)
+    return "Denoised trace"
 
 
 def _time_axis_is_ms(time: np.ndarray) -> bool:
@@ -104,6 +156,67 @@ def _detection_short_events(detection: object) -> np.ndarray:
     return np.zeros((0, 6), dtype=float)
 
 
+def _detection_burst_events(detection: object) -> np.ndarray:
+    qc = getattr(detection, "qc_plot_data", {})
+    if isinstance(qc, dict):
+        events = np.asarray(qc.get("burst_plateau_event_table", np.zeros((0, 8), dtype=float)), dtype=float)
+        if events.ndim == 2 and events.shape[1] == 8:
+            return events
+    return np.zeros((0, 8), dtype=float)
+
+
+def _adjust_event_table_for_offset(events: Optional[np.ndarray], offset: int, n: int, width: int) -> np.ndarray:
+    table = np.asarray(events if events is not None else np.zeros((0, width), dtype=float), dtype=float)
+    if table.ndim != 2 or table.shape[1] != width or table.shape[0] == 0:
+        return np.zeros((0, width), dtype=float)
+    adjusted = table.copy()
+    adjusted[:, 0] -= float(offset)
+    adjusted[:, 1] -= float(offset)
+    keep = (adjusted[:, 1] > 0.0) & (adjusted[:, 0] < float(n))
+    adjusted = adjusted[keep]
+    if adjusted.size == 0:
+        return np.zeros((0, width), dtype=float)
+    adjusted[:, 0] = np.maximum(adjusted[:, 0], 0.0)
+    adjusted[:, 1] = np.minimum(adjusted[:, 1], float(n))
+    return adjusted
+
+
+def _adjust_plateau_signal_rows_for_offset(
+    rows: Optional[List[Dict[str, Any]]],
+    offset: int,
+    n: int,
+) -> List[Dict[str, Any]]:
+    if not isinstance(rows, list):
+        return []
+    adjusted: List[Dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            start = int(row.get("start_index", 0))
+            end = int(row.get("end_index_exclusive", start))
+        except (TypeError, ValueError):
+            continue
+        if end <= offset or start >= offset + n:
+            continue
+        display_start = max(0, start - offset)
+        display_end = min(int(n), max(display_start + 1, end - offset))
+        out = dict(row)
+        out["start_index"] = int(display_start)
+        out["end_index_exclusive"] = int(display_end)
+        adjusted.append(out)
+    return adjusted
+
+
+def _detection_burst_debug(detection: object) -> Dict[str, Any]:
+    qc = getattr(detection, "qc_plot_data", {})
+    if not isinstance(qc, dict):
+        return {"burst_plateau_candidate_rows": []}
+    return {
+        "burst_plateau_candidate_rows": list(qc.get("burst_plateau_candidate_rows", [])),
+    }
+
+
 def _detection_highpass_trace(detection: object, enabled: bool) -> Optional[np.ndarray]:
     if not enabled:
         return None
@@ -111,6 +224,19 @@ def _detection_highpass_trace(detection: object, enabled: bool) -> Optional[np.n
     if not isinstance(qc, dict):
         return None
     trace = qc.get("highpass_signal")
+    if trace is None:
+        return None
+    arr = np.asarray(trace, dtype=float)
+    return arr if arr.size > 0 else None
+
+
+def _detection_lowpass_trace(detection: object, enabled: bool) -> Optional[np.ndarray]:
+    if not enabled:
+        return None
+    qc = getattr(detection, "qc_plot_data", {})
+    if not isinstance(qc, dict):
+        return None
+    trace = qc.get("lowpass_signal")
     if trace is None:
         return None
     arr = np.asarray(trace, dtype=float)
@@ -259,8 +385,46 @@ def _startup_trimmed_trace_export_data(state: TraceCuration, startup_exclusion_m
         "plateau_mask": _trim_1d_for_startup(state.plateau_mask, startup_idx, n, dtype=bool),
         "long_plateau_mask": _trim_1d_for_startup(state.long_plateau_mask, startup_idx, n, dtype=bool),
         "short_plateau_mask": _trim_1d_for_startup(state.short_plateau_mask, startup_idx, n, dtype=bool),
+        "burst_plateau_mask": _trim_1d_for_startup(state.burst_plateau_mask, startup_idx, n, dtype=bool),
+        "burst_plateau_events": _adjust_event_table_for_offset(state.burst_plateau_events, startup_idx, n - startup_idx, 8),
+        "plateau_signal_classification": _adjust_plateau_signal_rows_for_offset(
+            state.plateau_signal_classification,
+            startup_idx,
+            n - startup_idx,
+        ),
         "spikes": _adjust_spikes_for_startup(state.spikes, startup_idx, n),
     }
+
+
+def _rejected_long_plateau_rows_for_export(
+    debug: Optional[Dict[str, Any]],
+    startup_idx: int,
+    n: int,
+) -> List[Dict[str, Any]]:
+    if not isinstance(debug, dict):
+        return []
+    rows = debug.get("long_plateau_region_debug_rows", [])
+    if not isinstance(rows, list):
+        return []
+
+    rejected: List[Dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict) or bool(row.get("accepted", False)):
+            continue
+        original_start = int(row.get("start_index", 0))
+        original_end = int(row.get("end_index_exclusive", original_start + 1))
+        if original_end <= startup_idx:
+            continue
+        display_start = max(0, original_start - startup_idx)
+        display_end = max(display_start + 1, original_end - startup_idx)
+        display_end = min(display_end, int(n))
+        if display_start >= display_end or display_start >= int(n):
+            continue
+        display_row = dict(row)
+        display_row["display_start_index"] = int(display_start)
+        display_row["display_end_index_exclusive"] = int(display_end)
+        rejected.append(display_row)
+    return sorted(rejected, key=lambda item: float(item.get("near_miss_score", 0.0)), reverse=True)
 
 
 def _render_spike_png(
@@ -273,6 +437,7 @@ def _render_spike_png(
     half_window_ms: float = 5.0,
     width: int = 1200,
     height: int = 400,
+    show_spike_markers: bool = True,
 ) -> "QtGui.QPixmap":
     """Render a single spike event as a PNG pixmap centered on spike."""
     spike_time = spike.spike_time
@@ -296,7 +461,6 @@ def _render_spike_png(
 
     # Shift time so spike is at t=0
     t_win_rescaled = t_win - spike_time
-    spike_x = 0.0  # Spike is at t=0
 
     spike_y = float(corrected[spike.spike_index]) if spike.spike_index < len(corrected) else 0.0
 
@@ -328,10 +492,16 @@ def _render_spike_png(
             pen=pg.mkPen("#8e24aa", width=1.2, style=Qt.PenStyle.DashLine),
             name="Detection threshold",
         )
-
-    # Mark the spike
-    scatter = pg.ScatterPlotItem(x=[spike_x], y=[spike_y], size=10, brush=pg.mkBrush("#f1c40f"), pen=pg.mkPen("#ffffff", width=1.0))
-    main_plot.addItem(scatter)
+    if show_spike_markers:
+        main_plot.addItem(
+            pg.ScatterPlotItem(
+                x=[0.0],
+                y=[spike_y],
+                size=10,
+                brush=pg.mkBrush("#f1c40f"),
+                pen=pg.mkPen("#ffffff", width=1.0),
+            )
+        )
 
     # Add vertical line at spike (t=0)
     y_range = main_plot.viewRange()[1]
@@ -367,7 +537,16 @@ def _render_spike_png(
         denoised_plot.setMaximumHeight(plot_height)
         denoised_plot.plot(t_win_rescaled, denoised_win, pen=pg.mkPen("#8e24aa", width=2.0), name="State-guided denoised")
         denoised_y = float(hybrid_denoised[spike.spike_index]) if spike.spike_index < len(hybrid_denoised) else 0.0
-        denoised_plot.addItem(pg.ScatterPlotItem(x=[0.0], y=[denoised_y], size=10, brush=pg.mkBrush("#f1c40f"), pen=pg.mkPen("#ffffff", width=1.0)))
+        if show_spike_markers:
+            denoised_plot.addItem(
+                pg.ScatterPlotItem(
+                    x=[0.0],
+                    y=[denoised_y],
+                    size=10,
+                    brush=pg.mkBrush("#f1c40f"),
+                    pen=pg.mkPen("#ffffff", width=1.0),
+                )
+            )
         denoised_plot.plot([0, 0], denoised_plot.viewRange()[1], pen=pg.mkPen("#ff0000", width=1.5, style=Qt.PenStyle.DashLine))
         denoised_plot.setXRange(-half_window, half_window, padding=0)
         if finite.size > 0:
@@ -391,6 +570,7 @@ def _render_aligned_spikes_png(
     half_window_ms: float = 5.0,
     width: int = 1200,
     height: int = 400,
+    show_spike_markers: bool = True,
 ) -> "QtGui.QPixmap":
     """Render all spikes overlaid on a single plot for easy comparison."""
     if not spikes:
@@ -416,8 +596,8 @@ def _render_aligned_spikes_png(
     main_plot.setMaximumHeight(height)
 
     # Extract and plot all spike waveforms
-    spike_ys_all = []
     spike_xs_all = []
+    spike_ys_all = []
     
     for spike in spikes:
         spike_time = spike.spike_time
@@ -441,7 +621,6 @@ def _render_aligned_spikes_png(
         # Plot each spike waveform with semi-transparent blue (#66 = 40% alpha)
         main_plot.plot(t_win_rescaled, corr_win, pen=pg.mkPen("#2979ff66", width=1.5))
         
-        # Track spike points for scatter plot
         spike_y = float(corrected[spike.spike_index]) if spike.spike_index < len(corrected) else 0.0
         spike_xs_all.append(0.0)
         spike_ys_all.append(spike_y)
@@ -468,9 +647,14 @@ def _render_aligned_spikes_png(
             
             main_plot.plot(t_win_rescaled, base_win, pen=pg.mkPen("#ff6d004d", width=1.0))  # 4d = 30% alpha
 
-    # Mark all spikes
-    if spike_xs_all:
-        scatter = pg.ScatterPlotItem(x=spike_xs_all, y=spike_ys_all, size=8, brush=pg.mkBrush("#f1c40f99"), pen=pg.mkPen("#ffffff", width=0.5))
+    if show_spike_markers and spike_xs_all:
+        scatter = pg.ScatterPlotItem(
+            x=spike_xs_all,
+            y=spike_ys_all,
+            size=8,
+            brush=pg.mkBrush("#f1c40f99"),
+            pen=pg.mkPen("#ffffff", width=0.5),
+        )
         main_plot.addItem(scatter)
 
     # Add vertical line at spike (t=0)
@@ -837,9 +1021,11 @@ def _plateau_source_for_region(
     end: int,
     long_plateau_mask: Optional[np.ndarray],
     short_plateau_mask: Optional[np.ndarray],
+    burst_plateau_mask: Optional[np.ndarray] = None,
 ) -> str:
     long_hit = False
     short_hit = False
+    burst_hit = False
     if long_plateau_mask is not None:
         lm = np.asarray(long_plateau_mask, dtype=bool)
         if lm.size > start:
@@ -848,19 +1034,99 @@ def _plateau_source_for_region(
         sm = np.asarray(short_plateau_mask, dtype=bool)
         if sm.size > start:
             short_hit = bool(np.any(sm[start : min(end, sm.size)]))
+    if burst_plateau_mask is not None:
+        bm = np.asarray(burst_plateau_mask, dtype=bool)
+        if bm.size > start:
+            burst_hit = bool(np.any(bm[start : min(end, bm.size)]))
     if long_hit:
         return "long"
     if short_hit:
         return "short"
+    if burst_hit:
+        return "burst"
     return "unknown"
 
 
-def _plateau_code_rows(
+def _event_metrics_for_region(events: Optional[np.ndarray], start: int, end: int) -> Dict[str, float]:
+    if events is None:
+        return {}
+    table = np.asarray(events, dtype=float)
+    if table.ndim != 2 or table.shape[0] == 0 or table.shape[1] < 8:
+        return {}
+    best: Optional[np.ndarray] = None
+    best_overlap = 0
+    for row in table:
+        row_start = int(row[0])
+        row_end = int(row[1])
+        overlap = max(0, min(end, row_end) - max(start, row_start))
+        if overlap > best_overlap:
+            best = row
+            best_overlap = overlap
+    if best is None or best_overlap <= 0:
+        return {}
+    return {
+        "burst_floor_support_fraction": float(best[4]),
+        "burst_peak_dominance_noise": float(best[5]),
+        "burst_iqr_over_noise": float(best[6]),
+        "burst_confidence": float(best[7]),
+    }
+
+
+def _unknown_signal_metrics() -> Dict[str, object]:
+    return {
+        "signal_type": "unknown",
+        "signal_confidence": float("nan"),
+        "raw_highfreq_rms": float("nan"),
+        "denoised_highfreq_rms": float("nan"),
+        "residual_rms": float("nan"),
+        "residual_fraction": float("nan"),
+        "noise_reduction_fraction": float("nan"),
+        "raw_peak_density_hz": float("nan"),
+        "denoised_peak_density_hz": float("nan"),
+        "preserved_peak_fraction": float("nan"),
+    }
+
+
+def _signal_metrics_for_region(
+    rows: Optional[List[Dict[str, Any]]],
+    start: int,
+    end: int,
+) -> Dict[str, object]:
+    if not isinstance(rows, list):
+        return _unknown_signal_metrics()
+    best: Optional[Dict[str, Any]] = None
+    best_overlap = 0
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            row_start = int(row.get("start_index", 0))
+            row_end = int(row.get("end_index_exclusive", row_start))
+        except (TypeError, ValueError):
+            continue
+        overlap = max(0, min(end, row_end) - max(start, row_start))
+        if overlap > best_overlap:
+            best = row
+            best_overlap = overlap
+    if best is None or best_overlap <= 0:
+        return _unknown_signal_metrics()
+    metrics = _unknown_signal_metrics()
+    for key in SIGNAL_TYPE_COLUMNS:
+        if key in best:
+            metrics[key] = best[key]
+    return metrics
+
+
+def _plateau_rows(
     trace_name: str,
     time: np.ndarray,
     plateau_mask: np.ndarray,
     long_plateau_mask: Optional[np.ndarray] = None,
     short_plateau_mask: Optional[np.ndarray] = None,
+    burst_plateau_mask: Optional[np.ndarray] = None,
+    burst_plateau_events: Optional[np.ndarray] = None,
+    plateau_signal_classification: Optional[List[Dict[str, Any]]] = None,
+    sampling_rate_hz: Optional[float] = None,
 ) -> List[Dict[str, object]]:
     regions = _contiguous_true_regions(plateau_mask)
     if not regions:
@@ -874,19 +1140,23 @@ def _plateau_code_rows(
         s = max(0, min(int(start), n_time - 1))
         e_exclusive = max(0, min(int(end), n_time))
         e = max(s, min(e_exclusive - 1, n_time - 1))
-        rows.append(
-            {
-                "trace_name": trace_name,
-                "plateau_code": f"P{idx:03d}",
-                "detector_source": _plateau_source_for_region(start, end, long_plateau_mask, short_plateau_mask),
-                "start_index": int(start),
-                "end_index_exclusive": int(end),
-                "start_time": float(time[s]),
-                "end_time": float(time[e]),
-                "sample_count": int(max(0, end - start)),
-                "duration_time_units": float(time[e] - time[s]),
-            }
-        )
+        source = _plateau_source_for_region(start, end, long_plateau_mask, short_plateau_mask, burst_plateau_mask)
+        row = {
+            "trace_name": trace_name,
+            "plateau_index": int(idx),
+            "detector_source": source,
+            "start_index": int(start),
+            "end_index_exclusive": int(end),
+            "onset_time_ms": _absolute_time_ms(time, s, sampling_rate_hz),
+            "start_time": float(time[s]),
+            "end_time": float(time[e]),
+            "sample_count": int(max(0, end - start)),
+            "duration_time_units": float(time[e] - time[s]),
+        }
+        if source == "burst":
+            row.update(_event_metrics_for_region(burst_plateau_events, start, end))
+        row.update(_signal_metrics_for_region(plateau_signal_classification, start, end))
+        rows.append(row)
     return rows
 
 
@@ -897,7 +1167,7 @@ def _render_full_trace_plateau_png(
     plateau_mask: np.ndarray,
     long_plateau_mask: Optional[np.ndarray] = None,
     short_plateau_mask: Optional[np.ndarray] = None,
-    spikes: Optional[List[SpikeRecord]] = None,
+    burst_plateau_mask: Optional[np.ndarray] = None,
     width: int = 1800,
     height: int = 500,
 ) -> "QtGui.QPixmap":
@@ -912,8 +1182,6 @@ def _render_full_trace_plateau_png(
     t = np.asarray(time[:n], dtype=float)
     y = np.asarray(corrected[:n], dtype=float)
     mask = np.asarray(plateau_mask[:n], dtype=bool)
-    regions = _contiguous_true_regions(mask)
-
     app = QtWidgets.QApplication.instance()
     if app is None:
         app = QtWidgets.QApplication([])
@@ -927,7 +1195,7 @@ def _render_full_trace_plateau_png(
     plot.showGrid(x=True, y=True, alpha=0.2)
     plot.setLabel("bottom", "Time")
     plot.setLabel("left", "Signal")
-    plot.setTitle(f"{trace_name} | Full trace with plateau labels")
+    plot.setTitle(f"{trace_name} | Full trace with plateaus")
     plot.setMinimumHeight(height)
     plot.setMaximumHeight(height)
     plot.plot(t, y, pen=pg.mkPen("#2979ff", width=1.5))
@@ -941,42 +1209,6 @@ def _render_full_trace_plateau_png(
         else:
             y_pad = max(1e-3, (y_max - y_min) * 0.10)
         plot.setYRange(y_min - y_pad, y_max + y_pad, padding=0)
-        label_y = y_max + (0.02 * max(1e-6, (y_max - y_min)))
-    else:
-        label_y = 0.0
-
-    # Overlay detected spikes so plateau export shows spike morphology context.
-    if spikes:
-        spike_points: List[tuple[float, float, int]] = []
-        for spike in sorted(spikes, key=lambda s: int(s.spike_index)):
-            idx = int(spike.spike_index)
-            if 0 <= idx < n and np.isfinite(t[idx]) and np.isfinite(y[idx]):
-                spike_points.append((float(t[idx]), float(y[idx]), idx))
-
-        if spike_points:
-            sx = [p[0] for p in spike_points]
-            sy = [p[1] for p in spike_points]
-            scatter = pg.ScatterPlotItem(
-                x=sx,
-                y=sy,
-                size=8,
-                brush=pg.mkBrush("#f1c40f"),
-                pen=pg.mkPen("#7a5c00", width=1.0),
-            )
-            plot.addItem(scatter)
-
-            y_span = max(1e-6, float(y_max - y_min)) if finite.size > 0 else 1.0
-            for i, (sx_i, sy_i, idx_i) in enumerate(spike_points, 1):
-                dy = 0.035 * y_span if (i % 2 == 1) else 0.06 * y_span
-                label = pg.TextItem(
-                    f"S{i:03d}",
-                    color="#7a5c00",
-                    fill=pg.mkColor("#fff8d6e6"),
-                    border=pg.mkColor("#c8a600"),
-                    anchor=(0.5, 1.0),
-                )
-                plot.addItem(label)
-                label.setPos(sx_i, sy_i + dy)
 
     def _add_shaded_regions(source_mask: Optional[np.ndarray], brush: object, pen: object) -> None:
         if source_mask is None:
@@ -999,22 +1231,7 @@ def _render_full_trace_plateau_png(
     red_mask = long_plateau_mask if long_plateau_mask is not None else mask
     _add_shaded_regions(red_mask, pg.mkBrush(231, 76, 60, 55), pg.mkPen(192, 57, 43, 0))
     _add_shaded_regions(short_plateau_mask, pg.mkBrush(21, 101, 192, 50), pg.mkPen(21, 101, 192, 0))
-
-    for idx, (start, end) in enumerate(regions, 1):
-        s = max(0, min(start, n - 1))
-        e = max(s, min(end - 1, n - 1))
-        x0 = float(t[s])
-        x1 = float(t[e])
-
-        label = pg.TextItem(
-            f"P{idx:03d}",
-            color="#7f1d1d",
-            fill=pg.mkColor("#ffffffd9"),
-            border=pg.mkColor("#c0392b"),
-            anchor=(0.5, 1.0),
-        )
-        plot.addItem(label)
-        label.setPos((x0 + x1) * 0.5, label_y)
+    _add_shaded_regions(burst_plateau_mask, pg.mkBrush(124, 58, 237, 50), pg.mkPen(124, 58, 237, 0))
 
     if n >= 2:
         plot.setXRange(float(t[0]), float(t[-1]), padding=0)
@@ -1030,13 +1247,13 @@ def _render_full_trace_plateau_png(
 
 def _render_plateau_zoom_png(
     trace_name: str,
-    plateau_code: str,
     time: np.ndarray,
     corrected: np.ndarray,
     start_idx: int,
     end_idx_exclusive: int,
     plateau_source: str = "long",
-    spikes: Optional[List[SpikeRecord]] = None,
+    signal_type: str = "unknown",
+    shade_region: bool = True,
     width: int = 1400,
     height: int = 420,
 ) -> "QtGui.QPixmap":
@@ -1053,15 +1270,9 @@ def _render_plateau_zoom_png(
     y = np.asarray(corrected[:n], dtype=float)
     onset_t = float(t[s])
     end_t = float(t[e])
-    plateau_span = max(0.0, end_t - onset_t)
 
-    dt = np.diff(t)
-    dt = dt[np.isfinite(dt) & (dt > 0)]
-    dt_med = float(np.median(dt)) if dt.size else 1.0
-    pad = max(10.0 * dt_med, 0.25 * plateau_span)
-
-    win_lo_t = onset_t - pad
-    win_hi_t = end_t + pad
+    win_lo_t = onset_t + PLATEAU_EXPORT_X_RANGE[0]
+    win_hi_t = onset_t + PLATEAU_EXPORT_X_RANGE[1]
     lo = max(0, int(np.searchsorted(t, win_lo_t, side="left") - 1))
     hi = min(n, int(np.searchsorted(t, win_hi_t, side="right") + 1))
     if hi <= lo:
@@ -1085,25 +1296,36 @@ def _render_plateau_zoom_png(
     plot.showGrid(x=True, y=True, alpha=0.2)
     plot.setLabel("bottom", "Time relative to plateau onset")
     plot.setLabel("left", "Signal")
-    plot.setTitle(f"{trace_name} | {plateau_code} zoom (onset=0)")
+    title_kind = "failed candidate" if str(plateau_source).lower() in {"failed", "rejected"} else "plateau"
+    signal_suffix = "" if title_kind != "plateau" else f" | {str(plateau_source)} / {str(signal_type)}"
+    plot.setTitle(f"{trace_name} | {title_kind} zoom{signal_suffix}")
     plot.setMinimumHeight(height)
     plot.setMaximumHeight(height)
     plot.plot(x_rel, y_win, pen=pg.mkPen("#2979ff", width=1.8))
 
-    is_short = str(plateau_source).lower() == "short"
-    region_brush = pg.mkBrush(21, 101, 192, 50) if is_short else pg.mkBrush(231, 76, 60, 55)
-    region_pen = pg.mkPen("#1565c0", width=1.1) if is_short else pg.mkPen("#c0392b", width=1.1)
-    label_color = "#0f3d73" if is_short else "#7f1d1d"
-    label_border = pg.mkColor("#1565c0") if is_short else pg.mkColor("#c0392b")
+    source = str(plateau_source).lower()
+    if source == "short":
+        region_brush = pg.mkBrush(21, 101, 192, 50)
+        region_pen = pg.mkPen("#1565c0", width=1.1)
+    elif source == "burst":
+        region_brush = pg.mkBrush(124, 58, 237, 50)
+        region_pen = pg.mkPen("#7c3aed", width=1.1)
+    elif source in {"failed", "rejected"}:
+        region_brush = pg.mkBrush(100, 116, 139, 45)
+        region_pen = pg.mkPen("#64748b", width=1.1)
+    else:
+        region_brush = pg.mkBrush(231, 76, 60, 55)
+        region_pen = pg.mkPen("#c0392b", width=1.1)
 
-    plateau_region = pg.LinearRegionItem(
-        values=(0.0, float(plateau_end_rel)),
-        brush=region_brush,
-        pen=region_pen,
-        movable=False,
-    )
-    plateau_region.setZValue(-8)
-    plot.addItem(plateau_region)
+    if shade_region:
+        plateau_region = pg.LinearRegionItem(
+            values=(0.0, float(plateau_end_rel)),
+            brush=region_brush,
+            pen=region_pen,
+            movable=False,
+        )
+        plateau_region.setZValue(-8)
+        plot.addItem(plateau_region)
 
     finite = y_win[np.isfinite(y_win)]
     if finite.size > 0:
@@ -1111,68 +1333,170 @@ def _render_plateau_zoom_png(
         y_max = float(np.max(finite))
         y_pad = max(1e-3, (y_max - y_min) * 0.10) if y_max > y_min else 1e-3
         plot.setYRange(y_min - y_pad, y_max + y_pad, padding=0)
-        y_line = y_max + 0.02 * max(1e-6, (y_max - y_min))
-    else:
-        y_line = 0.0
 
-    plot.plot([0.0, 0.0], [float(np.min(finite)) if finite.size else -1.0, float(np.max(finite)) if finite.size else 1.0], pen=pg.mkPen("#ff0000", width=1.5, style=Qt.PenStyle.DashLine))
-    onset_label = pg.TextItem(
-        "onset=0",
-        color=label_color,
-        fill=pg.mkColor("#ffffffd9"),
-        border=label_border,
-        anchor=(0.5, 1.0),
-    )
-    plot.addItem(onset_label)
-    onset_label.setPos(0.0, y_line)
-
-    # Overlay spikes in this zoom window and label those inside the plateau span.
-    if spikes:
-        spike_points: List[tuple[float, float, int, bool]] = []
-        for spike in sorted(spikes, key=lambda s: int(s.spike_index)):
-            idx = int(spike.spike_index)
-            if lo <= idx < hi and np.isfinite(t[idx]) and np.isfinite(y[idx]):
-                x_rel_i = float(t[idx] - onset_t)
-                in_plateau = bool(s <= idx < e_exclusive)
-                spike_points.append((x_rel_i, float(y[idx]), idx, in_plateau))
-
-        if spike_points:
-            sx = [p[0] for p in spike_points]
-            sy = [p[1] for p in spike_points]
-            scatter = pg.ScatterPlotItem(
-                x=sx,
-                y=sy,
-                size=8,
-                brush=pg.mkBrush("#f1c40f"),
-                pen=pg.mkPen("#7a5c00", width=1.0),
-            )
-            plot.addItem(scatter)
-
-            if finite.size > 0:
-                y_span = max(1e-6, float(np.max(finite) - np.min(finite)))
-            else:
-                y_span = 1.0
-
-            label_idx = 1
-            for x_i, y_i, _idx_i, in_plateau in spike_points:
-                if not in_plateau:
-                    continue
-                dy = 0.04 * y_span if (label_idx % 2 == 1) else 0.07 * y_span
-                label = pg.TextItem(
-                    f"S{label_idx:03d}",
-                    color="#7a5c00",
-                    fill=pg.mkColor("#fff8d6e6"),
-                    border=pg.mkColor("#c8a600"),
-                    anchor=(0.5, 1.0),
-                )
-                plot.addItem(label)
-                label.setPos(x_i, y_i + dy)
-                label_idx += 1
-
-    if x_rel.size >= 2:
-        plot.setXRange(float(x_rel[0]), float(x_rel[-1]), padding=0)
+    plot.setXRange(PLATEAU_EXPORT_X_RANGE[0], PLATEAU_EXPORT_X_RANGE[1], padding=0)
 
     layout.addWidget(plot)
+    container.resize(width, height)
+    container.hide()
+    QtWidgets.QApplication.processEvents()
+    pix = QtWidgets.QWidget.grab(container)
+    container.close()
+    return pix
+
+
+def _set_plot_y_range(plot: object, values: np.ndarray) -> None:
+    arr = np.asarray(values, dtype=float)
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return
+    y_min = float(np.min(finite))
+    y_max = float(np.max(finite))
+    y_pad = max(1e-3, (y_max - y_min) * 0.10) if y_max > y_min else 1e-3
+    plot.setYRange(y_min - y_pad, y_max + y_pad, padding=0)
+
+
+def _add_trace_plateau_shading(plot: object, time: np.ndarray, plateau_mask: Optional[np.ndarray]) -> None:
+    if plateau_mask is None or time.size == 0:
+        return
+    mask = np.asarray(plateau_mask, dtype=bool)
+    n = min(int(time.size), int(mask.size))
+    if n <= 0:
+        return
+    t = np.asarray(time[:n], dtype=float)
+    for start, end in _contiguous_true_regions(mask[:n]):
+        s = max(0, min(int(start), n - 1))
+        e = max(s, min(int(end) - 1, n - 1))
+        region = pg.LinearRegionItem(
+            values=(float(t[s]), float(t[e])),
+            brush=pg.mkBrush(231, 76, 60, 55),
+            pen=pg.mkPen(192, 57, 43, 0),
+            movable=False,
+        )
+        region.setZValue(-8)
+        plot.addItem(region)
+
+
+def _render_whole_trace_png(
+    trace_name: str,
+    time: np.ndarray,
+    signal: np.ndarray,
+    title_suffix: str,
+    line_color: str = "#2979ff",
+    plateau_mask: Optional[np.ndarray] = None,
+    spikes: Optional[List[SpikeRecord]] = None,
+    width: int = 1800,
+    height: int = 500,
+    show_spike_markers: bool = True,
+) -> "QtGui.QPixmap":
+    n = int(min(len(time), len(signal)))
+    if n <= 0:
+        return QtGui.QPixmap()
+
+    t = np.asarray(time[:n], dtype=float)
+    y = np.asarray(signal[:n], dtype=float)
+
+    app = QtWidgets.QApplication.instance()
+    if app is None:
+        app = QtWidgets.QApplication([])
+
+    container = QtWidgets.QWidget()
+    layout = QtWidgets.QVBoxLayout(container)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(0)
+
+    plot = pg.PlotWidget(background="#f7f9fc")
+    plot.showGrid(x=True, y=True, alpha=0.2)
+    plot.setLabel("bottom", "Time")
+    plot.setLabel("left", "Signal")
+    plot.setTitle(f"{trace_name} | {title_suffix}")
+    plot.setMinimumHeight(height)
+    plot.setMaximumHeight(height)
+    plot.plot(t, y, pen=pg.mkPen(line_color, width=1.5))
+    _add_trace_plateau_shading(plot, t, plateau_mask)
+
+    if show_spike_markers and spikes:
+        points: List[tuple[float, float]] = []
+        for spike in sorted(spikes, key=lambda item: int(item.spike_index)):
+            idx = int(spike.spike_index)
+            if 0 <= idx < n and np.isfinite(t[idx]) and np.isfinite(y[idx]):
+                points.append((float(t[idx]), float(y[idx])))
+        if points:
+            plot.addItem(
+                pg.ScatterPlotItem(
+                    x=[point[0] for point in points],
+                    y=[point[1] for point in points],
+                    size=7,
+                    brush=pg.mkBrush("#f1c40f"),
+                    pen=pg.mkPen("#7a5c00", width=0.8),
+                )
+            )
+
+    _set_plot_y_range(plot, y)
+    if n >= 2:
+        plot.setXRange(float(t[0]), float(t[-1]), padding=0)
+
+    layout.addWidget(plot)
+    container.resize(width, height)
+    container.hide()
+    QtWidgets.QApplication.processEvents()
+    pix = QtWidgets.QWidget.grab(container)
+    container.close()
+    return pix
+
+
+def _render_raw_processed_comparison_png(
+    trace_name: str,
+    time: np.ndarray,
+    raw: np.ndarray,
+    processed: np.ndarray,
+    processed_label: str,
+    processed_color: str,
+    width: int = 1800,
+    height: int = 700,
+) -> "QtGui.QPixmap":
+    n = int(min(len(time), len(raw), len(processed)))
+    if n <= 0:
+        return QtGui.QPixmap()
+
+    t = np.asarray(time[:n], dtype=float)
+    raw_y = np.asarray(raw[:n], dtype=float)
+    processed_y = np.asarray(processed[:n], dtype=float)
+
+    app = QtWidgets.QApplication.instance()
+    if app is None:
+        app = QtWidgets.QApplication([])
+
+    container = QtWidgets.QWidget()
+    layout = QtWidgets.QVBoxLayout(container)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(0)
+
+    panel_h = max(1, height // 2)
+    raw_plot = pg.PlotWidget(background="#f7f9fc")
+    raw_plot.showGrid(x=True, y=True, alpha=0.2)
+    raw_plot.setLabel("left", "Raw")
+    raw_plot.setTitle(f"{trace_name} | raw vs {processed_label}")
+    raw_plot.setMinimumHeight(panel_h)
+    raw_plot.setMaximumHeight(panel_h)
+    raw_plot.plot(t, raw_y, pen=pg.mkPen("#455a64", width=1.4))
+    _set_plot_y_range(raw_plot, raw_y)
+    if n >= 2:
+        raw_plot.setXRange(float(t[0]), float(t[-1]), padding=0)
+    layout.addWidget(raw_plot)
+
+    processed_plot = pg.PlotWidget(background="#f7f9fc")
+    processed_plot.showGrid(x=True, y=True, alpha=0.2)
+    processed_plot.setLabel("bottom", "Time")
+    processed_plot.setLabel("left", processed_label)
+    processed_plot.setMinimumHeight(panel_h)
+    processed_plot.setMaximumHeight(panel_h)
+    processed_plot.plot(t, processed_y, pen=pg.mkPen(processed_color, width=1.4))
+    _set_plot_y_range(processed_plot, processed_y)
+    if n >= 2:
+        processed_plot.setXRange(float(t[0]), float(t[-1]), padding=0)
+    layout.addWidget(processed_plot)
+
     container.resize(width, height)
     container.hide()
     QtWidgets.QApplication.processEvents()
@@ -1194,22 +1518,12 @@ def _collect_plateau_windows_aligned_to_onset(
     t = np.asarray(time[:n], dtype=float)
     y = np.asarray(corrected[:n], dtype=float)
 
-    dt = np.diff(t)
-    dt = dt[np.isfinite(dt) & (dt > 0)]
-    dt_med = float(np.median(dt)) if dt.size else 1.0
-
     for start, end_exclusive in regions:
         s = max(0, min(int(start), n - 1))
-        e_exclusive = max(s + 1, min(int(end_exclusive), n))
-        e = max(s, e_exclusive - 1)
 
         onset_t = float(t[s])
-        end_t = float(t[e])
-        span = max(0.0, end_t - onset_t)
-        pad = max(10.0 * dt_med, 0.25 * span)
-
-        lo_t = onset_t - pad
-        hi_t = end_t + pad
+        lo_t = onset_t + PLATEAU_EXPORT_X_RANGE[0]
+        hi_t = onset_t + PLATEAU_EXPORT_X_RANGE[1]
         lo = max(0, int(np.searchsorted(t, lo_t, side="left") - 1))
         hi = min(n, int(np.searchsorted(t, hi_t, side="right") + 1))
         if hi <= lo:
@@ -1251,20 +1565,15 @@ def _render_superimposed_plateaus_png(
     plot.showGrid(x=True, y=True, alpha=0.2)
     plot.setLabel("bottom", "Time relative to plateau onset")
     plot.setLabel("left", "Signal")
-    plot.setTitle(f"{trace_name} | plateau superimposed (onset=0)")
+    plot.setTitle(f"{trace_name} | plateau superimposed")
     plot.setMinimumHeight(height)
     plot.setMaximumHeight(height)
 
     all_values: List[float] = []
-    x_min = float("inf")
-    x_max = float("-inf")
     for t_win, y_win in windows:
         plot.plot(t_win, y_win, pen=pg.mkPen("#2979ff66", width=1.2))
         arr = np.asarray(y_win, dtype=float)
         all_values.extend([v for v in arr.flat if np.isfinite(v)])
-        if t_win.size > 0:
-            x_min = min(x_min, float(np.min(t_win)))
-            x_max = max(x_max, float(np.max(t_win)))
 
     if all_values:
         y_vals = np.asarray(all_values, dtype=float)
@@ -1272,10 +1581,8 @@ def _render_superimposed_plateaus_png(
         y_hi = float(np.max(y_vals))
         y_pad = max(1e-3, (y_hi - y_lo) * 0.10) if y_hi > y_lo else 1e-3
         plot.setYRange(y_lo - y_pad, y_hi + y_pad, padding=0)
-        plot.plot([0.0, 0.0], [y_lo - y_pad, y_hi + y_pad], pen=pg.mkPen("#ff0000", width=1.5, style=Qt.PenStyle.DashLine))
 
-    if np.isfinite(x_min) and np.isfinite(x_max) and x_max > x_min:
-        plot.setXRange(x_min, x_max, padding=0)
+    plot.setXRange(PLATEAU_EXPORT_X_RANGE[0], PLATEAU_EXPORT_X_RANGE[1], padding=0)
 
     layout.addWidget(plot)
     container.resize(width, height)
@@ -1314,14 +1621,12 @@ def _render_superimposed_all_traces_plateaus_png(
     plot.showGrid(x=True, y=True, alpha=0.2)
     plot.setLabel("bottom", "Time relative to plateau onset")
     plot.setLabel("left", "Signal (a.u., trace-normalized)")
-    plot.setTitle("All traces | plateau superimposed (onset=0, a.u.)")
+    plot.setTitle("All traces | plateau superimposed")
     plot.setMinimumHeight(height)
     plot.setMaximumHeight(height)
     plot.addLegend(offset=(10, 8))
 
     all_values: List[float] = []
-    x_min = float("inf")
-    x_max = float("-inf")
     for idx, (trace_name, time, corrected, plateau_mask) in enumerate(trace_data):
         regions = _contiguous_true_regions(np.asarray(plateau_mask, dtype=bool))
         windows = _collect_plateau_windows_aligned_to_onset(time, corrected, regions)
@@ -1356,9 +1661,6 @@ def _render_superimposed_all_traces_plateaus_png(
 
             arr = np.asarray(y_win_au, dtype=float)
             all_values.extend([v for v in arr.flat if np.isfinite(v)])
-            if t_win.size > 0:
-                x_min = min(x_min, float(np.min(t_win)))
-                x_max = max(x_max, float(np.max(t_win)))
 
     if all_values:
         y_vals = np.asarray(all_values, dtype=float)
@@ -1366,10 +1668,8 @@ def _render_superimposed_all_traces_plateaus_png(
         y_hi = float(np.max(y_vals))
         y_pad = max(1e-3, (y_hi - y_lo) * 0.10) if y_hi > y_lo else 1e-3
         plot.setYRange(y_lo - y_pad, y_hi + y_pad, padding=0)
-        plot.plot([0.0, 0.0], [y_lo - y_pad, y_hi + y_pad], pen=pg.mkPen("#ff0000", width=1.5, style=Qt.PenStyle.DashLine))
 
-    if np.isfinite(x_min) and np.isfinite(x_max) and x_max > x_min:
-        plot.setXRange(x_min, x_max, padding=0)
+    plot.setXRange(PLATEAU_EXPORT_X_RANGE[0], PLATEAU_EXPORT_X_RANGE[1], padding=0)
 
     layout.addWidget(plot)
     container.resize(width, height)
@@ -1437,8 +1737,11 @@ EXPORT_MANIFEST_NAME = "export_manifest.json"
 
 PLATEAU_EVENT_COLUMNS = [
     "trace_id",
+    "recording_id",
+    "roi_id",
     "plateau_id",
     "detector_source",
+    *SIGNAL_TYPE_COLUMNS,
     "start_index",
     "end_index_exclusive",
     "onset_time_ms",
@@ -1456,6 +1759,8 @@ PLATEAU_EVENT_COLUMNS = [
 
 TRACE_SUMMARY_COLUMNS = [
     "trace_id",
+    "recording_id",
+    "roi_id",
     "plateau_count",
     "first_onset_ms",
     "mean_duration_ms",
@@ -1476,6 +1781,8 @@ TRACE_SUMMARY_COLUMNS = [
 
 SPIKE_EVENT_COLUMNS = [
     "trace_id",
+    "recording_id",
+    "roi_id",
     "spike_id",
     "peak_index",
     "peak_time",
@@ -1510,7 +1817,7 @@ QC_EVENT_METRICS = {
 QC_OUTLIER_THRESHOLD = 4.5
 
 
-def _time_to_ms_scale(time: np.ndarray) -> float:
+def _time_to_ms_scale(time: np.ndarray, sampling_rate_hz: Optional[float] = None) -> float:
     t = np.asarray(time, dtype=float)
     if t.size < 2:
         return 1.0
@@ -1519,10 +1826,21 @@ def _time_to_ms_scale(time: np.ndarray) -> float:
     if dt.size == 0:
         return 1.0
     dt_med = float(np.median(dt))
-    sample_period_ms = _time_sample_period_ms(t)
+    sample_period_ms = _time_sample_period_ms(t, sampling_rate_hz)
     if not np.isfinite(sample_period_ms) or sample_period_ms <= 0.0:
         return 1.0
     return float(sample_period_ms / dt_med)
+
+
+def _absolute_time_ms(time: np.ndarray, index: int, sampling_rate_hz: Optional[float] = None) -> float:
+    t = np.asarray(time, dtype=float)
+    if t.size == 0:
+        return float("nan")
+    idx = max(0, min(int(index), t.size - 1))
+    value = float(t[idx])
+    if not np.isfinite(value):
+        return float("nan")
+    return float(value * _time_to_ms_scale(t, sampling_rate_hz))
 
 
 def _time_sample_period_ms(time: np.ndarray, sampling_rate_hz: Optional[float] = None) -> float:
@@ -1936,7 +2254,8 @@ def _build_spike_event_rows(trace_names: List[str], traces: Dict[str, TraceCurat
             rows.append(
                 {
                     "trace_id": str(trace_name),
-                    "spike_id": f"S{idx:04d}",
+                    **trace_identity_columns(trace_name),
+                    "spike_id": f"{idx:04d}",
                     "peak_index": peak_index,
                     "peak_time": peak_time,
                     "amplitude": float(spike.amplitude_above_baseline),
@@ -1976,6 +2295,7 @@ def _build_trace_spike_summary_rows(trace_names: List[str], spike_event_rows: Li
             per = pd.DataFrame()
         row: Dict[str, object] = {
             "trace_id": str(trace_name),
+            **trace_identity_columns(trace_name),
             "spike_count": int(per.shape[0]),
         }
         for col in metric_cols:
@@ -2000,6 +2320,9 @@ def _build_plateau_event_rows(trace_names: List[str], traces: Dict[str, TraceCur
         m = np.asarray(state.plateau_mask, dtype=bool)
         long_mask = np.asarray(state.long_plateau_mask, dtype=bool) if state.long_plateau_mask is not None else None
         short_mask = np.asarray(state.short_plateau_mask, dtype=bool) if state.short_plateau_mask is not None else None
+        burst_mask = np.asarray(state.burst_plateau_mask, dtype=bool) if state.burst_plateau_mask is not None else None
+        burst_events = np.asarray(state.burst_plateau_events, dtype=float) if state.burst_plateau_events is not None else None
+        signal_rows = state.plateau_signal_classification
 
         n = min(y.size, b.size, t.size, m.size)
         if n <= 2:
@@ -2012,7 +2335,8 @@ def _build_plateau_event_rows(trace_names: List[str], traces: Dict[str, TraceCur
         if not np.any(m):
             continue
 
-        sample_period_ms = _time_sample_period_ms(t, _trace_sampling_rate_hz(state))
+        sampling_rate_hz = _trace_sampling_rate_hz(state)
+        sample_period_ms = _time_sample_period_ms(t, sampling_rate_hz)
         if not np.isfinite(sample_period_ms) or sample_period_ms <= 0.0:
             continue
 
@@ -2024,7 +2348,7 @@ def _build_plateau_event_rows(trace_names: List[str], traces: Dict[str, TraceCur
             amp = y[start:end] - b[start:end]
             amp_f = amp[np.isfinite(amp)]
 
-            onset_time_ms = float(start * sample_period_ms)
+            onset_time_ms = _absolute_time_ms(t, start, sampling_rate_hz)
             duration_ms = float((end - start) * sample_period_ms)
 
             fwhm_samples = _event_fwhm_samples(amp)
@@ -2038,11 +2362,12 @@ def _build_plateau_event_rows(trace_names: List[str], traces: Dict[str, TraceCur
             mean_amp = float(np.mean(amp_f)) if amp_f.size > 0 else float("nan")
             peak_amp = float(np.max(amp_f)) if amp_f.size > 0 else float("nan")
 
-            rows.append(
-                {
+            source = _plateau_source_for_region(start, end, long_mask, short_mask, burst_mask)
+            row = {
                     "trace_id": str(trace_name),
-                    "plateau_id": f"P{idx:03d}",
-                    "detector_source": _plateau_source_for_region(start, end, long_mask, short_mask),
+                    **trace_identity_columns(trace_name),
+                    "plateau_id": f"{idx:03d}",
+                    "detector_source": source,
                     "start_index": int(start),
                     "end_index_exclusive": int(end),
                     "onset_time_ms": onset_time_ms,
@@ -2056,8 +2381,11 @@ def _build_plateau_event_rows(trace_names: List[str], traces: Dict[str, TraceCur
                     "mean_amp_above_baseline": mean_amp,
                     "peak_amp_above_baseline": peak_amp,
                     "sample_count": int(end - start),
-                }
-            )
+            }
+            if source == "burst":
+                row.update(_event_metrics_for_region(burst_events, start, end))
+            row.update(_signal_metrics_for_region(signal_rows, start, end))
+            rows.append(row)
 
     return rows
 
@@ -2111,6 +2439,7 @@ def _build_trace_summary_rows(
             rows.append(
                 {
                     "trace_id": str(trace_name),
+                    **trace_identity_columns(trace_name),
                     "plateau_count": 0,
                     "first_onset_ms": float("nan"),
                     "mean_duration_ms": float("nan"),
@@ -2168,6 +2497,7 @@ def _build_trace_summary_rows(
         rows.append(
             {
                 "trace_id": str(trace_name),
+                **trace_identity_columns(trace_name),
                 "plateau_count": int(per.shape[0]),
                 "first_onset_ms": first_onset,
                 "mean_duration_ms": mean_dur,
@@ -2250,6 +2580,8 @@ def _build_all_trace_summary_row(events_df: pd.DataFrame) -> Dict[str, object]:
 
     return {
         "trace_id": "ALL",
+        "recording_id": "ALL",
+        "roi_id": "",
         "plateau_count": int(events_df.shape[0]),
         "first_onset_ms": float("nan"),
         "mean_duration_ms": m_dur,
@@ -3595,14 +3927,13 @@ def _write_long_plateau_debug_export(
     for row in accepted_rows:
         s = int(row.get("display_start_index", row.get("start_index", 0)))
         e = int(row.get("display_end_index_exclusive", s + 1)) - 1
-        if 0 <= s < n and 0 <= e < n:
-            ax.text(float(time_arr[s]), y_text, f"A{row.get('region_id')}", color="#991b1b", fontsize=8)
+        if not (0 <= s < n and 0 <= e < n):
+            continue
     for row in rejected_rows[:50]:
         s = int(row.get("display_start_index", row.get("start_index", 0)))
         e = int(row.get("display_end_index_exclusive", s + 1)) - 1
         if 0 <= s < n and 0 <= e < n:
             ax.axvspan(float(time_arr[s]), float(time_arr[e]), color="#64748b", alpha=0.10, linewidth=0)
-            ax.text(float(time_arr[s]), y_text, f"R{row.get('region_id')}", color="#334155", fontsize=8, rotation=45)
     ax.set_title(f"{trace_name} | Accepted long plateaus and rejected candidates")
     ax.set_xlabel(_time_axis_label(time_arr))
     ax.set_ylabel("Signal")
@@ -3630,7 +3961,7 @@ def _write_long_plateau_debug_export(
         fig, axes = plt.subplots(2, 1, figsize=(12, 7), sharex=True)
         axes[0].plot(time_arr[lo:hi], input_signal[lo:hi], color="#2563eb", linewidth=1.0, label="input")
         axes[0].axvspan(float(time_arr[start]), float(time_arr[max(start, end - 1)]), color="#64748b", alpha=0.18)
-        axes[0].set_title(f"Rejected candidate {region_id}: {row.get('rejection_reason', '')}")
+        axes[0].set_title(f"Rejected candidate: {row.get('rejection_reason', '')}")
         axes[0].legend(loc="best")
         axes[0].grid(True, alpha=0.22)
         axes[1].plot(time_arr[lo:hi], detrended[lo:hi], color="#16a34a", linewidth=1.0, label="detrended proxy")
@@ -3720,14 +4051,20 @@ def _spike_record_from_event_stats_row(row: pd.Series, trace_name: str) -> Spike
 
 @dataclass(frozen=True)
 class TraceAnalysisResult:
+    time: np.ndarray
+    raw: np.ndarray
+    corrected_source: np.ndarray
     corrected: np.ndarray
     hybrid_denoised: np.ndarray
     gonzalez_cwt_debug: Dict[str, Any]
     long_plateau_debug: Dict[str, Any]
+    plateau_signal_classification: List[Dict[str, Any]]
     correction_baseline: np.ndarray
     detection: object
     artifact_mask: np.ndarray
     sampling_rate_hz: float
+    highpass_trace: Optional[np.ndarray]
+    lowpass_trace: Optional[np.ndarray]
 
 
 @dataclass(frozen=True)
@@ -3739,6 +4076,7 @@ class TraceAnalysisRequest:
     sampling_rate_hz: float
     detection_params: DetectionParams
     artifact_params: ArtifactParams
+    pipeline_config: Dict[str, Any]
     generation: int
 
 
@@ -3750,7 +4088,238 @@ def _clone_artifact_params(params: ArtifactParams) -> ArtifactParams:
     return ArtifactParams.from_dict(params.to_dict())
 
 
-def _analysis_low_state_kwargs(params: DetectionParams) -> Dict[str, object]:
+def _user_template_indices_from_trace(state: TraceCuration) -> List[int]:
+    indices: List[int] = []
+    for spike in list(state.spikes):
+        status = str(getattr(spike, "status", "")).strip().lower()
+        source = str(getattr(spike, "source", "")).strip().lower()
+        if status in {"accepted", "manual"} or source == "manual":
+            indices.append(int(spike.spike_index))
+    return sorted(set(index for index in indices if index >= 0))
+
+
+_DOWNSAMPLE_STEP_ID = "rolling_average_downsample"
+_FILTER_STEP_IDS = ("highpass_filter", "lowpass_filter")
+_PIPELINE_TRANSFORM_STEP_IDS = (*_FILTER_STEP_IDS, _DOWNSAMPLE_STEP_ID)
+
+
+def _pipeline_config_from_payload(data: Dict[str, Any]) -> PipelineConfig:
+    if isinstance(data, dict):
+        return PipelineConfig.from_dict(data)
+    return PipelineConfig.from_preset("current")
+
+
+def _pipeline_has_step(config: PipelineConfig, step_id: str) -> bool:
+    return str(step_id) in [str(item) for item in config.ordered_step_ids]
+
+
+def _pipeline_step_enabled(config: PipelineConfig, step_id: str) -> bool:
+    return _pipeline_has_step(config, step_id) and bool(config.enabled_steps.get(step_id, False))
+
+
+def _pipeline_enabled_order(config: PipelineConfig) -> List[str]:
+    ordered: List[str] = []
+    for step_id in config.ordered_step_ids:
+        step = str(step_id)
+        if step in PIPELINE_STEP_DEFINITIONS and step not in ordered and bool(config.enabled_steps.get(step, True)):
+            ordered.append(step)
+    return ordered
+
+
+def _pipeline_stage_index(ordered_steps: List[str], step_id: str) -> int:
+    try:
+        return ordered_steps.index(step_id)
+    except ValueError:
+        return len(ordered_steps)
+
+
+def _pipeline_transform_steps_between(
+    config: PipelineConfig,
+    start_step_id: Optional[str],
+    end_step_id: str,
+) -> List[str]:
+    ordered = _pipeline_enabled_order(config)
+    start = -1 if start_step_id is None else _pipeline_stage_index(ordered, start_step_id)
+    end = _pipeline_stage_index(ordered, end_step_id)
+    if end < start:
+        end = len(ordered)
+    return [
+        step_id
+        for index, step_id in enumerate(ordered)
+        if start < index < end and step_id in _PIPELINE_TRANSFORM_STEP_IDS
+    ]
+
+
+def _pipeline_filter_steps_between(
+    config: PipelineConfig,
+    start_step_id: Optional[str],
+    end_step_id: str,
+) -> List[str]:
+    return [
+        step_id
+        for step_id in _pipeline_transform_steps_between(config, start_step_id, end_step_id)
+        if step_id in _FILTER_STEP_IDS
+    ]
+
+
+def _legacy_filter_steps(params: DetectionParams) -> List[str]:
+    steps: List[str] = []
+    if bool(getattr(params, "use_highpass_filter", False)):
+        steps.append("highpass_filter")
+    if bool(getattr(params, "use_lowpass_filter", False)):
+        steps.append("lowpass_filter")
+    return steps
+
+
+def _pipeline_uses_transform_steps(config: PipelineConfig) -> bool:
+    return any(step_id in _PIPELINE_TRANSFORM_STEP_IDS for step_id in config.ordered_step_ids)
+
+
+def _rolling_downsample_factor(params: DetectionParams) -> int:
+    try:
+        value = int(getattr(params, "rolling_downsample_factor", 2))
+    except (TypeError, ValueError):
+        value = 2
+    return max(2, min(100, value))
+
+
+def _rolling_block_mean_1d(values: np.ndarray, factor: int) -> np.ndarray:
+    arr = np.asarray(values, dtype=float)
+    factor = max(2, int(factor))
+    usable = (arr.size // factor) * factor
+    if usable <= 0:
+        raise ValueError(
+            f"Rolling-average downsampling factor {factor} is larger than the available sample count {arr.size}."
+        )
+    blocks = arr[:usable].reshape(-1, factor)
+    finite = np.isfinite(blocks)
+    counts = finite.sum(axis=1)
+    sums = np.where(finite, blocks, 0.0).sum(axis=1)
+    return np.divide(
+        sums,
+        counts,
+        out=np.full(counts.shape, np.nan, dtype=float),
+        where=counts > 0,
+    )
+
+
+def _rolling_block_any_1d(values: np.ndarray, factor: int) -> np.ndarray:
+    arr = np.asarray(values, dtype=bool)
+    factor = max(2, int(factor))
+    usable = (arr.size // factor) * factor
+    if usable <= 0:
+        raise ValueError(
+            f"Rolling-average downsampling factor {factor} is larger than the available mask length {arr.size}."
+        )
+    return np.any(arr[:usable].reshape(-1, factor), axis=1)
+
+
+def _downsample_optional_numeric(values: Optional[np.ndarray], factor: int) -> Optional[np.ndarray]:
+    if values is None:
+        return None
+    return _rolling_block_mean_1d(np.asarray(values, dtype=float), factor)
+
+
+def _downsample_optional_bool(values: Optional[np.ndarray], factor: int) -> Optional[np.ndarray]:
+    if values is None:
+        return None
+    return _rolling_block_any_1d(np.asarray(values, dtype=bool), factor)
+
+
+def _downsample_filter_traces(filter_traces: Dict[str, np.ndarray], factor: int) -> None:
+    for key, values in list(filter_traces.items()):
+        filter_traces[key] = _rolling_block_mean_1d(np.asarray(values, dtype=float), factor)
+
+
+def _downsample_pipeline_state(
+    state: Dict[str, Any],
+    factor: int,
+    filter_traces: Dict[str, np.ndarray],
+) -> None:
+    state["time"] = _rolling_block_mean_1d(np.asarray(state["time"], dtype=float), factor)
+    state["raw"] = _rolling_block_mean_1d(np.asarray(state["raw"], dtype=float), factor)
+    state["corrected_source"] = _rolling_block_mean_1d(
+        np.asarray(state["corrected_source"], dtype=float),
+        factor,
+    )
+    state["signal"] = _rolling_block_mean_1d(np.asarray(state["signal"], dtype=float), factor)
+    state["sampling_rate_hz"] = float(state["sampling_rate_hz"]) / float(factor)
+    state["artifact_mask"] = _downsample_optional_bool(state.get("artifact_mask"), factor)
+    state["baseline"] = _downsample_optional_numeric(state.get("baseline"), factor)
+    state["plateau_mask"] = _downsample_optional_bool(state.get("plateau_mask"), factor)
+    side_numeric = state.get("side_numeric")
+    if isinstance(side_numeric, dict):
+        for key, values in list(side_numeric.items()):
+            side_numeric[key] = _rolling_block_mean_1d(np.asarray(values, dtype=float), factor)
+    side_bool = state.get("side_bool")
+    if isinstance(side_bool, dict):
+        for key, values in list(side_bool.items()):
+            side_bool[key] = _rolling_block_any_1d(np.asarray(values, dtype=bool), factor)
+    _downsample_filter_traces(filter_traces, factor)
+
+
+def _apply_pipeline_transform_steps(
+    state: Dict[str, Any],
+    steps: List[str],
+    params: DetectionParams,
+    filter_traces: Dict[str, np.ndarray],
+) -> None:
+    current = np.asarray(state["signal"], dtype=float).copy()
+    sampling_rate_hz = float(state["sampling_rate_hz"])
+    for step_id in steps:
+        if step_id == "highpass_filter":
+            current = _butterworth_highpass(
+                current,
+                fs=sampling_rate_hz,
+                cutoff_hz=float(getattr(params, "highpass_cutoff_hz", 1.0)),
+                order=int(getattr(params, "highpass_order", 3)),
+            )
+            filter_traces["highpass_filter"] = current.copy()
+        elif step_id == "lowpass_filter":
+            current = _butterworth_lowpass(
+                current,
+                fs=sampling_rate_hz,
+                cutoff_hz=float(getattr(params, "lowpass_cutoff_hz", 50.0)),
+                order=int(getattr(params, "lowpass_order", 5)),
+            )
+            filter_traces["lowpass_filter"] = current.copy()
+        elif step_id == _DOWNSAMPLE_STEP_ID:
+            state["signal"] = current
+            _downsample_pipeline_state(state, _rolling_downsample_factor(params), filter_traces)
+            current = np.asarray(state["signal"], dtype=float).copy()
+            sampling_rate_hz = float(state["sampling_rate_hz"])
+    state["signal"] = current
+
+
+def _apply_pipeline_filter_steps(
+    signal: np.ndarray,
+    steps: List[str],
+    params: DetectionParams,
+    sampling_rate_hz: float,
+) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+    current = np.asarray(signal, dtype=float).copy()
+    traces: Dict[str, np.ndarray] = {}
+    for step_id in steps:
+        if step_id == "highpass_filter":
+            current = _butterworth_highpass(
+                current,
+                fs=sampling_rate_hz,
+                cutoff_hz=float(getattr(params, "highpass_cutoff_hz", 1.0)),
+                order=int(getattr(params, "highpass_order", 3)),
+            )
+            traces["highpass_filter"] = current.copy()
+        elif step_id == "lowpass_filter":
+            current = _butterworth_lowpass(
+                current,
+                fs=sampling_rate_hz,
+                cutoff_hz=float(getattr(params, "lowpass_cutoff_hz", 50.0)),
+                order=int(getattr(params, "lowpass_order", 5)),
+            )
+            traces["lowpass_filter"] = current.copy()
+    return current, traces
+
+
+def _analysis_gonzalez_denoise_kwargs(params: DetectionParams) -> Dict[str, object]:
     return {
         "threshold_sd": float(params.gonzalez_threshold_sd),
         "max_clusters": int(params.gonzalez_max_clusters),
@@ -3758,25 +4327,7 @@ def _analysis_low_state_kwargs(params: DetectionParams) -> Dict[str, object]:
         "attenuation_max": float(params.gonzalez_attenuation_max),
         "enable_noise_cluster_rejection": bool(params.gonzalez_enable_noise_cluster_rejection),
         "enable_event_template_rejection": bool(params.gonzalez_enable_event_template_rejection),
-        "enable_low_state_safety_gate": bool(params.enable_low_state_safety_gate),
-        "min_event_peak_preservation": float(params.min_event_peak_preservation),
-        "min_local_max_ratio": float(params.min_local_max_ratio),
-        "min_reliable_low_state_fraction": float(params.min_reliable_low_state_fraction),
-        "min_reliable_low_state_samples": int(params.min_reliable_low_state_samples),
-        "plateau_tv_min_duration_ms": float(params.plateau_tv_min_duration_ms),
-        "plateau_tv_max_weight_factor": float(params.plateau_tv_max_weight_factor),
-    }
-
-
-def _analysis_gonzalez_cwt_debug_kwargs(params: DetectionParams) -> Dict[str, object]:
-    return {
-        "threshold_sd": float(params.gonzalez_threshold_sd),
-        "max_clusters": int(params.gonzalez_max_clusters),
-        "attenuation_min": float(params.gonzalez_attenuation_min),
-        "attenuation_max": float(params.gonzalez_attenuation_max),
-        "enable_noise_cluster_rejection": bool(params.gonzalez_enable_noise_cluster_rejection),
-        "enable_event_template_rejection": bool(params.gonzalez_enable_event_template_rejection),
-        "enable_low_state_safety_gate": bool(params.enable_low_state_safety_gate),
+        "enable_denoise_safety_gate": bool(params.enable_denoise_safety_gate),
         "min_event_peak_preservation": float(params.min_event_peak_preservation),
         "min_local_max_ratio": float(params.min_local_max_ratio),
     }
@@ -3784,83 +4335,262 @@ def _analysis_gonzalez_cwt_debug_kwargs(params: DetectionParams) -> Dict[str, ob
 
 def analyze_trace_data(
     request: TraceAnalysisRequest,
-    legacy_denoise_fn: Callable[..., np.ndarray] = denoise_hybrid_fluorescence_trace,
 ) -> TraceAnalysisResult:
-    """Run artifact interpolation, plateau detection, denoising, and spike detection for one trace."""
+    """Run optional artifact interpolation, plateau detection, denoising, and spike detection for one trace."""
     time = np.asarray(request.time, dtype=float)
+    raw = np.asarray(request.raw, dtype=float)
     corrected_source = np.asarray(request.corrected_source, dtype=float)
+    n = min(time.size, raw.size, corrected_source.size)
+    time = time[:n]
+    raw = raw[:n]
+    corrected_source = corrected_source[:n]
+    pipeline_config = _pipeline_config_from_payload(request.pipeline_config)
+    transform_pipeline_mode = _pipeline_uses_transform_steps(pipeline_config)
+    analysis_params = _clone_detection_params(request.detection_params)
+    # Ordered pipeline filters are applied explicitly here. Disable the legacy
+    # detector-side preprocessing flags so a filter is not applied twice.
+    analysis_params.use_highpass_filter = False
+    analysis_params.use_lowpass_filter = False
     sampling_rate_hz = (
         float(request.sampling_rate_hz)
         if np.isfinite(request.sampling_rate_hz) and float(request.sampling_rate_hz) > 0.0
         else _sampling_rate_hz(time)
     )
-    corrected, artifact_mask = apply_artifact_interpolation(
-        time,
-        corrected_source,
-        params=request.artifact_params.to_dict(),
+    filter_traces: Dict[str, np.ndarray] = {}
+    working_state: Dict[str, Any] = {
+        "time": time.copy(),
+        "raw": raw.copy(),
+        "corrected_source": corrected_source.copy(),
+        "signal": corrected_source.copy(),
+        "sampling_rate_hz": sampling_rate_hz,
+        "artifact_mask": None,
+        "baseline": None,
+        "plateau_mask": None,
+        "side_numeric": {},
+        "side_bool": {},
+    }
+    downsampled_before_artifact = False
+    if _pipeline_step_enabled(pipeline_config, "artifact_cleanup"):
+        pre_artifact_downsample = [
+            step_id
+            for step_id in _pipeline_transform_steps_between(pipeline_config, None, "artifact_cleanup")
+            if step_id == _DOWNSAMPLE_STEP_ID
+        ]
+        if pre_artifact_downsample:
+            _apply_pipeline_transform_steps(
+                working_state,
+                pre_artifact_downsample,
+                request.detection_params,
+                filter_traces,
+            )
+            downsampled_before_artifact = True
+    if _pipeline_step_enabled(pipeline_config, "artifact_cleanup"):
+        corrected, artifact_mask = apply_artifact_interpolation(
+            np.asarray(working_state["time"], dtype=float),
+            np.asarray(working_state["signal"], dtype=float),
+            params=request.artifact_params.to_dict(),
+        )
+    else:
+        corrected = np.asarray(working_state["signal"], dtype=float).copy()
+        artifact_mask = np.zeros(corrected.size, dtype=bool)
+    working_state["signal"] = corrected
+    working_state["artifact_mask"] = np.asarray(artifact_mask, dtype=bool)
+    pre_baseline_steps = (
+        _pipeline_transform_steps_between(pipeline_config, None, "baseline_correction")
+        if transform_pipeline_mode
+        else _legacy_filter_steps(request.detection_params)
+    )
+    if downsampled_before_artifact:
+        pre_baseline_steps = [step_id for step_id in pre_baseline_steps if step_id != _DOWNSAMPLE_STEP_ID]
+    _apply_pipeline_transform_steps(
+        working_state,
+        pre_baseline_steps,
+        request.detection_params,
+        filter_traces,
     )
 
     baseline_result = detect_spikes(
         request.trace_name,
-        time,
-        corrected,
-        request.detection_params,
-        artifact_mask=artifact_mask,
-        sampling_rate_hz=sampling_rate_hz,
+        np.asarray(working_state["time"], dtype=float),
+        np.asarray(working_state["signal"], dtype=float),
+        analysis_params,
+        artifact_mask=np.asarray(working_state["artifact_mask"], dtype=bool),
+        sampling_rate_hz=float(working_state["sampling_rate_hz"]),
     )
     baseline = np.asarray(baseline_result.baseline, dtype=float)
     computation_source = np.asarray(baseline_result.processed_signal, dtype=float)
     plateau_mask = _detection_mask(baseline_result, "long_plateau_mask")
-    low_state_denoiser = str(request.detection_params.low_state_denoiser or "gonzalez_full_trace")
+    denoising_method = str(analysis_params.denoising_method or "gonzalez_full_trace")
     corrected_baseline_corrected = computation_source - baseline
+    working_state["signal"] = corrected_baseline_corrected
+    working_state["baseline"] = baseline
+    working_state["plateau_mask"] = plateau_mask
+    working_state["side_numeric"] = {"corrected_for_result": corrected_baseline_corrected.copy()}
+    working_state["side_bool"] = {}
+    denoising_enabled = (
+        _pipeline_step_enabled(pipeline_config, "denoising")
+        if transform_pipeline_mode
+        else denoising_method != "none"
+    )
+    if not denoising_enabled:
+        denoising_method = "none"
+    if denoising_enabled:
+        pre_denoise_steps = (
+            _pipeline_transform_steps_between(pipeline_config, "baseline_correction", "denoising")
+            if transform_pipeline_mode
+            else []
+        )
+        post_denoise_steps = (
+            _pipeline_transform_steps_between(pipeline_config, "denoising", "spike_detection")
+            if transform_pipeline_mode
+            else []
+        )
+    else:
+        pre_denoise_steps = []
+        post_denoise_steps = (
+            _pipeline_transform_steps_between(pipeline_config, "baseline_correction", "spike_detection")
+            if transform_pipeline_mode
+            else []
+        )
+    _apply_pipeline_transform_steps(
+        working_state,
+        pre_denoise_steps,
+        request.detection_params,
+        filter_traces,
+    )
+    denoise_input = np.asarray(working_state["signal"], dtype=float)
+    corrected_for_result = np.asarray(
+        working_state.get("side_numeric", {}).get("corrected_for_result", denoise_input),
+        dtype=float,
+    )
+    baseline = np.asarray(working_state["baseline"], dtype=float)
+    plateau_mask = np.asarray(working_state["plateau_mask"], dtype=bool)
+    sampling_rate_hz = float(working_state["sampling_rate_hz"])
     # Denoising is used as a detection aid. The returned corrected trace below
     # remains the preferred source for quantitative amplitude, width, area,
     # plateau level, and export summary measurements.
-    denoised_baseline_corrected = np.asarray(
-        denoise_trace_state_guided_low_plateau_tv(
-            corrected_baseline_corrected,
-            fs=sampling_rate_hz,
-            plateau_mask=plateau_mask,
-            plateau_tv_weight=float(request.detection_params.plateau_tv_weight),
-            boundary_protect_ms=float(request.detection_params.low_state_boundary_protect_ms),
-            low_state_denoiser=low_state_denoiser,
-            low_state_denoise_fn=legacy_denoise_fn if low_state_denoiser == "legacy_hybrid" else None,
-            normalization_baseline=baseline,
-            **_analysis_low_state_kwargs(request.detection_params),
-        ),
-        dtype=float,
-    )
-    gonzalez_cwt_debug = dict(
-        denoise_gonzalez_adaptive_wavelet(
-            corrected_baseline_corrected,
-            fs=sampling_rate_hz,
-            input_mode="corrected",
-            return_debug=True,
-            **_analysis_gonzalez_cwt_debug_kwargs(request.detection_params),
+    if denoising_method == "none":
+        gonzalez_cwt_debug = dict(
+            denoise_trace_gonzalez_full_trace(
+                denoise_input,
+                fs=sampling_rate_hz,
+                denoising_method="none",
+                return_debug=True,
+            )
         )
-    )
+        denoised_baseline_corrected = np.asarray(gonzalez_cwt_debug.get("output", denoise_input), dtype=float)
+    else:
+        denoise_debug_payload = denoise_trace_gonzalez_full_trace(
+            denoise_input,
+            fs=sampling_rate_hz,
+            denoising_method=denoising_method,
+            normalization_baseline=baseline,
+            return_debug=True,
+            **_analysis_gonzalez_denoise_kwargs(analysis_params),
+        )
+        if isinstance(denoise_debug_payload, dict):
+            denoised_baseline_corrected = np.asarray(
+                denoise_debug_payload.get("output", denoise_input),
+                dtype=float,
+            )
+            core_debug = denoise_debug_payload.get("gonzalez_debug")
+            gonzalez_cwt_debug = dict(core_debug) if isinstance(core_debug, dict) else dict(denoise_debug_payload)
+        else:
+            denoised_baseline_corrected = np.asarray(denoise_debug_payload, dtype=float)
+            gonzalez_cwt_debug = {
+                "denoiser_used": denoising_method,
+                "output": denoised_baseline_corrected.copy(),
+            }
+        if "denoiser_used" not in gonzalez_cwt_debug:
+            gonzalez_cwt_debug["denoiser_used"] = denoising_method
+        if "output" not in gonzalez_cwt_debug:
+            gonzalez_cwt_debug["output"] = denoised_baseline_corrected.copy()
     gonzalez_cwt_debug["wrapper_output"] = denoised_baseline_corrected.copy()
     raw_gonzalez_output = np.asarray(gonzalez_cwt_debug.get("output", denoised_baseline_corrected), dtype=float)
     if raw_gonzalez_output.shape == denoised_baseline_corrected.shape:
         gonzalez_cwt_debug["wrapper_correction_component"] = denoised_baseline_corrected - raw_gonzalez_output
-    gonzalez_cwt_debug["wrapper_output_mode"] = low_state_denoiser
-    detection = detect_spikes(
-        request.trace_name,
-        time,
-        denoised_baseline_corrected,
+    gonzalez_cwt_debug["wrapper_output_mode"] = denoising_method
+    gonzalez_cwt_debug["wrapper_input_normalization"] = _denoising_input_normalization_label(denoising_method)
+    side_numeric: Dict[str, np.ndarray] = {
+        "corrected_for_result": corrected_for_result,
+        "denoise_input": denoise_input,
+        "hybrid_denoised": denoised_baseline_corrected,
+    }
+    if raw_gonzalez_output.shape == denoised_baseline_corrected.shape:
+        side_numeric["gonzalez_output"] = raw_gonzalez_output
+    working_state["signal"] = denoised_baseline_corrected
+    working_state["side_numeric"] = side_numeric
+    working_state["side_bool"] = {}
+    _apply_pipeline_transform_steps(
+        working_state,
+        post_denoise_steps,
         request.detection_params,
-        artifact_mask=artifact_mask,
-        baseline_override=np.zeros_like(baseline),
-        plateau_mask_override=plateau_mask,
-        sampling_rate_hz=sampling_rate_hz,
-        short_plateau_trace_override=corrected_baseline_corrected,
+        filter_traces,
     )
-    detection.qc_plot_data["highpass_signal"] = np.asarray(
-        baseline_result.qc_plot_data.get("highpass_signal", np.zeros_like(corrected)),
+    detection_source = np.asarray(working_state["signal"], dtype=float)
+    side_numeric = working_state.get("side_numeric", {})
+    denoise_input = np.asarray(side_numeric.get("denoise_input", denoise_input), dtype=float)
+    denoised_baseline_corrected = np.asarray(
+        side_numeric.get("hybrid_denoised", denoised_baseline_corrected),
         dtype=float,
     )
+    corrected_for_result = np.asarray(
+        side_numeric.get("corrected_for_result", corrected_for_result),
+        dtype=float,
+    )
+    if "gonzalez_output" in side_numeric:
+        gonzalez_output = np.asarray(side_numeric["gonzalez_output"], dtype=float)
+        gonzalez_cwt_debug["output"] = gonzalez_output.copy()
+        if gonzalez_output.shape == denoised_baseline_corrected.shape:
+            gonzalez_cwt_debug["wrapper_correction_component"] = denoised_baseline_corrected - gonzalez_output
+    gonzalez_cwt_debug["wrapper_output"] = denoised_baseline_corrected.copy()
+    sampling_rate_hz = float(working_state["sampling_rate_hz"])
+    artifact_mask = np.asarray(working_state["artifact_mask"], dtype=bool)
+    plateau_mask = np.asarray(working_state["plateau_mask"], dtype=bool)
+    detection = detect_spikes(
+        request.trace_name,
+        np.asarray(working_state["time"], dtype=float),
+        detection_source,
+        analysis_params,
+        artifact_mask=artifact_mask,
+        baseline_override=np.zeros_like(detection_source),
+        plateau_mask_override=plateau_mask,
+        sampling_rate_hz=sampling_rate_hz,
+        short_plateau_trace_override=denoise_input,
+    )
+    highpass_trace = filter_traces.get("highpass_filter")
+    lowpass_trace = filter_traces.get("lowpass_filter")
+    detection.qc_plot_data["highpass_signal"] = (
+        np.asarray(highpass_trace, dtype=float) if highpass_trace is not None else np.zeros_like(detection_source)
+    )
+    detection.qc_plot_data["lowpass_signal"] = (
+        np.asarray(lowpass_trace, dtype=float) if lowpass_trace is not None else np.zeros_like(detection_source)
+    )
+    final_plateau_mask = _detection_mask(detection, "baseline_mask")
+    long_plateau_mask = _detection_mask(detection, "long_plateau_mask")
+    short_plateau_mask = _detection_mask(detection, "short_plateau_mask", fallback_key="")
+    burst_plateau_mask = _detection_mask(detection, "burst_plateau_mask", fallback_key="")
+    local_noise = np.asarray(
+        detection.qc_plot_data.get("local_noise_estimate", np.zeros_like(denoise_input)),
+        dtype=float,
+    )
+    plateau_signal_classification = classify_plateau_signals(
+        denoise_input,
+        denoised_baseline_corrected,
+        final_plateau_mask,
+        sampling_rate_hz=sampling_rate_hz,
+        long_plateau_mask=long_plateau_mask,
+        short_plateau_mask=short_plateau_mask,
+        burst_plateau_mask=burst_plateau_mask,
+        local_noise=local_noise,
+        denoising_enabled=denoising_method != "none" and denoising_enabled,
+    )
+    detection.qc_plot_data["plateau_signal_classification_rows"] = list(plateau_signal_classification)
     return TraceAnalysisResult(
-        corrected=corrected_baseline_corrected,
+        time=np.asarray(working_state["time"], dtype=float),
+        raw=np.asarray(working_state["raw"], dtype=float),
+        corrected_source=np.asarray(working_state["corrected_source"], dtype=float),
+        corrected=corrected_for_result,
         hybrid_denoised=denoised_baseline_corrected,
         gonzalez_cwt_debug=gonzalez_cwt_debug,
         long_plateau_debug={
@@ -3868,10 +4598,13 @@ def analyze_trace_data(
             for key, value in baseline_result.qc_plot_data.items()
             if str(key).startswith("long_plateau_")
         },
-        correction_baseline=baseline,
+        plateau_signal_classification=plateau_signal_classification,
+        correction_baseline=np.asarray(working_state["baseline"], dtype=float),
         detection=detection,
         artifact_mask=np.asarray(artifact_mask, dtype=bool),
         sampling_rate_hz=sampling_rate_hz,
+        highpass_trace=None if highpass_trace is None else np.asarray(highpass_trace, dtype=float),
+        lowpass_trace=None if lowpass_trace is None else np.asarray(lowpass_trace, dtype=float),
     )
 
 
@@ -3898,6 +4631,10 @@ def build_pending_trace_states(
             corrected=corrected_source.copy(),
             time=time,
             sampling_rate_hz=float(sampling_rate_map.get(trace_name, _sampling_rate_hz(time))),
+            original_time=time.copy(),
+            original_raw=raw_array.copy(),
+            original_corrected_source=corrected_source.copy(),
+            original_sampling_rate_hz=float(sampling_rate_map.get(trace_name, _sampling_rate_hz(time))),
             baseline=np.zeros_like(corrected_source, dtype=float),
             correction_baseline=None,
             artifact_mask=None,
@@ -3939,26 +4676,24 @@ class _TraceAnalysisTask(QRunnable):
     def __init__(
         self,
         request: TraceAnalysisRequest,
-        legacy_denoise_fn: Callable[..., np.ndarray],
     ) -> None:
         super().__init__()
         self.request = request
-        self.legacy_denoise_fn = legacy_denoise_fn
         self.signals = _TraceAnalysisWorkerSignals()
 
     def run(self) -> None:
         try:
-            result = analyze_trace_data(self.request, legacy_denoise_fn=self.legacy_denoise_fn)
+            result = analyze_trace_data(self.request)
             self.signals.finished.emit(self.request.trace_name, self.request.generation, result, None)
         except Exception as exc:
             self.signals.finished.emit(self.request.trace_name, self.request.generation, None, str(exc))
 
 
-class _HybridWorkerSignals(QObject):
+class _DenoiseWorkerSignals(QObject):
     finished = Signal(str, object, object, object)
 
 
-class _HybridDenoiseTask(QRunnable):
+class _GonzalezDenoiseTask(QRunnable):
     def __init__(
         self,
         trace_name: str,
@@ -3966,12 +4701,8 @@ class _HybridDenoiseTask(QRunnable):
         corrected: np.ndarray,
         fs: float,
         baseline: Optional[np.ndarray],
-        plateau_mask: Optional[np.ndarray],
-        low_state_denoiser: str,
-        low_state_kwargs: Dict[str, object],
-        plateau_tv_weight: float,
-        boundary_protect_ms: float,
-        legacy_denoise_fn: Callable[..., np.ndarray],
+        denoising_method: str,
+        denoise_kwargs: Dict[str, object],
         normalization_baseline: Optional[np.ndarray] = None,
     ) -> None:
         super().__init__()
@@ -3980,36 +4711,25 @@ class _HybridDenoiseTask(QRunnable):
         self.corrected = np.asarray(corrected, dtype=float).copy()
         self.fs = float(fs)
         self.baseline = None if baseline is None else np.asarray(baseline, dtype=float).copy()
-        self.plateau_mask = None if plateau_mask is None else np.asarray(plateau_mask, dtype=bool).copy()
-        self.low_state_denoiser = str(low_state_denoiser)
-        self.low_state_kwargs = dict(low_state_kwargs)
-        self.plateau_tv_weight = float(plateau_tv_weight)
-        self.boundary_protect_ms = float(boundary_protect_ms)
-        self.legacy_denoise_fn = legacy_denoise_fn
+        self.denoising_method = str(denoising_method)
+        self.denoise_kwargs = dict(denoise_kwargs)
         self.normalization_baseline = (
             None if normalization_baseline is None else np.asarray(normalization_baseline, dtype=float).copy()
         )
-        self.signals = _HybridWorkerSignals()
+        self.signals = _DenoiseWorkerSignals()
 
     def run(self) -> None:
         try:
             denoise_input = self.corrected
             if self.baseline is not None and self.baseline.shape == self.corrected.shape:
                 denoise_input = self.corrected - self.baseline
-            plateau_mask = self.plateau_mask
-            if plateau_mask is None or plateau_mask.shape != denoise_input.shape:
-                plateau_mask = np.zeros(denoise_input.shape, dtype=bool)
             result = np.asarray(
-                denoise_trace_state_guided_low_plateau_tv(
+                denoise_trace_gonzalez_full_trace(
                     denoise_input,
                     fs=self.fs,
-                    plateau_mask=plateau_mask,
-                    plateau_tv_weight=self.plateau_tv_weight,
-                    boundary_protect_ms=self.boundary_protect_ms,
-                    low_state_denoiser=self.low_state_denoiser,
-                    low_state_denoise_fn=self.legacy_denoise_fn if self.low_state_denoiser == "legacy_hybrid" else None,
+                    denoising_method=self.denoising_method,
                     normalization_baseline=self.normalization_baseline,
-                    **self.low_state_kwargs,
+                    **self.denoise_kwargs,
                 ),
                 dtype=float,
             )
@@ -4021,7 +4741,6 @@ class _HybridDenoiseTask(QRunnable):
 class SpikeCurationMainWindow(QMainWindow):
     def __init__(
         self,
-        hybrid_denoise_fn: Callable[..., np.ndarray] = denoise_hybrid_fluorescence_trace,
         denoise_fn: Optional[Callable[..., np.ndarray]] = None,
     ) -> None:
         super().__init__()
@@ -4035,10 +4754,12 @@ class SpikeCurationMainWindow(QMainWindow):
         self.traces: Dict[str, TraceCuration] = {}
         self.trace_names: List[str] = []
         self.current_trace_name: Optional[str] = None
+        self.current_recording_id: Optional[str] = None
         self._table_spikes: List[SpikeRecord] = []
-        self._hybrid_denoise_fn = hybrid_denoise_fn if denoise_fn is None else denoise_fn
-        self._hybrid_thread_pool = QThreadPool(self)
-        self._hybrid_tasks: List[_HybridDenoiseTask] = []
+        self._table_signature: Tuple[Tuple[str, str, str, str, str], ...] = ()
+        self._denoise_fn = denoise_fn
+        self._denoise_thread_pool = QThreadPool(self)
+        self._denoise_tasks: List[_GonzalezDenoiseTask] = []
         self._import_thread_pool = QThreadPool(self)
         self._import_thread_pool.setMaxThreadCount(1)
         self._analysis_thread_pool = QThreadPool(self)
@@ -4049,6 +4770,9 @@ class SpikeCurationMainWindow(QMainWindow):
         self._loading_excel = False
         self._pending_session: Optional[AppSession] = None
         self._pending_session_generation: Optional[int] = None
+        self.pipeline_config = PipelineConfig.from_preset("current")
+        self._seed_pipeline_from_filter_params()
+        self._last_packaged_trace_names: set[str] = set()
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -4062,8 +4786,9 @@ class SpikeCurationMainWindow(QMainWindow):
         self.btn_load_exported = QPushButton("Load Exported Result")
         self.btn_load_session = QPushButton("Load Session")
         self.btn_save_session = QPushButton("Save Session")
-        self.btn_export = QPushButton("Export All")
-        self.btn_export_png_current = QPushButton("Export Current")
+        self.btn_save_analysis_package = QPushButton("Save Analysis Package")
+        self.btn_export = QPushButton("Legacy Export All")
+        self.btn_export_png_current = QPushButton("Legacy Export Current")
         self.btn_reload_params_cfg = QPushButton("Reload Params Config")
         self.btn_rerun_current = QPushButton("Re-detect Current")
         self.btn_rerun_all = QPushButton("Re-detect All")
@@ -4073,6 +4798,7 @@ class SpikeCurationMainWindow(QMainWindow):
             self.btn_load_exported,
             self.btn_load_session,
             self.btn_save_session,
+            self.btn_save_analysis_package,
             self.btn_export,
             self.btn_export_png_current,
             self.btn_reload_params_cfg,
@@ -4090,8 +4816,16 @@ class SpikeCurationMainWindow(QMainWindow):
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
 
+        self.recording_selector = QComboBox()
+        left_layout.addWidget(QLabel("Recording"))
+        left_layout.addWidget(self.recording_selector)
+
         self.trace_list = QListWidget()
-        left_layout.addWidget(QLabel("Traces"))
+        self.trace_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.trace_list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.trace_list.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.trace_list.setAlternatingRowColors(True)
+        left_layout.addWidget(QLabel("ROIs / Trace Queue"))
         left_layout.addWidget(self.trace_list, stretch=1)
 
         nav_layout = QHBoxLayout()
@@ -4101,13 +4835,27 @@ class SpikeCurationMainWindow(QMainWindow):
         nav_layout.addWidget(self.btn_next_trace)
         left_layout.addLayout(nav_layout)
 
-        params_group = QGroupBox("Detection Params")
-        params_layout = QFormLayout(params_group)
+        run_layout = QHBoxLayout()
+        self.btn_run_current = QPushButton("Run Current")
+        self.btn_run_selected = QPushButton("Run Selected")
+        self.btn_run_all = QPushButton("Run All")
+        run_layout.addWidget(self.btn_run_current)
+        run_layout.addWidget(self.btn_run_selected)
+        run_layout.addWidget(self.btn_run_all)
+        left_layout.addLayout(run_layout)
+
+        self.trace_queue_status = QLabel("0 traces")
+        left_layout.addWidget(self.trace_queue_status)
+        left_layout.addStretch(1)
 
         self.param_detection_mode = QComboBox()
         self.param_detection_mode.addItem("MAD threshold", "mad")
         self.param_detection_mode.addItem("STD threshold", "std")
         self.param_detection_mode.addItem("SNR threshold", "snr")
+        self.param_detection_mode.addItem("Template matching", "template_matching")
+        self.param_detection_mode.setToolTip(
+            "Choose the spike detector. STD threshold is the default; Template matching uses user-selected templates."
+        )
         self.param_baseline_mode = QComboBox()
         self.param_baseline_mode.addItem("Percentile", "percentile")
         self.param_baseline_mode.addItem("Savitzky-Golay", "savgol")
@@ -4116,11 +4864,23 @@ class SpikeCurationMainWindow(QMainWindow):
         self.param_baseline_rolling_percentile = self._make_double_spin(1.0, 50.0, self.detection_params.baseline_rolling_percentile, 1.0)
         self.param_baseline_savgol_window_ms = self._make_double_spin(5.0, 5000.0, self.detection_params.baseline_savgol_window_ms, 5.0)
         self.param_baseline_savgol_polyorder = self._make_int_spin(1, 7, self.detection_params.baseline_savgol_polyorder)
-        self.param_use_highpass_filter = QCheckBox("Enable high-pass preprocessing")
-        self.param_use_highpass_filter.setChecked(bool(self.detection_params.use_highpass_filter))
         self.param_highpass_cutoff_hz = self._make_double_spin(0.001, 1000.0, self.detection_params.highpass_cutoff_hz, 0.1)
         self.param_highpass_order = self._make_int_spin(1, 10, self.detection_params.highpass_order)
+        self.param_lowpass_cutoff_hz = self._make_double_spin(0.001, 1000.0, self.detection_params.lowpass_cutoff_hz, 0.1)
+        self.param_lowpass_order = self._make_int_spin(1, 10, self.detection_params.lowpass_order)
+        self.param_rolling_downsample_factor = self._make_int_spin(
+            2,
+            100,
+            int(self.detection_params.rolling_downsample_factor),
+        )
         self.param_plateau_median_window_ms = self._make_double_spin(5.0, 500.0, self.detection_params.plateau_median_window_ms, 1.0)
+        self.param_long_plateau_drift_window_ms = self._make_double_spin(50.0, 60000.0, self.detection_params.long_plateau_drift_window_ms, 50.0)
+        self.param_long_plateau_drift_percentile = self._make_double_spin(1.0, 50.0, self.detection_params.long_plateau_drift_percentile, 1.0)
+        self.param_long_plateau_entry_noise_k = self._make_double_spin(0.0, 50.0, self.detection_params.long_plateau_entry_noise_k, 0.1)
+        self.param_long_plateau_exit_noise_k = self._make_double_spin(0.0, 50.0, self.detection_params.long_plateau_exit_noise_k, 0.1)
+        self.param_long_plateau_exit_fraction = self._make_double_spin(0.0, 1.0, self.detection_params.long_plateau_exit_fraction, 0.05)
+        self.param_long_plateau_enter_sustain_ms = self._make_double_spin(1.0, 5000.0, self.detection_params.long_plateau_enter_sustain_ms, 1.0)
+        self.param_long_plateau_exit_sustain_ms = self._make_double_spin(1.0, 5000.0, self.detection_params.long_plateau_exit_sustain_ms, 1.0)
         self.param_short_plateau_step_noise_k = self._make_double_spin(0.0, 20.0, self.detection_params.short_plateau_step_noise_k, 0.1)
         self.param_short_plateau_elevated_noise_k = self._make_double_spin(0.0, 20.0, self.detection_params.short_plateau_elevated_noise_k, 0.1)
         self.param_short_plateau_survival_noise_k = self._make_double_spin(0.0, 20.0, self.detection_params.short_plateau_survival_noise_k, 0.1)
@@ -4133,92 +4893,142 @@ class SpikeCurationMainWindow(QMainWindow):
         self.param_short_plateau_min_support_ms = self._make_double_spin(1.0, 500.0, self.detection_params.short_plateau_min_support_ms, 1.0)
         self.param_short_plateau_min_duration_ms = self._make_double_spin(1.0, 1000.0, self.detection_params.short_plateau_min_duration_ms, 1.0)
         self.param_spike_noise_k = self._make_double_spin(0.1, 100.0, self.detection_params.spike_noise_k, 0.1)
+        self.param_spike_noise_k.setToolTip(
+            "Noise multiplier for MAD/STD/SNR threshold detection. Default is 7x for conservative STD detection."
+        )
         self.param_spike_prominence_k = self._make_double_spin(0.0, 100.0, self.detection_params.spike_prominence_k, 0.1)
+        self.param_spike_prominence_k.setToolTip(
+            "Prominence multiplier used with threshold detectors to reject small local bumps."
+        )
+        self.param_template_matching_enable_autopick = QCheckBox("Enable safe auto-pick")
+        self.param_template_matching_enable_autopick.setChecked(
+            bool(self.detection_params.template_matching_enable_autopick)
+        )
+        self.param_template_matching_enable_autopick.setToolTip(
+            "Allow template matching to seed templates from STD detection at 12x noise. "
+            "When off, only user-provided or accepted/manual templates are used."
+        )
+        self.param_template_matching_template_indices = QLineEdit()
+        self.param_template_matching_template_indices.setPlaceholderText("e.g. 253, 523, 843")
+        self.param_template_matching_template_indices.setToolTip(
+            "Comma-separated peak sample indices chosen by the user. "
+            "If blank, accepted/manual spikes already saved on this trace are used when re-running."
+        )
+        self.param_template_matching_pre_ms = self._make_double_spin(0.1, 100.0, self.detection_params.template_matching_pre_ms, 0.5)
+        self.param_template_matching_post_ms = self._make_double_spin(0.1, 100.0, self.detection_params.template_matching_post_ms, 0.5)
+        self.param_template_matching_filter_cutoff_hz = self._make_double_spin(0.001, 1000.0, self.detection_params.template_matching_filter_cutoff_hz, 0.5)
+        self.param_template_matching_false_positive_rate = self._make_double_spin(0.000001, 0.5, self.detection_params.template_matching_false_positive_rate, 0.005)
+        self.param_template_matching_pre_ms.setToolTip("Milliseconds before each selected peak included in the template window.")
+        self.param_template_matching_post_ms.setToolTip("Milliseconds after each selected peak included in the template window.")
+        self.param_template_matching_filter_cutoff_hz.setToolTip(
+            "Second-order high-pass cutoff used before Evans-style template matching. Default is 20 Hz."
+        )
+        self.param_template_matching_false_positive_rate.setToolTip(
+            "Total desired false-positive rate; internally divided across template-length pieces."
+        )
         self.param_min_separation_ms = self._make_double_spin(1.0, 1000.0, self.detection_params.min_separation_ms, 1.0)
         self.param_spike_zoom_half_window_ms = self._make_double_spin(0.5, 500.0, self.detection_params.spike_zoom_half_window_ms, 0.5)
-
-        params_layout.addRow("detection_mode", self.param_detection_mode)
-        params_layout.addRow("startup_exclusion_ms", self.param_startup_exclusion_ms)
-        params_layout.addRow("baseline_mode", self.param_baseline_mode)
-        params_layout.addRow("baseline_rolling_window_ms", self.param_baseline_rolling_window_ms)
-        params_layout.addRow("baseline_rolling_percentile", self.param_baseline_rolling_percentile)
-        params_layout.addRow("baseline_savgol_window_ms", self.param_baseline_savgol_window_ms)
-        params_layout.addRow("baseline_savgol_polyorder", self.param_baseline_savgol_polyorder)
-        params_layout.addRow(self.param_use_highpass_filter)
-        params_layout.addRow("highpass_cutoff_hz", self.param_highpass_cutoff_hz)
-        params_layout.addRow("highpass_order", self.param_highpass_order)
-        params_layout.addRow("plateau_median_window_ms", self.param_plateau_median_window_ms)
-        params_layout.addRow("short_step_noise_k", self.param_short_plateau_step_noise_k)
-        params_layout.addRow("short_elevated_noise_k", self.param_short_plateau_elevated_noise_k)
-        params_layout.addRow("short_survival_noise_k", self.param_short_plateau_survival_noise_k)
-        params_layout.addRow("short_loss_noise_k", self.param_short_plateau_loss_noise_k)
-        params_layout.addRow("short_median_noise_k", self.param_short_plateau_median_noise_k)
-        params_layout.addRow("short_pre_quiet_noise_k", self.param_short_plateau_pre_quiet_noise_k)
-        params_layout.addRow("short_min_support_fraction", self.param_short_plateau_min_support_fraction)
-        params_layout.addRow("short_min_confidence", self.param_short_plateau_min_confidence)
-        params_layout.addRow("short_early_dwell_ms", self.param_short_plateau_early_dwell_ms)
-        params_layout.addRow("short_min_support_ms", self.param_short_plateau_min_support_ms)
-        params_layout.addRow("short_min_duration_ms", self.param_short_plateau_min_duration_ms)
-        params_layout.addRow("spike_threshold_k", self.param_spike_noise_k)
-        params_layout.addRow("spike_prominence_k", self.param_spike_prominence_k)
-        params_layout.addRow("min_separation_ms", self.param_min_separation_ms)
-        params_layout.addRow("spike_zoom_half_window_ms", self.param_spike_zoom_half_window_ms)
-        left_layout.addWidget(params_group)
-
-        artifact_group = QGroupBox("Artifact Params")
-        artifact_layout = QFormLayout(artifact_group)
+        self.param_min_separation_ms.setToolTip("Minimum separation between accepted spike candidates.")
+        self.param_spike_zoom_half_window_ms.setToolTip("Half-width used for spike zoom plots and FWHM measurement.")
 
         self.param_artifact_abs_low = self._make_double_spin(0.0, 100000.0, self.artifact_params.absolute_low, 1.0)
         self.param_artifact_min_depth = self._make_double_spin(0.0, 100000.0, self.artifact_params.min_depth, 0.5)
         self.param_artifact_drop_start = self._make_double_spin(0.0, 100000.0, self.artifact_params.drop_start_abs, 0.5)
 
-        artifact_layout.addRow("Low Max", self.param_artifact_abs_low)
-        artifact_layout.addRow("Min Depth", self.param_artifact_min_depth)
-        artifact_layout.addRow("Drop Start", self.param_artifact_drop_start)
-        left_layout.addWidget(artifact_group)
-
-        overlay_group = QGroupBox("Signal Overlays")
-        overlay_layout = QFormLayout(overlay_group)
-
         self.chk_show_raw = QCheckBox("Show raw")
         self.chk_show_corrected = QCheckBox("Show corrected")
         self.chk_show_baseline = QCheckBox("Show baseline")
         self.chk_show_highpass = QCheckBox("Show high-pass")
-        self.chk_show_hybrid_denoised = QCheckBox("Show Gonzalez full-trace denoised")
+        self.chk_show_lowpass = QCheckBox("Show low-pass")
+        self.chk_show_hybrid_denoised = QCheckBox("Show Gonzalez denoised")
+        self.chk_show_normalized_denoised = QCheckBox("Show denoised % dF/F0")
+        self.chk_show_denoise_residual = QCheckBox("Show denoise residual")
+        self.display_units_combo = QComboBox()
+        self.display_units_combo.addItem("Native", NORMALIZATION_NATIVE)
+        self.display_render_source_combo = QComboBox()
+        for label, value in DISPLAY_RENDER_SOURCE_ITEMS:
+            self.display_render_source_combo.addItem(label, value)
+        self.display_units_combo.addItem("% ΔF/F0", NORMALIZATION_PERCENT_DFF)
+        self.display_units_combo.setToolTip("Choose whether the trace plot uses native units or percent dF/F0.")
+        self.display_render_source_combo.setToolTip("Choose which signal is drawn by the selected overlay line.")
+        self.chk_show_hybrid_denoised.setToolTip("Show or hide the signal chosen in the selected overlay menu.")
+        self.chk_show_normalized_denoised.setToolTip("Show the denoised trace as a percent dF/F0 overlay.")
+        self.chk_show_denoise_residual.setToolTip("Show corrected minus denoised signal as a residual overlay.")
 
         self.chk_show_raw.setChecked(True)
         self.chk_show_corrected.setChecked(True)
         self.chk_show_baseline.setChecked(True)
         self.chk_show_highpass.setChecked(False)
-        self.chk_show_hybrid_denoised.setChecked(False)
+        self.chk_show_lowpass.setChecked(False)
+        self.chk_show_hybrid_denoised.setChecked(True)
+        self.chk_show_normalized_denoised.setChecked(True)
+        self.chk_show_denoise_residual.setChecked(False)
 
+        self.overlay_controls_group = QGroupBox("Signal Overlays")
+        overlay_layout = QFormLayout(self.overlay_controls_group)
+        overlay_layout.addRow("Units", self.display_units_combo)
+        overlay_layout.addRow("Overlay", self.display_render_source_combo)
         overlay_layout.addRow(self.chk_show_raw)
         overlay_layout.addRow(self.chk_show_corrected)
         overlay_layout.addRow(self.chk_show_baseline)
         overlay_layout.addRow(self.chk_show_highpass)
+        overlay_layout.addRow(self.chk_show_lowpass)
         overlay_layout.addRow(self.chk_show_hybrid_denoised)
-        left_layout.addWidget(overlay_group)
+        overlay_layout.addRow(self.chk_show_normalized_denoised)
+        overlay_layout.addRow(self.chk_show_denoise_residual)
+        left_layout.addWidget(self.overlay_controls_group)
 
-        denoise_group = QGroupBox("Denoising")
-        denoise_layout = QFormLayout(denoise_group)
-        self.param_low_state_denoiser = QComboBox()
-        self.param_low_state_denoiser.addItem("Gonzalez adaptive wavelet", "gonzalez_adaptive_wavelet")
-        self.param_low_state_denoiser.addItem("Gonzalez full trace (no plateau mask)", "gonzalez_full_trace")
-        self.param_low_state_denoiser.addItem("Gonzalez full trace dF/F0", "gonzalez_full_trace_dff")
-        self.param_low_state_denoiser.addItem("Legacy Hybrid", "legacy_hybrid")
-        self.param_low_state_denoiser.addItem("No low-state denoising", "none")
-        low_state_index = self.param_low_state_denoiser.findData(str(self.detection_params.low_state_denoiser))
-        self.param_low_state_denoiser.setCurrentIndex(max(0, low_state_index))
+        self.pipeline_display_units_combo = QComboBox()
+        self.pipeline_display_units_combo.addItem("Native", NORMALIZATION_NATIVE)
+        self.pipeline_display_units_combo.addItem("% ΔF/F0", NORMALIZATION_PERCENT_DFF)
+        self.pipeline_display_render_source_combo = QComboBox()
+        for label, value in DISPLAY_RENDER_SOURCE_ITEMS:
+            self.pipeline_display_render_source_combo.addItem(label, value)
+        self.pipeline_chk_show_raw = QCheckBox("Show raw")
+        self.pipeline_chk_show_corrected = QCheckBox("Show corrected")
+        self.pipeline_chk_show_baseline = QCheckBox("Show baseline")
+        self.pipeline_chk_show_highpass = QCheckBox("Show high-pass")
+        self.pipeline_chk_show_lowpass = QCheckBox("Show low-pass")
+        self.pipeline_chk_show_hybrid_denoised = QCheckBox("Show selected overlay")
+        self.pipeline_chk_show_normalized_denoised = QCheckBox("Show denoised % dF/F0")
+        self.pipeline_chk_show_denoise_residual = QCheckBox("Show denoise residual")
+        self.pipeline_display_units_combo.setToolTip(self.display_units_combo.toolTip())
+        self.pipeline_display_render_source_combo.setToolTip(self.display_render_source_combo.toolTip())
+        self.pipeline_chk_show_hybrid_denoised.setToolTip(self.chk_show_hybrid_denoised.toolTip())
+        self.pipeline_chk_show_normalized_denoised.setToolTip(self.chk_show_normalized_denoised.toolTip())
+        self.pipeline_chk_show_denoise_residual.setToolTip(self.chk_show_denoise_residual.toolTip())
+        self._sync_pipeline_overlay_controls_from_main()
+
+        self.param_denoising_method = QComboBox()
+        self.param_denoising_method.addItem("On (corrected trace)", "gonzalez_full_trace")
+        self.param_denoising_method.addItem("On (dF/F0 input)", "gonzalez_full_trace_dff")
+        self.param_denoising_method.addItem("S7 reproduction (dF/F0)", "gonzalez_s7_dff")
+        self.param_denoising_method.addItem("Off", "none")
+        self.param_denoising_method.setToolTip(
+            "Enable denoising and choose the input units for the single Gonzalez denoiser."
+        )
+        denoising_method_index = self.param_denoising_method.findData(str(self.detection_params.denoising_method))
+        self.param_denoising_method.setCurrentIndex(max(0, denoising_method_index))
+        self.param_denoising_input_normalization = QLabel("")
+        self.param_denoising_input_normalization.setWordWrap(True)
+        self.param_denoising_input_normalization.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.param_denoising_input_normalization.setToolTip("Shows the input used by the Gonzalez denoiser.")
         self.param_gonzalez_threshold_sd = self._make_double_spin(
             0.0,
             10.0,
             self.detection_params.gonzalez_threshold_sd,
             0.1,
         )
+        self.param_gonzalez_threshold_sd.setToolTip(
+            "Higher values denoise more aggressively by requiring stronger wavelet activity to remain fully preserved."
+        )
         self.param_gonzalez_max_clusters = self._make_int_spin(
             1,
             100,
             int(self.detection_params.gonzalez_max_clusters),
+        )
+        self.param_gonzalez_max_clusters.setToolTip(
+            "Number of wavelet-frequency groups used before thresholding; higher values separate frequency bands more finely."
         )
         self.param_gonzalez_attenuation_min = self._make_double_spin(
             0.0,
@@ -4226,51 +5036,166 @@ class SpikeCurationMainWindow(QMainWindow):
             self.detection_params.gonzalez_attenuation_min,
             0.05,
         )
+        self.param_gonzalez_attenuation_min.setToolTip(
+            "Minimum suppression applied to samples below the wavelet threshold."
+        )
         self.param_gonzalez_attenuation_max = self._make_double_spin(
             0.0,
             1.0,
             self.detection_params.gonzalez_attenuation_max,
             0.05,
         )
+        self.param_gonzalez_attenuation_max.setToolTip(
+            "Maximum suppression applied to below-threshold wavelet coefficients; lower values preserve more signal."
+        )
         self.param_gonzalez_noise_cluster_rejection = QCheckBox("Noise-cluster rejection")
         self.param_gonzalez_noise_cluster_rejection.setChecked(
             bool(self.detection_params.gonzalez_enable_noise_cluster_rejection)
+        )
+        self.param_gonzalez_noise_cluster_rejection.setToolTip(
+            "Optionally discard one high-frequency, low-event cluster. Conservative but can remove real high-frequency spike content."
         )
         self.param_gonzalez_event_template_rejection = QCheckBox("Event-template cleanup")
         self.param_gonzalez_event_template_rejection.setChecked(
             bool(self.detection_params.gonzalez_enable_event_template_rejection)
         )
-        self.param_plateau_tv_weight = self._make_double_spin(
-            0.0,
-            100.0,
-            self.detection_params.plateau_tv_weight,
-            0.1,
+        self.param_gonzalez_event_template_rejection.setToolTip(
+            "Optionally attenuate events whose wavelet-cluster shape differs from the cluster template. Experimental and spike-risky."
         )
-        self.param_plateau_tv_weight.setToolTip("Used by state-aware Gonzalez and Legacy Hybrid modes.")
-        self.param_low_state_boundary_protect_ms = self._make_double_spin(
-            0.0,
-            500.0,
-            self.detection_params.low_state_boundary_protect_ms,
-            1.0,
-        )
-        denoise_layout.addRow("Low-state denoising method", self.param_low_state_denoiser)
-        denoise_layout.addRow("Gonzalez threshold SD", self.param_gonzalez_threshold_sd)
-        denoise_layout.addRow("Gonzalez max clusters", self.param_gonzalez_max_clusters)
-        denoise_layout.addRow("Gonzalez attenuation min", self.param_gonzalez_attenuation_min)
-        denoise_layout.addRow("Gonzalez attenuation max", self.param_gonzalez_attenuation_max)
+        artifact_group = QGroupBox("Artifact Cleanup")
+        artifact_layout = QFormLayout(artifact_group)
+        artifact_layout.addRow("absolute_low", self.param_artifact_abs_low)
+        artifact_layout.addRow("min_depth", self.param_artifact_min_depth)
+        artifact_layout.addRow("drop_start_abs", self.param_artifact_drop_start)
+
+        baseline_group = QGroupBox("Baseline Correction")
+        baseline_layout = QFormLayout(baseline_group)
+        baseline_layout.addRow("baseline_mode", self.param_baseline_mode)
+        baseline_layout.addRow("baseline_rolling_window_ms", self.param_baseline_rolling_window_ms)
+        baseline_layout.addRow("baseline_rolling_percentile", self.param_baseline_rolling_percentile)
+        baseline_layout.addRow("baseline_savgol_window_ms", self.param_baseline_savgol_window_ms)
+        baseline_layout.addRow("baseline_savgol_polyorder", self.param_baseline_savgol_polyorder)
+
+        highpass_group = QGroupBox("High-Pass Filter")
+        highpass_layout = QFormLayout(highpass_group)
+        highpass_layout.addRow("highpass_cutoff_hz", self.param_highpass_cutoff_hz)
+        highpass_layout.addRow("highpass_order", self.param_highpass_order)
+
+        lowpass_group = QGroupBox("Low-Pass Filter")
+        lowpass_layout = QFormLayout(lowpass_group)
+        lowpass_layout.addRow("lowpass_cutoff_hz", self.param_lowpass_cutoff_hz)
+        lowpass_layout.addRow("lowpass_order", self.param_lowpass_order)
+
+        rolling_downsample_group = QGroupBox("Rolling-Average Downsampling")
+        rolling_downsample_layout = QFormLayout(rolling_downsample_group)
+        rolling_downsample_layout.addRow("rolling_downsample_factor", self.param_rolling_downsample_factor)
+
+        plateau_group = QGroupBox("Plateau Detection")
+        plateau_layout = QVBoxLayout(plateau_group)
+        plateau_shared_group = QGroupBox("Shared Setup")
+        plateau_shared_group.setFlat(True)
+        plateau_shared_layout = QFormLayout(plateau_shared_group)
+        plateau_shared_layout.addRow("startup_exclusion_ms", self.param_startup_exclusion_ms)
+        plateau_shared_layout.addRow("plateau_median_window_ms", self.param_plateau_median_window_ms)
+
+        plateau_long_group = QGroupBox("Long Baseline-Protection Plateaus")
+        plateau_long_group.setFlat(True)
+        plateau_long_layout = QFormLayout(plateau_long_group)
+        plateau_long_layout.addRow("drift_window_ms", self.param_long_plateau_drift_window_ms)
+        plateau_long_layout.addRow("drift_percentile", self.param_long_plateau_drift_percentile)
+        plateau_long_layout.addRow("entry_noise_k", self.param_long_plateau_entry_noise_k)
+        plateau_long_layout.addRow("exit_noise_k", self.param_long_plateau_exit_noise_k)
+        plateau_long_layout.addRow("exit_fraction", self.param_long_plateau_exit_fraction)
+        plateau_long_layout.addRow("enter_sustain_ms", self.param_long_plateau_enter_sustain_ms)
+        plateau_long_layout.addRow("exit_sustain_ms", self.param_long_plateau_exit_sustain_ms)
+
+        plateau_short_burst_group = QGroupBox("Short / Burst Raised-Floor Plateaus")
+        plateau_short_burst_group.setFlat(True)
+        plateau_short_burst_layout = QFormLayout(plateau_short_burst_group)
+        plateau_short_burst_layout.addRow("step_noise_k", self.param_short_plateau_step_noise_k)
+        plateau_short_burst_layout.addRow("elevated_noise_k", self.param_short_plateau_elevated_noise_k)
+        plateau_short_burst_layout.addRow("survival_noise_k", self.param_short_plateau_survival_noise_k)
+        plateau_short_burst_layout.addRow("loss_noise_k", self.param_short_plateau_loss_noise_k)
+        plateau_short_burst_layout.addRow("median_noise_k", self.param_short_plateau_median_noise_k)
+        plateau_short_burst_layout.addRow("pre_quiet_noise_k", self.param_short_plateau_pre_quiet_noise_k)
+        plateau_short_burst_layout.addRow("min_support_fraction", self.param_short_plateau_min_support_fraction)
+        plateau_short_burst_layout.addRow("min_confidence", self.param_short_plateau_min_confidence)
+        plateau_short_burst_layout.addRow("early_dwell_ms", self.param_short_plateau_early_dwell_ms)
+        plateau_short_burst_layout.addRow("min_support_ms", self.param_short_plateau_min_support_ms)
+        plateau_short_burst_layout.addRow("min_duration_ms", self.param_short_plateau_min_duration_ms)
+        plateau_layout.addWidget(plateau_shared_group)
+        plateau_layout.addWidget(plateau_long_group)
+        plateau_layout.addWidget(plateau_short_burst_group)
+
+        denoise_group = QGroupBox("Denoising")
+        denoise_layout = QFormLayout(denoise_group)
+        denoise_layout.addRow("Denoising", self.param_denoising_method)
+        denoise_layout.addRow("Denoiser input", self.param_denoising_input_normalization)
+        denoise_layout.addRow("Noise threshold SD", self.param_gonzalez_threshold_sd)
+        denoise_layout.addRow("Cluster count", self.param_gonzalez_max_clusters)
+        denoise_layout.addRow("Min suppression", self.param_gonzalez_attenuation_min)
+        denoise_layout.addRow("Max suppression", self.param_gonzalez_attenuation_max)
         denoise_layout.addRow(self.param_gonzalez_noise_cluster_rejection)
         denoise_layout.addRow(self.param_gonzalez_event_template_rejection)
-        denoise_layout.addRow("Plateau TV strength", self.param_plateau_tv_weight)
-        denoise_layout.addRow("Boundary protection (ms)", self.param_low_state_boundary_protect_ms)
-        left_layout.addWidget(denoise_group)
 
-        left_layout.addStretch(1)
+        spike_group = QGroupBox("Spike Detection")
+        spike_layout = QVBoxLayout(spike_group)
 
-        right_panel = QWidget()
-        right_layout = QVBoxLayout(right_panel)
+        spike_shared_group = QGroupBox("Shared Detection Setup")
+        spike_shared_group.setFlat(True)
+        spike_shared_layout = QFormLayout(spike_shared_group)
+        spike_shared_layout.addRow("detection_mode", self.param_detection_mode)
+        spike_shared_layout.addRow("min_separation_ms", self.param_min_separation_ms)
+        spike_shared_layout.addRow("spike_zoom_half_window_ms", self.param_spike_zoom_half_window_ms)
+
+        spike_threshold_group = QGroupBox("Threshold Methods")
+        spike_threshold_group.setFlat(True)
+        spike_threshold_layout = QFormLayout(spike_threshold_group)
+        spike_threshold_layout.addRow("spike_noise_k", self.param_spike_noise_k)
+        spike_threshold_layout.addRow("spike_prominence_k", self.param_spike_prominence_k)
+
+        spike_template_group = QGroupBox("Template Matching")
+        spike_template_group.setFlat(True)
+        spike_template_layout = QFormLayout(spike_template_group)
+        spike_template_layout.addRow("template_matching_template_indices", self.param_template_matching_template_indices)
+        spike_template_layout.addRow("template_matching_enable_autopick", self.param_template_matching_enable_autopick)
+        spike_template_layout.addRow("template_matching_pre_ms", self.param_template_matching_pre_ms)
+        spike_template_layout.addRow("template_matching_post_ms", self.param_template_matching_post_ms)
+        spike_template_layout.addRow("template_matching_filter_cutoff_hz", self.param_template_matching_filter_cutoff_hz)
+        spike_template_layout.addRow("template_matching_false_positive_rate", self.param_template_matching_false_positive_rate)
+
+        spike_layout.addWidget(spike_shared_group)
+        spike_layout.addWidget(spike_threshold_group)
+        spike_layout.addWidget(spike_template_group)
+
+        display_group = QGroupBox("Signal Display / Overlay")
+        display_layout = QFormLayout(display_group)
+        display_layout.addRow("Units", self.pipeline_display_units_combo)
+        display_layout.addRow("Selected overlay", self.pipeline_display_render_source_combo)
+        display_layout.addRow(self.pipeline_chk_show_raw)
+        display_layout.addRow(self.pipeline_chk_show_corrected)
+        display_layout.addRow(self.pipeline_chk_show_baseline)
+        display_layout.addRow(self.pipeline_chk_show_highpass)
+        display_layout.addRow(self.pipeline_chk_show_lowpass)
+        display_layout.addRow(self.pipeline_chk_show_hybrid_denoised)
+        display_layout.addRow(self.pipeline_chk_show_normalized_denoised)
+        display_layout.addRow(self.pipeline_chk_show_denoise_residual)
+
+        review_group = QGroupBox("Review / Save Package")
+        review_layout = QVBoxLayout(review_group)
+        self.btn_review_save_package = QPushButton("Save Analysis Package")
+        self.btn_review_rerun_current = QPushButton("Re-detect Current")
+        self.pipeline_review_status = QLabel("Current Algorithm")
+        review_layout.addWidget(self.btn_review_save_package)
+        review_layout.addWidget(self.btn_review_rerun_current)
+        review_layout.addWidget(self.pipeline_review_status)
+        review_layout.addStretch(1)
+
+        center_panel = QWidget()
+        center_layout = QVBoxLayout(center_panel)
 
         self.plot = TracePlotWidget()
-        right_layout.addWidget(self.plot, stretch=5)
+        center_layout.addWidget(self.plot, stretch=1)
 
         self.table = QTableWidget(0, 5)
         self.table.setHorizontalHeaderLabels(["idx", "time", "amp", "snr", "prom"])
@@ -4281,7 +5206,62 @@ class SpikeCurationMainWindow(QMainWindow):
             "QTableWidget::item { color: #111111; }"
             "QHeaderView::section { background-color: #30343a; color: #f5f7fa; padding: 4px; border: 1px solid #4b4f56; }"
         )
-        right_layout.addWidget(self.table, stretch=1)
+        self.table.hide()
+
+        workflow_panel = QWidget()
+        workflow_layout = QVBoxLayout(workflow_panel)
+
+        preset_group = QGroupBox("Pipeline Builder")
+        preset_layout = QVBoxLayout(preset_group)
+        self.pipeline_preset_combo = QComboBox()
+        for preset_id, preset in PIPELINE_PRESETS.items():
+            self.pipeline_preset_combo.addItem(str(preset["label"]), preset_id)
+        preset_layout.addWidget(self.pipeline_preset_combo)
+        self.pipeline_warning_label = QLabel(self.pipeline_config.warning())
+        self.pipeline_warning_label.setWordWrap(True)
+        preset_layout.addWidget(self.pipeline_warning_label)
+        self.pipeline_order_summary_label = QLabel(PIPELINE_ORDER_SUMMARY)
+        self.pipeline_order_summary_label.setWordWrap(True)
+        self.pipeline_order_summary_label.setStyleSheet("color: #4f5965;")
+        preset_layout.addWidget(self.pipeline_order_summary_label)
+        self.pipeline_steps = QListWidget()
+        self.pipeline_steps.setDragDropMode(QAbstractItemView.DragDropMode.NoDragDrop)
+        self.pipeline_steps.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.pipeline_steps.setAlternatingRowColors(True)
+        preset_layout.addWidget(self.pipeline_steps, stretch=1)
+        add_step_layout = QHBoxLayout()
+        self.pipeline_add_step_combo = QComboBox()
+        self.btn_pipeline_add_step = QPushButton("Add Step")
+        add_step_layout.addWidget(self.pipeline_add_step_combo, stretch=1)
+        add_step_layout.addWidget(self.btn_pipeline_add_step)
+        preset_layout.addLayout(add_step_layout)
+        step_button_layout = QHBoxLayout()
+        self.btn_pipeline_step_up = QPushButton("Move Up")
+        self.btn_pipeline_step_down = QPushButton("Move Down")
+        self.btn_pipeline_remove_step = QPushButton("Remove")
+        step_button_layout.addWidget(self.btn_pipeline_step_up)
+        step_button_layout.addWidget(self.btn_pipeline_step_down)
+        step_button_layout.addWidget(self.btn_pipeline_remove_step)
+        preset_layout.addLayout(step_button_layout)
+        workflow_layout.addWidget(preset_group, stretch=1)
+
+        self.pipeline_params_stack = QtWidgets.QStackedWidget()
+        self._pipeline_step_page_indexes: Dict[str, int] = {}
+        for step_id, group in [
+            ("artifact_cleanup", artifact_group),
+            ("baseline_correction", baseline_group),
+            ("highpass_filter", highpass_group),
+            ("lowpass_filter", lowpass_group),
+            ("rolling_average_downsample", rolling_downsample_group),
+            ("plateau_detection", plateau_group),
+            ("denoising", denoise_group),
+            ("spike_detection", spike_group),
+            ("review_save", review_group),
+            ("signal_display", display_group),
+        ]:
+            self._pipeline_step_page_indexes[step_id] = self.pipeline_params_stack.addWidget(group)
+        workflow_layout.addWidget(self.pipeline_params_stack, stretch=2)
+        self._refresh_pipeline_steps()
 
         left_scroll = QScrollArea()
         left_scroll.setWidgetResizable(True)
@@ -4289,9 +5269,16 @@ class SpikeCurationMainWindow(QMainWindow):
         left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         left_scroll.setWidget(left_panel)
 
+        workflow_scroll = QScrollArea()
+        workflow_scroll.setWidgetResizable(True)
+        workflow_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        workflow_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        workflow_scroll.setWidget(workflow_panel)
+
         splitter.addWidget(left_scroll)
-        splitter.addWidget(right_panel)
-        splitter.setSizes([280, 1200])
+        splitter.addWidget(center_panel)
+        splitter.addWidget(workflow_scroll)
+        splitter.setSizes([260, 920, 360])
 
         self._connect_signals()
         self._init_shortcuts()
@@ -4310,11 +5297,438 @@ class SpikeCurationMainWindow(QMainWindow):
         widget.setValue(value)
         return widget
 
+    @staticmethod
+    def _parse_index_list(text: str) -> List[int]:
+        indices: List[int] = []
+        for piece in str(text or "").replace(";", ",").split(","):
+            item = piece.strip()
+            if not item:
+                continue
+            try:
+                indices.append(int(round(float(item))))
+            except ValueError:
+                continue
+        return indices
+
+    @staticmethod
+    def _format_index_list(indices: List[int]) -> str:
+        return ", ".join(str(int(index)) for index in indices)
+
+    def _set_combo_data(self, combo: QComboBox, value: str) -> None:
+        index = combo.findData(str(value))
+        if index >= 0:
+            combo.setCurrentIndex(index)
+
+    def _insert_pipeline_step_once(self, step_id: str, before_step_id: str = "spike_detection") -> int:
+        step_id = str(step_id)
+        if step_id not in PIPELINE_STEP_DEFINITIONS:
+            return -1
+        if step_id in self.pipeline_config.ordered_step_ids:
+            self.pipeline_config.enabled_steps[step_id] = True
+            return self.pipeline_config.ordered_step_ids.index(step_id)
+        try:
+            insert_at = self.pipeline_config.ordered_step_ids.index(before_step_id)
+        except ValueError:
+            insert_at = len(self.pipeline_config.ordered_step_ids)
+        self.pipeline_config.ordered_step_ids.insert(insert_at, step_id)
+        self.pipeline_config.enabled_steps[step_id] = True
+        return insert_at
+
+    def _seed_pipeline_from_filter_params(self) -> None:
+        filter_steps: List[str] = []
+        if bool(getattr(self.detection_params, "use_highpass_filter", False)):
+            filter_steps.append("highpass_filter")
+        if bool(getattr(self.detection_params, "use_lowpass_filter", False)):
+            filter_steps.append("lowpass_filter")
+        if not filter_steps:
+            return
+        self.pipeline_config = PipelineConfig.from_preset("custom")
+        for step_id in filter_steps:
+            self._insert_pipeline_step_once(step_id)
+
+    def _refresh_pipeline_steps(self) -> None:
+        step_ids = []
+        for step_id in self.pipeline_config.ordered_step_ids:
+            if step_id in PIPELINE_STEP_DEFINITIONS and step_id not in step_ids:
+                step_ids.append(step_id)
+        self.pipeline_config.ordered_step_ids = step_ids
+
+        locked = self.pipeline_config.is_locked()
+        self.pipeline_steps.blockSignals(True)
+        self.pipeline_steps.clear()
+        for row, step_id in enumerate(step_ids, start=1):
+            definition = PIPELINE_STEP_DEFINITIONS[step_id]
+            order_policy = str(definition.get("order_policy", ""))
+            order_label = PIPELINE_ORDER_POLICY_LABELS.get(order_policy, order_policy)
+            suffix = f" [{order_label}]" if order_label else ""
+            item = QListWidgetItem(f"{row}. {definition['label']}{suffix}")
+            item.setData(Qt.ItemDataRole.UserRole, step_id)
+            tooltip_parts = [
+                str(definition.get("description", "")),
+                str(definition.get("order_note", "")),
+            ]
+            item.setToolTip("\n".join(part for part in tooltip_parts if part))
+            item.setCheckState(
+                Qt.CheckState.Checked
+                if self.pipeline_config.enabled_steps.get(step_id, True)
+                else Qt.CheckState.Unchecked
+            )
+            flags = item.flags() | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled
+            if locked:
+                flags &= ~Qt.ItemFlag.ItemIsUserCheckable
+                flags &= ~Qt.ItemFlag.ItemIsDragEnabled
+                flags &= ~Qt.ItemFlag.ItemIsDropEnabled
+            else:
+                flags |= Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsDragEnabled | Qt.ItemFlag.ItemIsDropEnabled
+            item.setFlags(flags)
+            self.pipeline_steps.addItem(item)
+        self.pipeline_steps.blockSignals(False)
+
+        self.pipeline_steps.setDragDropMode(
+            QAbstractItemView.DragDropMode.NoDragDrop
+            if locked
+            else QAbstractItemView.DragDropMode.InternalMove
+        )
+        self.btn_pipeline_step_up.setEnabled(not locked)
+        self.btn_pipeline_step_down.setEnabled(not locked)
+        self.btn_pipeline_remove_step.setEnabled(
+            not locked and self.pipeline_steps.currentRow() >= 0 and self.pipeline_steps.count() > 0
+        )
+        self._refresh_pipeline_add_controls()
+        self.pipeline_warning_label.setText(self.pipeline_config.warning())
+        self.pipeline_review_status.setText(
+            str(PIPELINE_PRESETS.get(self.pipeline_config.active_preset, {}).get("label", "Custom Pipeline"))
+        )
+        if self.pipeline_steps.currentRow() < 0 and self.pipeline_steps.count() > 0:
+            self.pipeline_steps.setCurrentRow(0)
+        else:
+            self._on_pipeline_step_selected(self.pipeline_steps.currentRow())
+
+    def _sync_pipeline_config_from_widgets(self) -> None:
+        if not hasattr(self, "pipeline_steps"):
+            return
+        ordered_step_ids: List[str] = []
+        enabled_steps: Dict[str, bool] = {}
+        for row in range(self.pipeline_steps.count()):
+            item = self.pipeline_steps.item(row)
+            if item is None:
+                continue
+            step_id = str(item.data(Qt.ItemDataRole.UserRole))
+            ordered_step_ids.append(step_id)
+            enabled_steps[step_id] = item.checkState() == Qt.CheckState.Checked
+        self.pipeline_config.ordered_step_ids = ordered_step_ids
+        self.pipeline_config.enabled_steps.update(enabled_steps)
+        for step_id in ADDABLE_PIPELINE_STEP_IDS:
+            if step_id not in ordered_step_ids:
+                self.pipeline_config.enabled_steps[step_id] = False
+        self.pipeline_config.trace_order = list(self.trace_names)
+
+    def _refresh_pipeline_add_controls(self) -> None:
+        if not hasattr(self, "pipeline_add_step_combo"):
+            return
+        existing = set(self.pipeline_config.ordered_step_ids)
+        self.pipeline_add_step_combo.blockSignals(True)
+        self.pipeline_add_step_combo.clear()
+        for step_id in ADDABLE_PIPELINE_STEP_IDS:
+            if step_id in existing:
+                continue
+            definition = PIPELINE_STEP_DEFINITIONS.get(step_id, {})
+            self.pipeline_add_step_combo.addItem(str(definition.get("label", step_id)), step_id)
+        self.pipeline_add_step_combo.blockSignals(False)
+        can_add = self.pipeline_add_step_combo.count() > 0
+        self.pipeline_add_step_combo.setEnabled(can_add)
+        self.btn_pipeline_add_step.setEnabled(can_add)
+
+    def _pipeline_config_dict(self) -> Dict[str, Any]:
+        self._sync_pipeline_config_from_widgets()
+        return self.pipeline_config.to_dict()
+
+    def _set_pipeline_combo_to_preset(self, preset_id: str) -> None:
+        index = self.pipeline_preset_combo.findData(str(preset_id))
+        if index < 0:
+            return
+        self.pipeline_preset_combo.blockSignals(True)
+        self.pipeline_preset_combo.setCurrentIndex(index)
+        self.pipeline_preset_combo.blockSignals(False)
+
+    def _mark_pipeline_custom(self) -> None:
+        if self.pipeline_config.active_preset == "custom":
+            return
+        self.pipeline_config.active_preset = "custom"
+        self._set_pipeline_combo_to_preset("custom")
+        self.pipeline_warning_label.setText(self.pipeline_config.warning())
+        self.pipeline_review_status.setText("Custom Editable Pipeline")
+
+    def _remember_current_denoiser_for_restore(self) -> None:
+        current = str(self.param_denoising_method.currentData() or "gonzalez_full_trace")
+        if current != "none":
+            self._last_non_none_denoising_method = current
+
+    def _apply_no_denoising_if_needed(self) -> None:
+        denoising_enabled = self.pipeline_config.enabled_steps.get("denoising", True)
+        if denoising_enabled:
+            current = str(self.param_denoising_method.currentData() or "")
+            if current == "none":
+                restore = str(getattr(self, "_last_non_none_denoising_method", "gonzalez_full_trace"))
+                self._set_combo_data(self.param_denoising_method, restore)
+            return
+        self._remember_current_denoiser_for_restore()
+        self._set_combo_data(self.param_denoising_method, "none")
+
+    def _on_pipeline_preset_changed(self, index: int) -> None:
+        preset_id = str(self.pipeline_preset_combo.itemData(index) or "current")
+        self.pipeline_config = PipelineConfig.from_preset(preset_id)
+        self.pipeline_config.trace_order = list(self.trace_names)
+        self._apply_no_denoising_if_needed()
+        self._refresh_pipeline_steps()
+
+    def _on_pipeline_step_selected(self, row: int) -> None:
+        if row < 0 or row >= self.pipeline_steps.count():
+            self.btn_pipeline_remove_step.setEnabled(False)
+            return
+        item = self.pipeline_steps.item(row)
+        if item is None:
+            self.btn_pipeline_remove_step.setEnabled(False)
+            return
+        step_id = str(item.data(Qt.ItemDataRole.UserRole))
+        self.btn_pipeline_remove_step.setEnabled(
+            not self.pipeline_config.is_locked() and step_id in ADDABLE_PIPELINE_STEP_IDS
+        )
+        index = self._pipeline_step_page_indexes.get(step_id)
+        if index is not None:
+            self.pipeline_params_stack.setCurrentIndex(index)
+
+    def _on_pipeline_item_changed(self, item: QListWidgetItem) -> None:
+        if self.pipeline_config.is_locked():
+            return
+        step_id = str(item.data(Qt.ItemDataRole.UserRole))
+        self._mark_pipeline_custom()
+        self._sync_pipeline_config_from_widgets()
+        if step_id == "denoising":
+            self._apply_no_denoising_if_needed()
+
+    def _on_pipeline_steps_reordered(self, *_args: object) -> None:
+        if self.pipeline_config.is_locked():
+            return
+        self._mark_pipeline_custom()
+        self._sync_pipeline_config_from_widgets()
+        self._refresh_pipeline_steps()
+
+    def _move_pipeline_step(self, offset: int) -> None:
+        if self.pipeline_config.is_locked():
+            return
+        row = self.pipeline_steps.currentRow()
+        new_row = row + int(offset)
+        if row < 0 or new_row < 0 or new_row >= self.pipeline_steps.count():
+            return
+        item = self.pipeline_steps.takeItem(row)
+        if item is None:
+            return
+        self.pipeline_steps.insertItem(new_row, item)
+        self.pipeline_steps.setCurrentRow(new_row)
+        self._on_pipeline_steps_reordered()
+
+    def _add_pipeline_step(self) -> None:
+        step_id = str(self.pipeline_add_step_combo.currentData() or "")
+        if step_id not in ADDABLE_PIPELINE_STEP_IDS:
+            return
+        if self.pipeline_config.is_locked():
+            self._mark_pipeline_custom()
+        row = self.pipeline_steps.currentRow()
+        insert_before = "spike_detection"
+        if row >= 0 and row < self.pipeline_steps.count():
+            current_item = self.pipeline_steps.item(row)
+            if current_item is not None:
+                current_step = str(current_item.data(Qt.ItemDataRole.UserRole))
+                current_index = self.pipeline_config.ordered_step_ids.index(current_step)
+                self.pipeline_config.ordered_step_ids.insert(current_index + 1, step_id)
+                self.pipeline_config.enabled_steps[step_id] = True
+                self._mark_pipeline_custom()
+                self._refresh_pipeline_steps()
+                self.pipeline_steps.setCurrentRow(current_index + 1)
+                return
+        new_row = self._insert_pipeline_step_once(step_id, before_step_id=insert_before)
+        self._mark_pipeline_custom()
+        self._refresh_pipeline_steps()
+        if new_row >= 0:
+            self.pipeline_steps.setCurrentRow(new_row)
+
+    def _remove_pipeline_step(self) -> None:
+        if self.pipeline_config.is_locked():
+            return
+        row = self.pipeline_steps.currentRow()
+        if row < 0 or row >= self.pipeline_steps.count():
+            return
+        item = self.pipeline_steps.item(row)
+        if item is None:
+            return
+        step_id = str(item.data(Qt.ItemDataRole.UserRole))
+        if step_id not in ADDABLE_PIPELINE_STEP_IDS:
+            return
+        self.pipeline_config.ordered_step_ids = [
+            existing for existing in self.pipeline_config.ordered_step_ids if existing != step_id
+        ]
+        self.pipeline_config.enabled_steps[step_id] = False
+        self._mark_pipeline_custom()
+        self._refresh_pipeline_steps()
+        if self.pipeline_steps.count() > 0:
+            self.pipeline_steps.setCurrentRow(min(row, self.pipeline_steps.count() - 1))
+
+    def _trace_names_for_recording(self, recording_id: Optional[str]) -> List[str]:
+        if recording_id is None:
+            return []
+        return [
+            name
+            for name in self.trace_names
+            if split_trace_identity(name)[0] == recording_id and name in self.traces
+        ]
+
+    def _visible_trace_names(self) -> List[str]:
+        if self.current_recording_id is None:
+            groups = recording_groups(self.trace_names)
+            self.current_recording_id = next(iter(groups), None)
+        return self._trace_names_for_recording(self.current_recording_id)
+
+    def _sync_recording_selector(self, preferred_trace_name: Optional[str] = None) -> None:
+        groups = recording_groups(self.trace_names)
+        if preferred_trace_name in self.trace_names:
+            preferred_recording = split_trace_identity(str(preferred_trace_name))[0]
+        elif self.current_recording_id in groups:
+            preferred_recording = self.current_recording_id
+        else:
+            preferred_recording = next(iter(groups), None)
+
+        self.current_recording_id = preferred_recording
+        self.recording_selector.blockSignals(True)
+        self.recording_selector.clear()
+        for recording_id, names in groups.items():
+            roi_count = len(names)
+            label = f"{recording_id} ({roi_count} ROI{'s' if roi_count != 1 else ''})"
+            self.recording_selector.addItem(label, recording_id)
+        if preferred_recording is not None:
+            index = self.recording_selector.findData(preferred_recording)
+            if index >= 0:
+                self.recording_selector.setCurrentIndex(index)
+        self.recording_selector.blockSignals(False)
+
+    def _trace_list_label(self, trace_name: str, state: Optional[TraceCuration]) -> str:
+        _recording_id, roi_id = split_trace_identity(trace_name)
+        return f"{roi_id}{self._trace_status_suffix(trace_name, state)}"
+
+    def _select_current_visible_trace(self, *, start_analysis: bool = True, render: bool = True) -> None:
+        visible_names = self._visible_trace_names()
+        if not visible_names:
+            self.current_trace_name = None
+            return
+        if self.current_trace_name not in visible_names:
+            self.current_trace_name = visible_names[0]
+        row = visible_names.index(str(self.current_trace_name))
+        self.trace_list.blockSignals(True)
+        self.trace_list.setCurrentRow(row)
+        self.trace_list.blockSignals(False)
+        if start_analysis:
+            self._start_analysis_for_trace(str(self.current_trace_name), priority=10)
+        if render:
+            self._render_current_trace(reset_view=True)
+
+    def _selected_trace_names(self) -> List[str]:
+        indexes = sorted(self.trace_list.selectedIndexes(), key=lambda idx: idx.row())
+        names: List[str] = []
+        for index in indexes:
+            item = self.trace_list.item(index.row())
+            if item is None:
+                continue
+            trace_name = str(item.data(Qt.ItemDataRole.UserRole))
+            if trace_name in self.traces and trace_name not in names:
+                names.append(trace_name)
+        if not names and self.current_trace_name in self.traces:
+            names.append(str(self.current_trace_name))
+        return names
+
+    def _run_trace_names(self, trace_names: List[str]) -> None:
+        active_names = [name for name in trace_names if name in self.traces]
+        if not active_names:
+            return
+        self._pull_params_from_widgets()
+        self._analysis_generation += 1
+        self._pending_session = None
+        self._pending_session_generation = None
+        for name in active_names:
+            state = self.traces[name]
+            state.analysis_generation = int(self._analysis_generation)
+            state.analysis_status = "pending"
+            state.analysis_error = ""
+            self._last_packaged_trace_names.discard(name)
+        current = self.current_trace_name if self.current_trace_name in active_names else active_names[0]
+        self._start_analysis_for_trace(str(current), priority=10, force=True)
+        for name in active_names:
+            if name != current:
+                self._start_analysis_for_trace(name, priority=0, force=True)
+        if current in self.trace_names:
+            self.current_trace_name = str(current)
+            self.current_recording_id = split_trace_identity(current)[0]
+        self._refresh_trace_list()
+        self._render_current_trace()
+        self.status_label.setText(f"Running {len(active_names)} trace(s) with current pipeline settings...")
+
+    def run_current_trace(self) -> None:
+        if self.current_trace_name:
+            self._run_trace_names([self.current_trace_name])
+
+    def run_selected_traces(self) -> None:
+        self._run_trace_names(self._selected_trace_names())
+
+    def run_all_traces(self) -> None:
+        self._run_trace_names(list(self.trace_names))
+
+    def _on_trace_queue_reordered(self, *_args: object) -> None:
+        ordered: List[str] = []
+        for row in range(self.trace_list.count()):
+            item = self.trace_list.item(row)
+            if item is None:
+                continue
+            trace_name = str(item.data(Qt.ItemDataRole.UserRole))
+            if trace_name in self.traces and trace_name not in ordered:
+                ordered.append(trace_name)
+        recording_names = self._trace_names_for_recording(self.current_recording_id)
+        if set(ordered) != set(recording_names):
+            return
+        ordered_set = set(ordered)
+        updated: List[str] = []
+        inserted = False
+        for name in self.trace_names:
+            if name in ordered_set:
+                if not inserted:
+                    updated.extend(ordered)
+                    inserted = True
+                continue
+            updated.append(name)
+        if not inserted or set(updated) != set(self.trace_names):
+            return
+        self.trace_names = updated
+        self.pipeline_config.trace_order = list(self.trace_names)
+        self._update_trace_queue_status()
+
+    def _update_trace_queue_status(self) -> None:
+        if not hasattr(self, "trace_queue_status"):
+            return
+        counts = {"pending": 0, "running": 0, "done": 0, "error": 0}
+        for name in self.trace_names:
+            state = self.traces.get(name)
+            if state is not None:
+                counts[state.analysis_status] = counts.get(state.analysis_status, 0) + 1
+        self.trace_queue_status.setText(
+            f"{len(self.trace_names)} traces | pending {counts.get('pending', 0)} | "
+            f"running {counts.get('running', 0)} | reviewed {counts.get('done', 0)} | "
+            f"failed {counts.get('error', 0)}"
+        )
+
     def _connect_signals(self) -> None:
         self.btn_load_excel.clicked.connect(self.load_excel_dialog)
         self.btn_load_exported.clicked.connect(self.load_exported_dialog)
         self.btn_load_session.clicked.connect(self.load_session_dialog)
         self.btn_save_session.clicked.connect(self.save_session_dialog)
+        self.btn_save_analysis_package.clicked.connect(self.save_analysis_package_dialog)
         self.btn_export.clicked.connect(self.export_all_dialog)
         self.btn_export_png_current.clicked.connect(self.export_current_dialog)
         self.btn_reload_params_cfg.clicked.connect(self.reload_detection_params_config)
@@ -4323,16 +5737,62 @@ class SpikeCurationMainWindow(QMainWindow):
 
         self.btn_prev_trace.clicked.connect(self.prev_trace)
         self.btn_next_trace.clicked.connect(self.next_trace)
+        self.btn_run_current.clicked.connect(self.run_current_trace)
+        self.btn_run_selected.clicked.connect(self.run_selected_traces)
+        self.btn_run_all.clicked.connect(self.run_all_traces)
+        self.btn_review_save_package.clicked.connect(self.save_analysis_package_dialog)
+        self.btn_review_rerun_current.clicked.connect(self.rerun_current)
 
+        self.recording_selector.currentIndexChanged.connect(self._on_recording_selected)
         self.trace_list.currentRowChanged.connect(self.on_trace_selected)
+        self.trace_list.model().rowsMoved.connect(self._on_trace_queue_reordered)
         self.plot.clicked.connect(self.on_plot_clicked)
         self.table.cellClicked.connect(self.on_table_clicked)
         self.chk_show_raw.stateChanged.connect(self._on_overlay_changed)
         self.chk_show_corrected.stateChanged.connect(self._on_overlay_changed)
         self.chk_show_baseline.stateChanged.connect(self._on_overlay_changed)
         self.chk_show_highpass.stateChanged.connect(self._on_overlay_changed)
+        self.chk_show_lowpass.stateChanged.connect(self._on_overlay_changed)
         self.chk_show_hybrid_denoised.stateChanged.connect(self._on_overlay_changed)
-        self.param_low_state_denoiser.currentIndexChanged.connect(self._update_denoise_control_state)
+        self.chk_show_normalized_denoised.stateChanged.connect(self._on_overlay_changed)
+        self.chk_show_denoise_residual.stateChanged.connect(self._on_overlay_changed)
+        self.display_units_combo.currentIndexChanged.connect(self._on_display_units_changed)
+        self.display_render_source_combo.currentIndexChanged.connect(self._on_overlay_changed)
+        for checkbox in [
+            self.chk_show_raw,
+            self.chk_show_corrected,
+            self.chk_show_baseline,
+            self.chk_show_highpass,
+            self.chk_show_lowpass,
+            self.chk_show_hybrid_denoised,
+            self.chk_show_normalized_denoised,
+            self.chk_show_denoise_residual,
+        ]:
+            checkbox.stateChanged.connect(self._sync_pipeline_overlay_controls_from_main)
+        self.display_units_combo.currentIndexChanged.connect(self._sync_pipeline_overlay_controls_from_main)
+        self.display_render_source_combo.currentIndexChanged.connect(self._sync_pipeline_overlay_controls_from_main)
+        for checkbox in [
+            self.pipeline_chk_show_raw,
+            self.pipeline_chk_show_corrected,
+            self.pipeline_chk_show_baseline,
+            self.pipeline_chk_show_highpass,
+            self.pipeline_chk_show_lowpass,
+            self.pipeline_chk_show_hybrid_denoised,
+            self.pipeline_chk_show_normalized_denoised,
+            self.pipeline_chk_show_denoise_residual,
+        ]:
+            checkbox.stateChanged.connect(self._on_pipeline_overlay_controls_changed)
+        self.pipeline_display_units_combo.currentIndexChanged.connect(self._on_pipeline_overlay_controls_changed)
+        self.pipeline_display_render_source_combo.currentIndexChanged.connect(self._on_pipeline_overlay_controls_changed)
+        self.param_denoising_method.currentIndexChanged.connect(self._update_denoise_control_state)
+        self.pipeline_preset_combo.currentIndexChanged.connect(self._on_pipeline_preset_changed)
+        self.pipeline_steps.currentRowChanged.connect(self._on_pipeline_step_selected)
+        self.pipeline_steps.itemChanged.connect(self._on_pipeline_item_changed)
+        self.pipeline_steps.model().rowsMoved.connect(self._on_pipeline_steps_reordered)
+        self.btn_pipeline_add_step.clicked.connect(self._add_pipeline_step)
+        self.btn_pipeline_step_up.clicked.connect(lambda: self._move_pipeline_step(-1))
+        self.btn_pipeline_step_down.clicked.connect(lambda: self._move_pipeline_step(1))
+        self.btn_pipeline_remove_step.clicked.connect(self._remove_pipeline_step)
         self._update_denoise_control_state()
 
     def _init_shortcuts(self) -> None:
@@ -4344,7 +5804,7 @@ class SpikeCurationMainWindow(QMainWindow):
                 "N": self.jump_next_spike,
                 "B": self.jump_prev_spike,
                 "Ctrl+S": self.save_session_dialog,
-                "Ctrl+E": self.export_all_dialog,
+                "Ctrl+E": self.save_analysis_package_dialog,
                 "Ctrl+Shift+E": self.export_current_dialog,
                 "Q": lambda: self._toggle_checkbox(self.chk_show_raw),
                 "W": lambda: self._toggle_checkbox(self.chk_show_corrected),
@@ -4354,6 +5814,99 @@ class SpikeCurationMainWindow(QMainWindow):
     def _toggle_checkbox(self, checkbox: QCheckBox) -> None:
         checkbox.setChecked(not checkbox.isChecked())
 
+    @staticmethod
+    def _set_combo_to_matching_data(target: QComboBox, source: QComboBox) -> None:
+        index = target.findData(source.currentData())
+        if index >= 0:
+            target.setCurrentIndex(index)
+
+    def _overlay_checkbox_pairs(self) -> List[Tuple[QCheckBox, QCheckBox]]:
+        if not hasattr(self, "pipeline_chk_show_raw"):
+            return []
+        return [
+            (self.chk_show_raw, self.pipeline_chk_show_raw),
+            (self.chk_show_corrected, self.pipeline_chk_show_corrected),
+            (self.chk_show_baseline, self.pipeline_chk_show_baseline),
+            (self.chk_show_highpass, self.pipeline_chk_show_highpass),
+            (self.chk_show_lowpass, self.pipeline_chk_show_lowpass),
+            (self.chk_show_hybrid_denoised, self.pipeline_chk_show_hybrid_denoised),
+            (self.chk_show_normalized_denoised, self.pipeline_chk_show_normalized_denoised),
+            (self.chk_show_denoise_residual, self.pipeline_chk_show_denoise_residual),
+        ]
+
+    def _sync_pipeline_overlay_controls_from_main(self, *_args: object) -> None:
+        if not hasattr(self, "pipeline_display_units_combo"):
+            return
+        for source, target in self._overlay_checkbox_pairs():
+            target.blockSignals(True)
+            target.setChecked(source.isChecked())
+            target.blockSignals(False)
+        for source, target in [
+            (self.display_units_combo, self.pipeline_display_units_combo),
+            (self.display_render_source_combo, self.pipeline_display_render_source_combo),
+        ]:
+            target.blockSignals(True)
+            self._set_combo_to_matching_data(target, source)
+            target.blockSignals(False)
+
+    def _on_pipeline_overlay_controls_changed(self, *_args: object) -> None:
+        for target, source in self._overlay_checkbox_pairs():
+            target.blockSignals(True)
+            target.setChecked(source.isChecked())
+            target.blockSignals(False)
+        for target, source in [
+            (self.display_units_combo, self.pipeline_display_units_combo),
+            (self.display_render_source_combo, self.pipeline_display_render_source_combo),
+        ]:
+            target.blockSignals(True)
+            self._set_combo_to_matching_data(target, source)
+            target.blockSignals(False)
+        self._render_current_trace(refit_y=True)
+
+    def _display_normalization_mode(self) -> str:
+        if not hasattr(self, "display_units_combo"):
+            return NORMALIZATION_NATIVE
+        return str(self.display_units_combo.currentData() or NORMALIZATION_NATIVE)
+
+    def _selected_render_source(self) -> str:
+        if not hasattr(self, "display_render_source_combo"):
+            return DISPLAY_RENDER_SOURCE_DENOISED
+        return str(self.display_render_source_combo.currentData() or DISPLAY_RENDER_SOURCE_DENOISED)
+
+    @staticmethod
+    def _raw_overlay_signal(raw: np.ndarray, raw_baseline: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        raw_arr = np.asarray(raw, dtype=float)
+        baseline_arr = None if raw_baseline is None else np.asarray(raw_baseline, dtype=float)
+        if baseline_arr is not None and baseline_arr.shape == raw_arr.shape:
+            return raw_arr - baseline_arr
+        return None
+
+    def _selected_pipeline_signal_for_display(
+        self,
+        source: str,
+        raw: np.ndarray,
+        raw_baseline: Optional[np.ndarray],
+        corrected: np.ndarray,
+        denoised: Optional[np.ndarray],
+        normalized_denoised: Optional[np.ndarray],
+        highpass: Optional[np.ndarray],
+        lowpass: Optional[np.ndarray],
+    ) -> Optional[np.ndarray]:
+        if source == DISPLAY_RENDER_SOURCE_CORRECTED:
+            return np.asarray(corrected, dtype=float)
+        if source == DISPLAY_RENDER_SOURCE_RAW:
+            return self._raw_overlay_signal(raw, raw_baseline)
+        if source == DISPLAY_RENDER_SOURCE_NORMALIZED_DENOISED:
+            return None if normalized_denoised is None else np.asarray(normalized_denoised, dtype=float)
+        if source == DISPLAY_RENDER_SOURCE_HIGHPASS:
+            return None if highpass is None else np.asarray(highpass, dtype=float)
+        if source == DISPLAY_RENDER_SOURCE_LOWPASS:
+            return None if lowpass is None else np.asarray(lowpass, dtype=float)
+        return None if denoised is None else np.asarray(denoised, dtype=float)
+
+    def _on_display_units_changed(self, *_args: object) -> None:
+        self._render_current_trace(refit_y=True)
+
     def _pull_params_from_widgets(self) -> None:
         self.detection_params.detection_mode = str(self.param_detection_mode.currentData() or "mad")
         self.detection_params.baseline_mode = str(self.param_baseline_mode.currentData() or "percentile")
@@ -4362,10 +5915,19 @@ class SpikeCurationMainWindow(QMainWindow):
         self.detection_params.baseline_rolling_percentile = float(self.param_baseline_rolling_percentile.value())
         self.detection_params.baseline_savgol_window_ms = float(self.param_baseline_savgol_window_ms.value())
         self.detection_params.baseline_savgol_polyorder = int(self.param_baseline_savgol_polyorder.value())
-        self.detection_params.use_highpass_filter = bool(self.param_use_highpass_filter.isChecked())
         self.detection_params.highpass_cutoff_hz = float(self.param_highpass_cutoff_hz.value())
         self.detection_params.highpass_order = int(self.param_highpass_order.value())
+        self.detection_params.lowpass_cutoff_hz = float(self.param_lowpass_cutoff_hz.value())
+        self.detection_params.lowpass_order = int(self.param_lowpass_order.value())
+        self.detection_params.rolling_downsample_factor = int(self.param_rolling_downsample_factor.value())
         self.detection_params.plateau_median_window_ms = float(self.param_plateau_median_window_ms.value())
+        self.detection_params.long_plateau_drift_window_ms = float(self.param_long_plateau_drift_window_ms.value())
+        self.detection_params.long_plateau_drift_percentile = float(self.param_long_plateau_drift_percentile.value())
+        self.detection_params.long_plateau_entry_noise_k = float(self.param_long_plateau_entry_noise_k.value())
+        self.detection_params.long_plateau_exit_noise_k = float(self.param_long_plateau_exit_noise_k.value())
+        self.detection_params.long_plateau_exit_fraction = float(self.param_long_plateau_exit_fraction.value())
+        self.detection_params.long_plateau_enter_sustain_ms = float(self.param_long_plateau_enter_sustain_ms.value())
+        self.detection_params.long_plateau_exit_sustain_ms = float(self.param_long_plateau_exit_sustain_ms.value())
         self.detection_params.short_plateau_step_noise_k = float(self.param_short_plateau_step_noise_k.value())
         self.detection_params.short_plateau_elevated_noise_k = float(self.param_short_plateau_elevated_noise_k.value())
         self.detection_params.short_plateau_survival_noise_k = float(self.param_short_plateau_survival_noise_k.value())
@@ -4379,11 +5941,19 @@ class SpikeCurationMainWindow(QMainWindow):
         self.detection_params.short_plateau_min_duration_ms = float(self.param_short_plateau_min_duration_ms.value())
         self.detection_params.spike_noise_k = float(self.param_spike_noise_k.value())
         self.detection_params.spike_prominence_k = float(self.param_spike_prominence_k.value())
+        self.detection_params.template_matching_enable_autopick = bool(
+            self.param_template_matching_enable_autopick.isChecked()
+        )
+        self.detection_params.template_matching_template_indices = self._parse_index_list(
+            self.param_template_matching_template_indices.text()
+        )
+        self.detection_params.template_matching_pre_ms = float(self.param_template_matching_pre_ms.value())
+        self.detection_params.template_matching_post_ms = float(self.param_template_matching_post_ms.value())
+        self.detection_params.template_matching_filter_cutoff_hz = float(self.param_template_matching_filter_cutoff_hz.value())
+        self.detection_params.template_matching_false_positive_rate = float(self.param_template_matching_false_positive_rate.value())
         self.detection_params.min_separation_ms = float(self.param_min_separation_ms.value())
         self.detection_params.spike_zoom_half_window_ms = float(self.param_spike_zoom_half_window_ms.value())
-        self.detection_params.low_state_denoiser = str(
-            self.param_low_state_denoiser.currentData() or "gonzalez_full_trace"
-        )
+        self.detection_params.denoising_method = str(self.param_denoising_method.currentData() or "gonzalez_full_trace")
         self.detection_params.gonzalez_threshold_sd = float(self.param_gonzalez_threshold_sd.value())
         self.detection_params.gonzalez_max_clusters = int(self.param_gonzalez_max_clusters.value())
         self.detection_params.gonzalez_attenuation_min = float(self.param_gonzalez_attenuation_min.value())
@@ -4394,11 +5964,14 @@ class SpikeCurationMainWindow(QMainWindow):
         self.detection_params.gonzalez_enable_event_template_rejection = bool(
             self.param_gonzalez_event_template_rejection.isChecked()
         )
-        self.detection_params.plateau_tv_weight = float(self.param_plateau_tv_weight.value())
-        self.detection_params.low_state_boundary_protect_ms = float(self.param_low_state_boundary_protect_ms.value())
         self.artifact_params.absolute_low = float(self.param_artifact_abs_low.value())
         self.artifact_params.min_depth = float(self.param_artifact_min_depth.value())
         self.artifact_params.drop_start_abs = float(self.param_artifact_drop_start.value())
+        self._sync_pipeline_config_from_widgets()
+        self.detection_params.use_highpass_filter = _pipeline_step_enabled(self.pipeline_config, "highpass_filter")
+        self.detection_params.use_lowpass_filter = _pipeline_step_enabled(self.pipeline_config, "lowpass_filter")
+        if not self.pipeline_config.enabled_steps.get("denoising", True):
+            self.detection_params.denoising_method = "none"
 
     def _push_params_to_widgets(self) -> None:
         mode_index = self.param_detection_mode.findData(str(self.detection_params.detection_mode))
@@ -4410,10 +5983,19 @@ class SpikeCurationMainWindow(QMainWindow):
         self.param_baseline_rolling_percentile.setValue(self.detection_params.baseline_rolling_percentile)
         self.param_baseline_savgol_window_ms.setValue(self.detection_params.baseline_savgol_window_ms)
         self.param_baseline_savgol_polyorder.setValue(int(self.detection_params.baseline_savgol_polyorder))
-        self.param_use_highpass_filter.setChecked(bool(self.detection_params.use_highpass_filter))
         self.param_highpass_cutoff_hz.setValue(float(self.detection_params.highpass_cutoff_hz))
         self.param_highpass_order.setValue(int(self.detection_params.highpass_order))
+        self.param_lowpass_cutoff_hz.setValue(float(self.detection_params.lowpass_cutoff_hz))
+        self.param_lowpass_order.setValue(int(self.detection_params.lowpass_order))
+        self.param_rolling_downsample_factor.setValue(int(self.detection_params.rolling_downsample_factor))
         self.param_plateau_median_window_ms.setValue(self.detection_params.plateau_median_window_ms)
+        self.param_long_plateau_drift_window_ms.setValue(float(self.detection_params.long_plateau_drift_window_ms))
+        self.param_long_plateau_drift_percentile.setValue(float(self.detection_params.long_plateau_drift_percentile))
+        self.param_long_plateau_entry_noise_k.setValue(float(self.detection_params.long_plateau_entry_noise_k))
+        self.param_long_plateau_exit_noise_k.setValue(float(self.detection_params.long_plateau_exit_noise_k))
+        self.param_long_plateau_exit_fraction.setValue(float(self.detection_params.long_plateau_exit_fraction))
+        self.param_long_plateau_enter_sustain_ms.setValue(float(self.detection_params.long_plateau_enter_sustain_ms))
+        self.param_long_plateau_exit_sustain_ms.setValue(float(self.detection_params.long_plateau_exit_sustain_ms))
         self.param_short_plateau_step_noise_k.setValue(float(self.detection_params.short_plateau_step_noise_k))
         self.param_short_plateau_elevated_noise_k.setValue(float(self.detection_params.short_plateau_elevated_noise_k))
         self.param_short_plateau_survival_noise_k.setValue(float(self.detection_params.short_plateau_survival_noise_k))
@@ -4427,10 +6009,20 @@ class SpikeCurationMainWindow(QMainWindow):
         self.param_short_plateau_min_duration_ms.setValue(float(self.detection_params.short_plateau_min_duration_ms))
         self.param_spike_noise_k.setValue(self.detection_params.spike_noise_k)
         self.param_spike_prominence_k.setValue(self.detection_params.spike_prominence_k)
+        self.param_template_matching_enable_autopick.setChecked(
+            bool(self.detection_params.template_matching_enable_autopick)
+        )
+        self.param_template_matching_template_indices.setText(
+            self._format_index_list(list(self.detection_params.template_matching_template_indices))
+        )
+        self.param_template_matching_pre_ms.setValue(float(self.detection_params.template_matching_pre_ms))
+        self.param_template_matching_post_ms.setValue(float(self.detection_params.template_matching_post_ms))
+        self.param_template_matching_filter_cutoff_hz.setValue(float(self.detection_params.template_matching_filter_cutoff_hz))
+        self.param_template_matching_false_positive_rate.setValue(float(self.detection_params.template_matching_false_positive_rate))
         self.param_min_separation_ms.setValue(self.detection_params.min_separation_ms)
         self.param_spike_zoom_half_window_ms.setValue(self.detection_params.spike_zoom_half_window_ms)
-        low_state_index = self.param_low_state_denoiser.findData(str(self.detection_params.low_state_denoiser))
-        self.param_low_state_denoiser.setCurrentIndex(max(0, low_state_index))
+        denoising_method_index = self.param_denoising_method.findData(str(self.detection_params.denoising_method))
+        self.param_denoising_method.setCurrentIndex(max(0, denoising_method_index))
         self.param_gonzalez_threshold_sd.setValue(float(self.detection_params.gonzalez_threshold_sd))
         self.param_gonzalez_max_clusters.setValue(int(self.detection_params.gonzalez_max_clusters))
         self.param_gonzalez_attenuation_min.setValue(float(self.detection_params.gonzalez_attenuation_min))
@@ -4441,47 +6033,22 @@ class SpikeCurationMainWindow(QMainWindow):
         self.param_gonzalez_event_template_rejection.setChecked(
             bool(self.detection_params.gonzalez_enable_event_template_rejection)
         )
-        self.param_plateau_tv_weight.setValue(float(self.detection_params.plateau_tv_weight))
-        self.param_low_state_boundary_protect_ms.setValue(float(self.detection_params.low_state_boundary_protect_ms))
         self._update_denoise_control_state()
         self.param_artifact_abs_low.setValue(self.artifact_params.absolute_low)
         self.param_artifact_min_depth.setValue(self.artifact_params.min_depth)
         self.param_artifact_drop_start.setValue(self.artifact_params.drop_start_abs)
 
     def _update_denoise_control_state(self, *_args: object) -> None:
-        low_state_denoiser = str(self.param_low_state_denoiser.currentData() or "gonzalez_full_trace")
-        state_aware_mode = low_state_denoiser in {"gonzalez_adaptive_wavelet", "legacy_hybrid"}
-        full_trace_mode = low_state_denoiser in {"gonzalez_full_trace", "gonzalez_full_trace_dff"}
-        self.chk_show_hybrid_denoised.setText(
-            "Show Gonzalez full-trace denoised"
-            if low_state_denoiser == "gonzalez_full_trace"
-            else "Show denoised"
-        )
-        self.param_plateau_tv_weight.setEnabled(state_aware_mode)
-        self.param_plateau_tv_weight.setToolTip(
-            "Used by state-aware Gonzalez and Legacy Hybrid modes."
-            if state_aware_mode
-            else (
-                "Ignored by full-trace Gonzalez mode."
-                if full_trace_mode
-                else "Ignored when denoising is disabled."
-            )
-        )
-        self.param_low_state_boundary_protect_ms.setEnabled(state_aware_mode)
-        self.param_low_state_boundary_protect_ms.setToolTip(
-            "Used by state-aware Gonzalez and Legacy Hybrid modes."
-            if state_aware_mode
-            else (
-                "Ignored by full-trace Gonzalez mode."
-                if full_trace_mode
-                else "Ignored when denoising is disabled."
-            )
-        )
+        denoising_method = str(self.param_denoising_method.currentData() or "gonzalez_full_trace")
+        self.param_denoising_input_normalization.setText(_denoising_input_normalization_label(denoising_method))
+        self.chk_show_hybrid_denoised.setText("Show selected overlay")
+        if hasattr(self, "pipeline_chk_show_hybrid_denoised"):
+            self.pipeline_chk_show_hybrid_denoised.setText("Show selected overlay")
 
     def _result_root(self) -> Path:
         if getattr(sys, "frozen", False):
             return Path(sys.executable).resolve().parent / "Result"
-        return Path(__file__).resolve().parents[2] / "Result"
+        return Path(__file__).resolve().parents[3] / "Result"
 
     def _make_export_dir(self, label: str) -> Path:
         """Create and return a timestamped subfolder under the Result directory.
@@ -4511,7 +6078,7 @@ class SpikeCurationMainWindow(QMainWindow):
                     return bundled_cfg
 
             return editable_cfg
-        return Path(__file__).resolve().parents[1] / "detection_params.json"
+        return Path(__file__).resolve().parents[2] / "detection_params.json"
 
     def _load_detection_params_config(self) -> None:
         cfg_path = self._detection_params_config_path()
@@ -4527,7 +6094,10 @@ class SpikeCurationMainWindow(QMainWindow):
 
     def reload_detection_params_config(self) -> None:
         self._load_detection_params_config()
+        self.pipeline_config = PipelineConfig.from_preset("current")
+        self._seed_pipeline_from_filter_params()
         self._push_params_to_widgets()
+        self._refresh_pipeline_steps()
         self.status_label.setText(f"Reloaded detector params: {self._detection_params_config_path().name}")
 
     def load_excel_dialog(self) -> None:
@@ -4541,6 +6111,7 @@ class SpikeCurationMainWindow(QMainWindow):
             self.btn_load_excel,
             self.btn_load_exported,
             self.btn_load_session,
+            self.btn_save_analysis_package,
             self.btn_rerun_current,
             self.btn_rerun_all,
         ]:
@@ -4567,11 +6138,16 @@ class SpikeCurationMainWindow(QMainWindow):
                 raise ValueError("corrected_traces.csv must contain a 'time' column")
 
             time = pd.to_numeric(corrected_df["time"], errors="coerce").to_numpy(dtype=float)
-            trace_cols = [col for col in corrected_df.columns if col != "time"]
+            trace_cols = [col for col in corrected_df.columns if col != "time" and not is_ignored_trace_column(col)]
             if not trace_cols:
                 raise ValueError("No trace columns found in corrected_traces.csv")
 
             self.traces.clear()
+            self._last_packaged_trace_names.clear()
+            self.current_trace_name = None
+            self.current_recording_id = None
+            self.recording_selector.clear()
+            self.trace_list.clear()
             for trace_name in trace_cols:
                 signal = pd.to_numeric(corrected_df[trace_name], errors="coerce").to_numpy(dtype=float)
                 state = TraceCuration(
@@ -4581,6 +6157,10 @@ class SpikeCurationMainWindow(QMainWindow):
                     corrected=signal.copy(),
                     time=time,
                     sampling_rate_hz=_sampling_rate_hz(time),
+                    original_time=time.copy(),
+                    original_raw=signal.copy(),
+                    original_corrected_source=signal.copy(),
+                    original_sampling_rate_hz=_sampling_rate_hz(time),
                     artifact_mask=None,
                     spikes=[],
                     smoothed=None,
@@ -4604,9 +6184,10 @@ class SpikeCurationMainWindow(QMainWindow):
                 state.sort_spikes()
 
             self.trace_names = sorted(self.traces.keys())
+            self.pipeline_config.trace_order = list(self.trace_names)
             self._refresh_trace_list()
             if self.trace_names:
-                self.trace_list.setCurrentRow(0)
+                self._select_current_visible_trace(start_analysis=False, render=True)
             self.status_label.setText(f"Loaded exported result: {folder_path.name} | traces: {len(self.trace_names)}")
         except Exception as exc:
             QMessageBox.critical(self, "Load Export Error", str(exc))
@@ -4617,13 +6198,17 @@ class SpikeCurationMainWindow(QMainWindow):
         generation = self._analysis_generation
         self.excel_path = file_path
         self.traces.clear()
+        self._last_packaged_trace_names.clear()
         self.trace_names = []
         self.current_trace_name = None
+        self.current_recording_id = None
         self._table_spikes = []
         self._analysis_tasks = []
         self._pending_session = pending_session
         self._pending_session_generation = generation if pending_session is not None else None
+        self.recording_selector.clear()
         self.trace_list.clear()
+        self._table_signature = ()
         self.table.setRowCount(0)
         self._loading_excel = True
         self._set_loading_controls_enabled(False)
@@ -4671,11 +6256,15 @@ class SpikeCurationMainWindow(QMainWindow):
             generation=int(generation),
         )
         self.trace_names = sorted(self.traces.keys())
+        self.pipeline_config.trace_order = list(self.trace_names)
         if self._pending_session is not None:
             apply_session_to_traces(self._pending_session, self.traces)
+        if self.trace_names:
+            self.current_trace_name = self.trace_names[0]
+            self.current_recording_id = split_trace_identity(self.current_trace_name)[0]
         self._refresh_trace_list()
         if self.trace_names:
-            self.trace_list.setCurrentRow(0)
+            self._select_current_visible_trace(start_analysis=False, render=True)
             self._start_analysis_for_trace(self.trace_names[0], priority=10)
             for trace_name in self.trace_names[1:]:
                 self._start_analysis_for_trace(trace_name, priority=0)
@@ -4691,7 +6280,13 @@ class SpikeCurationMainWindow(QMainWindow):
             app_session = load_session(file_path)
             self.detection_params = app_session.detection_params
             self.artifact_params = app_session.artifact_params
+            if app_session.pipeline_config:
+                self.pipeline_config = PipelineConfig.from_dict(app_session.pipeline_config)
+            else:
+                self.pipeline_config = PipelineConfig.from_preset("current")
+                self._seed_pipeline_from_filter_params()
             self._push_params_to_widgets()
+            self._refresh_pipeline_steps()
 
             if app_session.excel_path:
                 self.load_excel(app_session.excel_path, pending_session=app_session)
@@ -4713,8 +6308,49 @@ class SpikeCurationMainWindow(QMainWindow):
         if not file_path:
             return
         self._pull_params_from_widgets()
-        save_session(file_path, self.excel_path, self.detection_params, self.artifact_params, self.traces)
+        save_session(
+            file_path,
+            self.excel_path,
+            self.detection_params,
+            self.artifact_params,
+            self.traces,
+            pipeline_config=self._pipeline_config_dict(),
+        )
         self.status_label.setText(f"Session saved: {Path(file_path).name}")
+
+    def save_analysis_package_dialog(self) -> None:
+        if not self.traces:
+            return
+        if not self._analysis_ready_for_trace_names(self.trace_names, action="save analysis package"):
+            return
+        parent = QFileDialog.getExistingDirectory(
+            self,
+            "Choose Analysis Package Parent Folder",
+            str(self._result_root()),
+        )
+        if not parent:
+            return
+        self._pull_params_from_widgets()
+        try:
+            from detector.analysis.package import default_analysis_package_dir, save_analysis_package
+
+            out_dir = default_analysis_package_dir(Path(parent), self.excel_path)
+            saved_dir = save_analysis_package(
+                out_dir,
+                source_excel=self.excel_path,
+                detection_params=self.detection_params,
+                artifact_params=self.artifact_params,
+                trace_names=self.trace_names,
+                traces=self.traces,
+                pipeline_config=self._pipeline_config_dict(),
+                render_normalization_mode=self._display_normalization_mode(),
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Analysis Package Error", str(exc))
+            return
+        self._last_packaged_trace_names = set(self.trace_names)
+        self._refresh_trace_list()
+        self.status_label.setText(f"Analysis package saved: {saved_dir}")
 
     def _analysis_ready_for_trace_names(self, trace_names: List[str], action: str) -> bool:
         not_done = [
@@ -4784,6 +6420,7 @@ class SpikeCurationMainWindow(QMainWindow):
 
     def _write_export_manifest(self, out_dir: Path, export_type: str, trace_names: List[str]) -> Path:
         active_trace_names = [name for name in trace_names if name in self.traces]
+        grouped_recordings = recording_groups(active_trace_names)
         files = sorted(
             path
             for path in out_dir.rglob("*")
@@ -4797,6 +6434,15 @@ class SpikeCurationMainWindow(QMainWindow):
             "source_excel": self.excel_path,
             "trace_count": len(active_trace_names),
             "traces": [str(name) for name in active_trace_names],
+            "recordings": [
+                {
+                    "recording_id": recording_id,
+                    "roi_count": len(names),
+                    "roi_ids": [split_trace_identity(name)[1] for name in names],
+                    "traces": [str(name) for name in names],
+                }
+                for recording_id, names in grouped_recordings.items()
+            ],
             "folders": {
                 "tables": EXPORT_TABLES_DIR,
                 "reports": EXPORT_REPORTS_DIR,
@@ -4836,13 +6482,17 @@ class SpikeCurationMainWindow(QMainWindow):
         self._write_export_tables_and_report(out_dir, self.trace_names)
 
         images_dir = out_dir / "images"
+        traces_dir = images_dir / "traces"
         spikes_dir = images_dir / "spikes"
         plateaus_dir = images_dir / "plateaus"
+        recordings_dir = images_dir / "recordings"
         denoising_debug_dir = images_dir / "denoising_debug"
         long_plateau_debug_dir = images_dir / "plateau_debug" / "long"
         summary_dir = images_dir / "summary"
+        traces_dir.mkdir(parents=True, exist_ok=True)
         spikes_dir.mkdir(parents=True, exist_ok=True)
         plateaus_dir.mkdir(parents=True, exist_ok=True)
+        recordings_dir.mkdir(parents=True, exist_ok=True)
         denoising_debug_dir.mkdir(parents=True, exist_ok=True)
         long_plateau_debug_dir.mkdir(parents=True, exist_ok=True)
         summary_dir.mkdir(parents=True, exist_ok=True)
@@ -4889,11 +6539,19 @@ class SpikeCurationMainWindow(QMainWindow):
                 spikes_dir=spikes_dir,
                 plateaus_dir=plateaus_dir,
             )
+            exported_trace_images = self._export_trace_level_bundle(state, traces_dir)
             plateau_mask_for_export = export_view["plateau_mask"]
             has_plateau_map = bool(
                 plateau_mask_for_export is not None and np.any(np.asarray(plateau_mask_for_export, dtype=bool))
             )
-            if exported_count <= 0 and not has_plateau_map:
+            has_failed_plateau_candidates = bool(
+                _rejected_long_plateau_rows_for_export(
+                    state.long_plateau_debug,
+                    int(export_view["startup_idx"]),
+                    int(len(export_view["time"])),
+                )
+            )
+            if exported_count <= 0 and exported_trace_images <= 0 and not has_plateau_map and not has_failed_plateau_candidates:
                 continue
             exported_traces += 1
             if not aligned_pix.isNull():
@@ -4920,7 +6578,62 @@ class SpikeCurationMainWindow(QMainWindow):
                     (trace_name, export_view["time"], export_view["corrected"], np.asarray(plateau_mask_for_export, dtype=bool))
                 )
 
-        if exported_traces > 0:
+        if self.trace_names:
+            try:
+                from detector.exporter.render_options import RenderOptions
+                from detector.exporter.rendering import render_recording_aligned_trace_panels
+
+                panel_rows: List[Dict[str, object]] = []
+                panel_options = RenderOptions(
+                    normalization_mode=NORMALIZATION_PERCENT_DFF,
+                    aligned_panel_channel="denoised",
+                    aligned_panel_auto_y=True,
+                    aligned_panel_share_y=False,
+                )
+                for recording_id, names in recording_groups(self.trace_names).items():
+                    states = [self.traces[name] for name in names if name in self.traces]
+                    pix, metadata = render_recording_aligned_trace_panels(
+                        recording_id,
+                        states,
+                        self.detection_params,
+                        panel_options,
+                    )
+                    if pix.isNull():
+                        continue
+                    safe_recording = "".join(c if c.isalnum() else "_" for c in str(recording_id))
+                    panel_path = recordings_dir / f"{safe_recording}_aligned_trace_panels_percent_dff.png"
+                    if pix.save(str(panel_path)):
+                        traces_text = metadata.get("traces", [])
+                        if isinstance(traces_text, list):
+                            traces_text = ";".join(str(value) for value in traces_text)
+                        panel_rows.append(
+                            {
+                                "recording_id": recording_id,
+                                "trace_count": metadata.get("trace_count", 0),
+                                "traces": traces_text,
+                                "image_path": str(panel_path.relative_to(out_dir)),
+                                "normalization_mode": metadata.get("normalization_mode", ""),
+                                "unit": metadata.get("unit", ""),
+                                "source_channel": metadata.get("source_channel", ""),
+                                "share_y": metadata.get("share_y", False),
+                                "plot_y_label": metadata.get("plot_y_label", ""),
+                                "y_limit_low_percentile": metadata.get("y_limit_low_percentile", float("nan")),
+                                "y_limit_high_percentile": metadata.get("y_limit_high_percentile", float("nan")),
+                                "y_limit_min_span": metadata.get("y_limit_min_span", float("nan")),
+                                "time_start": metadata.get("time_start", float("nan")),
+                                "time_end": metadata.get("time_end", float("nan")),
+                                "y_min": metadata.get("y_min", float("nan")),
+                                "y_max": metadata.get("y_max", float("nan")),
+                            }
+                        )
+                if panel_rows:
+                    pd.DataFrame(panel_rows).to_csv(
+                        out_dir / EXPORT_TABLES_DIR / "recording_aligned_trace_panel_scales.csv",
+                        index=False,
+                    )
+            except Exception as exc:
+                print(f"Recording aligned trace panel export failed: {exc}", file=sys.stderr)
+
             # Grid of per-trace superimposed waveform plots placed side-by-side.
             superimposed_grid = _compose_horizontal_traces_png(
                 all_trace_superimposed_pixmaps,
@@ -4986,6 +6699,13 @@ class SpikeCurationMainWindow(QMainWindow):
         has_plateau_map = bool(
             plateau_mask_for_export is not None and np.any(np.asarray(plateau_mask_for_export, dtype=bool))
         )
+        has_failed_plateau_candidates = bool(
+            _rejected_long_plateau_rows_for_export(
+                state.long_plateau_debug,
+                int(export_view["startup_idx"]),
+                int(len(export_view["time"])),
+            )
+        )
 
         safe_name = "".join(c if c.isalnum() else "_" for c in state.trace_name)
         out_dir = self._make_export_dir(f"export_current_{safe_name}")
@@ -4993,11 +6713,13 @@ class SpikeCurationMainWindow(QMainWindow):
         self._write_export_tables_and_report(out_dir, [state.trace_name])
 
         images_dir = out_dir / "images"
+        traces_dir = images_dir / "traces"
         spikes_dir = images_dir / "spikes"
         plateaus_dir = images_dir / "plateaus"
         denoising_debug_dir = images_dir / "denoising_debug"
         long_plateau_debug_dir = images_dir / "plateau_debug" / "long"
         summary_dir = images_dir / "summary"
+        traces_dir.mkdir(parents=True, exist_ok=True)
         spikes_dir.mkdir(parents=True, exist_ok=True)
         plateaus_dir.mkdir(parents=True, exist_ok=True)
         denoising_debug_dir.mkdir(parents=True, exist_ok=True)
@@ -5024,7 +6746,8 @@ class SpikeCurationMainWindow(QMainWindow):
                 startup_exclusion_ms=startup_exclusion_ms,
             )
         exported_count = 0
-        if has_spikes or has_plateau_map:
+        exported_trace_images = self._export_trace_level_bundle(state, traces_dir)
+        if has_spikes or has_plateau_map or has_failed_plateau_candidates:
             exported_count, _aligned_pix, _superimposed_pix = self._export_trace_spike_bundle(
                 state,
                 out_dir,
@@ -5032,7 +6755,11 @@ class SpikeCurationMainWindow(QMainWindow):
                 plateaus_dir=plateaus_dir,
             )
         self._write_export_manifest(out_dir, "current", [state.trace_name])
-        image_note = " with images" if exported_count > 0 or has_plateau_map else "; no spike/plateau images were available"
+        image_note = (
+            " with images"
+            if exported_count > 0 or exported_trace_images > 0 or has_plateau_map or has_failed_plateau_candidates
+            else "; no spike/plateau images were available"
+        )
         self.status_label.setText(
             f"Exported current trace tables, reports, reload files{image_note}; denoising debug images to {out_dir}"
         )
@@ -5042,6 +6769,108 @@ class SpikeCurationMainWindow(QMainWindow):
 
     def export_png_current_dialog(self) -> None:
         self.export_current_dialog()
+
+    def _export_trace_level_bundle(self, state: TraceCuration, traces_dir: Path) -> int:
+        safe_name = "".join(c if c.isalnum() else "_" for c in state.trace_name)
+        export_view = _startup_trimmed_trace_export_data(state, float(self.detection_params.startup_exclusion_ms))
+        time = np.asarray(export_view["time"], dtype=float)
+        raw = export_view["raw"]
+        corrected = export_view["corrected"]
+        denoised = export_view["hybrid_denoised"]
+        plateau_mask = export_view["plateau_mask"]
+        spikes = export_view["spikes"]
+        written = 0
+
+        if raw is not None:
+            raw_pix = _render_whole_trace_png(
+                trace_name=state.trace_name,
+                time=time,
+                signal=np.asarray(raw, dtype=float),
+                title_suffix="raw trace",
+                line_color="#455a64",
+                width=1800,
+                height=500,
+            )
+            if not raw_pix.isNull():
+                raw_pix.save(str(traces_dir / f"{safe_name}_raw_trace.png"))
+                written += 1
+
+        corrected_pix = _render_whole_trace_png(
+            trace_name=state.trace_name,
+            time=time,
+            signal=np.asarray(corrected, dtype=float),
+            title_suffix="corrected trace with plateaus",
+            line_color="#2979ff",
+            plateau_mask=np.asarray(plateau_mask, dtype=bool) if plateau_mask is not None else None,
+            width=1800,
+            height=500,
+        )
+        if not corrected_pix.isNull():
+            corrected_pix.save(str(traces_dir / f"{safe_name}_corrected_trace_plateaus.png"))
+            written += 1
+
+        if denoised is not None:
+            denoised_arr = np.asarray(denoised, dtype=float)
+            denoised_pix = _render_whole_trace_png(
+                trace_name=state.trace_name,
+                time=time,
+                signal=denoised_arr,
+                title_suffix="denoised trace with spikes",
+                line_color="#8e24aa",
+                spikes=spikes,
+                width=1800,
+                height=500,
+            )
+            if not denoised_pix.isNull():
+                denoised_pix.save(str(traces_dir / f"{safe_name}_denoised_trace_spikes.png"))
+                written += 1
+            corrected_arr = np.asarray(corrected, dtype=float)
+            if denoised_arr.shape == corrected_arr.shape:
+                residual_pix = _render_whole_trace_png(
+                    trace_name=state.trace_name,
+                    time=time,
+                    signal=corrected_arr - denoised_arr,
+                    title_suffix="denoise residual",
+                    line_color="#d81b60",
+                    width=1800,
+                    height=500,
+                )
+                if not residual_pix.isNull():
+                    residual_pix.save(str(traces_dir / f"{safe_name}_denoise_residual.png"))
+                    written += 1
+
+        if raw is not None:
+            raw_arr = np.asarray(raw, dtype=float)
+            raw_corrected_pix = _render_raw_processed_comparison_png(
+                trace_name=state.trace_name,
+                time=time,
+                raw=raw_arr,
+                processed=np.asarray(corrected, dtype=float),
+                processed_label="corrected",
+                processed_color="#2979ff",
+                width=1800,
+                height=700,
+            )
+            if not raw_corrected_pix.isNull():
+                raw_corrected_pix.save(str(traces_dir / f"{safe_name}_raw_vs_corrected.png"))
+                written += 1
+
+            if denoised is not None:
+                raw_denoised_pix = _render_raw_processed_comparison_png(
+                    trace_name=state.trace_name,
+                    time=time,
+                    raw=raw_arr,
+                    processed=np.asarray(denoised, dtype=float),
+                    processed_label="denoised",
+                    processed_color="#8e24aa",
+                    width=1800,
+                    height=700,
+                )
+                if not raw_denoised_pix.isNull():
+                    raw_denoised_pix.save(str(traces_dir / f"{safe_name}_raw_vs_denoised.png"))
+                    written += 1
+
+        return written
 
     def _export_trace_spike_bundle(
         self,
@@ -5084,7 +6913,7 @@ class SpikeCurationMainWindow(QMainWindow):
             if pix.isNull():
                 continue
             spike_pixmaps.append(pix)
-            pix.save(str(spike_out / f"{safe_name}_spike{spike_idx:04d}.png"))
+            pix.save(str(spike_out / f"{safe_name}_spike_event_{spike_idx:04d}.png"))
 
         # Render superimposed (overlaid) spikes
         superimposed_pix = _render_superimposed_spikes_png(
@@ -5118,6 +6947,11 @@ class SpikeCurationMainWindow(QMainWindow):
                 if export_view["short_plateau_mask"] is not None
                 else np.zeros_like(plateau_mask, dtype=bool)
             )
+            burst_plateau_mask = (
+                np.asarray(export_view["burst_plateau_mask"], dtype=bool)
+                if export_view["burst_plateau_mask"] is not None
+                else np.zeros_like(plateau_mask, dtype=bool)
+            )
             full_trace_plateau_pix = _render_full_trace_plateau_png(
                 trace_name=state.trace_name,
                 time=time,
@@ -5125,12 +6959,12 @@ class SpikeCurationMainWindow(QMainWindow):
                 plateau_mask=plateau_mask,
                 long_plateau_mask=long_plateau_mask,
                 short_plateau_mask=short_plateau_mask,
-                spikes=spikes,
+                burst_plateau_mask=burst_plateau_mask,
                 width=1800,
                 height=500,
             )
             if not full_trace_plateau_pix.isNull():
-                full_trace_plateau_pix.save(str(plateau_out / f"{safe_name}_full_trace_plateau_codes.png"))
+                full_trace_plateau_pix.save(str(plateau_out / f"{safe_name}_full_trace_plateaus.png"))
 
             plateau_superimposed_pix = _render_superimposed_plateaus_png(
                 trace_name=state.trace_name,
@@ -5143,34 +6977,57 @@ class SpikeCurationMainWindow(QMainWindow):
             if not plateau_superimposed_pix.isNull():
                 plateau_superimposed_pix.save(str(plateau_out / f"{safe_name}_plateaus_superimposed_onset0.png"))
 
-            plateau_rows = _plateau_code_rows(
+            plateau_rows = _plateau_rows(
                 trace_name=state.trace_name,
                 time=time,
                 plateau_mask=plateau_mask,
                 long_plateau_mask=long_plateau_mask,
                 short_plateau_mask=short_plateau_mask,
+                burst_plateau_mask=burst_plateau_mask,
+                burst_plateau_events=export_view["burst_plateau_events"],
+                plateau_signal_classification=export_view["plateau_signal_classification"],
+                sampling_rate_hz=_trace_sampling_rate_hz(state),
             )
             if plateau_rows:
-                pd.DataFrame(plateau_rows).to_csv(str(plateau_out / f"{safe_name}_plateau_codes.csv"), index=False)
+                pd.DataFrame(plateau_rows).to_csv(str(plateau_out / f"{safe_name}_plateaus.csv"), index=False)
 
                 regions = _contiguous_true_regions(plateau_mask)
                 for idx, (start, end) in enumerate(regions, 1):
-                    plateau_code = f"P{idx:03d}"
-                    plateau_source = _plateau_source_for_region(start, end, long_plateau_mask, short_plateau_mask)
+                    plateau_source = _plateau_source_for_region(start, end, long_plateau_mask, short_plateau_mask, burst_plateau_mask)
+                    signal_type = str(
+                        _signal_metrics_for_region(
+                            export_view["plateau_signal_classification"],
+                            start,
+                            end,
+                        ).get("signal_type", "unknown")
+                    )
                     zoom_pix = _render_plateau_zoom_png(
                         trace_name=state.trace_name,
-                        plateau_code=plateau_code,
                         time=time,
                         corrected=corrected,
                         start_idx=int(start),
                         end_idx_exclusive=int(end),
                         plateau_source=plateau_source,
-                        spikes=spikes,
+                        signal_type=signal_type,
                         width=1400,
                         height=420,
                     )
                     if not zoom_pix.isNull():
-                        zoom_pix.save(str(plateau_out / f"{safe_name}_{plateau_code}_zoom_onset0.png"))
+                        zoom_pix.save(str(plateau_out / f"{safe_name}_plateau_zoom_{idx:03d}.png"))
+                    zoom_unshaded_pix = _render_plateau_zoom_png(
+                        trace_name=state.trace_name,
+                        time=time,
+                        corrected=corrected,
+                        start_idx=int(start),
+                        end_idx_exclusive=int(end),
+                        plateau_source=plateau_source,
+                        signal_type=signal_type,
+                        shade_region=False,
+                        width=1400,
+                        height=420,
+                    )
+                    if not zoom_unshaded_pix.isNull():
+                        zoom_unshaded_pix.save(str(plateau_out / f"{safe_name}_plateau_zoom_{idx:03d}_no_shading.png"))
 
             short_events = np.asarray(
                 state.short_plateau_events if state.short_plateau_events is not None else np.zeros((0, 6), dtype=float),
@@ -5193,58 +7050,157 @@ class SpikeCurationMainWindow(QMainWindow):
                 short_df["offset_index_exclusive"] = short_df["offset_index_exclusive"].astype(int)
                 short_df.to_csv(str(plateau_out / f"{safe_name}_short_plateau_detector_events.csv"), index=False)
 
+            burst_events = np.asarray(
+                export_view["burst_plateau_events"],
+                dtype=float,
+            )
+            if burst_events.ndim == 2 and burst_events.shape[0] > 0 and burst_events.shape[1] == 8:
+                burst_df = pd.DataFrame(
+                    burst_events,
+                    columns=[
+                        "onset_index",
+                        "offset_index_exclusive",
+                        "duration_ms",
+                        "median_level",
+                        "floor_support_fraction",
+                        "peak_dominance_noise",
+                        "iqr_over_noise",
+                        "confidence",
+                    ],
+                )
+                burst_df.insert(0, "trace_name", state.trace_name)
+                burst_df["onset_index"] = burst_df["onset_index"].astype(int)
+                burst_df["offset_index_exclusive"] = burst_df["offset_index_exclusive"].astype(int)
+                burst_df.to_csv(str(plateau_out / f"{safe_name}_burst_plateau_detector_events.csv"), index=False)
+
+            burst_debug_rows = []
+            if isinstance(state.burst_plateau_debug, dict):
+                raw_rows = state.burst_plateau_debug.get("burst_plateau_candidate_rows", [])
+                if isinstance(raw_rows, list):
+                    burst_debug_rows = [row for row in raw_rows if isinstance(row, dict)]
+            if burst_debug_rows:
+                pd.DataFrame(burst_debug_rows).to_csv(
+                    str(plateau_out / f"{safe_name}_burst_plateau_candidate_debug.csv"),
+                    index=False,
+                )
+
+        rejected_rows = _rejected_long_plateau_rows_for_export(
+            state.long_plateau_debug,
+            int(export_view["startup_idx"]),
+            int(len(time)),
+        )
+        for row in rejected_rows[:50]:
+            region_id = int(row.get("region_id", 0))
+            start = int(row.get("display_start_index", row.get("start_index", 0)))
+            end = int(row.get("display_end_index_exclusive", start + 1))
+            candidate_pix = _render_plateau_zoom_png(
+                trace_name=state.trace_name,
+                time=time,
+                corrected=corrected,
+                start_idx=start,
+                end_idx_exclusive=end,
+                plateau_source="rejected",
+                shade_region=False,
+                width=1400,
+                height=420,
+            )
+            if not candidate_pix.isNull():
+                candidate_pix.save(str(plateau_out / f"{safe_name}_failed_candidate_zoom_{region_id:03d}.png"))
+
         return len(spike_pixmaps), aligned_pix, superimposed_pix
 
 
     def _refresh_trace_list(self) -> None:
         selected = self.current_trace_name
+        self._sync_recording_selector(selected)
+        visible_names = self._visible_trace_names()
+        if selected not in visible_names and visible_names:
+            selected = visible_names[0]
+            self.current_trace_name = selected
         self.trace_list.blockSignals(True)
         self.trace_list.clear()
-        for name in self.trace_names:
+        for name in visible_names:
             state = self.traces.get(name)
-            suffix = ""
-            if state is not None:
-                if state.analysis_status == "pending":
-                    suffix = " [pending]"
-                elif state.analysis_status == "running":
-                    suffix = " [analyzing]"
-                elif state.analysis_status == "error":
-                    suffix = " [error]"
-            item = QListWidgetItem(f"{name}{suffix}")
+            item = QListWidgetItem(self._trace_list_label(name, state))
             item.setData(Qt.ItemDataRole.UserRole, name)
             self.trace_list.addItem(item)
-        if selected in self.trace_names:
-            self.trace_list.setCurrentRow(self.trace_names.index(selected))
+        if selected in visible_names:
+            self.trace_list.setCurrentRow(visible_names.index(str(selected)))
         self.trace_list.blockSignals(False)
+        self._update_trace_queue_status()
+
+    def _trace_status_suffix(self, trace_name: str, state: Optional[TraceCuration]) -> str:
+        if trace_name in self._last_packaged_trace_names:
+            return " [packaged]"
+        if state is None:
+            return ""
+        if state.analysis_status == "pending":
+            return " [pending]"
+        if state.analysis_status == "running":
+            return " [analyzing]"
+        if state.analysis_status == "error":
+            return " [failed]"
+        if state.analysis_status == "done":
+            return " [reviewed]"
+        return ""
 
     def _refresh_trace_list_item(self, trace_name: str) -> None:
+        visible_names = self._visible_trace_names()
         try:
-            row = self.trace_names.index(trace_name)
+            row = visible_names.index(trace_name)
         except ValueError:
+            self._update_trace_queue_status()
             return
         item = self.trace_list.item(row)
         state = self.traces.get(trace_name)
         if item is None or state is None:
+            self._update_trace_queue_status()
             return
-        suffix = ""
-        if state.analysis_status == "pending":
-            suffix = " [pending]"
-        elif state.analysis_status == "running":
-            suffix = " [analyzing]"
-        elif state.analysis_status == "error":
-            suffix = " [error]"
-        item.setText(f"{trace_name}{suffix}")
+        item.setText(self._trace_list_label(trace_name, state))
         item.setData(Qt.ItemDataRole.UserRole, trace_name)
+        self._update_trace_queue_status()
 
-    def _make_analysis_request(self, state: TraceCuration) -> TraceAnalysisRequest:
+    def _source_arrays_for_analysis(self, state: TraceCuration) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+        time = (
+            np.asarray(state.original_time, dtype=float)
+            if state.original_time is not None
+            else np.asarray(state.time, dtype=float)
+        )
+        raw = (
+            np.asarray(state.original_raw, dtype=float)
+            if state.original_raw is not None
+            else np.asarray(state.raw, dtype=float)
+        )
+        corrected_source = (
+            np.asarray(state.original_corrected_source, dtype=float)
+            if state.original_corrected_source is not None
+            else np.asarray(state.corrected_source, dtype=float)
+        )
+        sampling_rate_hz = state.original_sampling_rate_hz
+        if sampling_rate_hz is None or not np.isfinite(sampling_rate_hz) or float(sampling_rate_hz) <= 0.0:
+            sampling_rate_hz = _sampling_rate_hz(time)
+        return time, raw, corrected_source, float(sampling_rate_hz)
+
+    def _make_analysis_request(
+        self,
+        state: TraceCuration,
+        template_indices_override: Optional[List[int]] = None,
+    ) -> TraceAnalysisRequest:
+        source_time, source_raw, source_corrected, source_sampling_rate_hz = self._source_arrays_for_analysis(state)
+        detection_params = _clone_detection_params(self.detection_params)
+        mode = str(detection_params.detection_mode).strip().lower()
+        if mode in {"template_matching", "template-matching", "template matching", "evans", "evans_log_likelihood"}:
+            if not list(getattr(detection_params, "template_matching_template_indices", [])):
+                detection_params.template_matching_template_indices = list(template_indices_override or [])
         return TraceAnalysisRequest(
             trace_name=state.trace_name,
-            time=np.asarray(state.time, dtype=float).copy(),
-            raw=np.asarray(state.raw, dtype=float).copy(),
-            corrected_source=np.asarray(state.corrected_source, dtype=float).copy(),
-            sampling_rate_hz=_trace_sampling_rate_hz(state),
-            detection_params=_clone_detection_params(self.detection_params),
+            time=source_time.copy(),
+            raw=source_raw.copy(),
+            corrected_source=source_corrected.copy(),
+            sampling_rate_hz=source_sampling_rate_hz,
+            detection_params=detection_params,
             artifact_params=_clone_artifact_params(self.artifact_params),
+            pipeline_config=self._pipeline_config_dict(),
             generation=int(self._analysis_generation),
         )
 
@@ -5254,8 +7210,14 @@ class SpikeCurationMainWindow(QMainWindow):
             return
         if not force and state.analysis_status in {"running", "done"}:
             return
+        template_indices = _user_template_indices_from_trace(state)
         if force:
-            state.corrected = np.asarray(state.corrected_source, dtype=float).copy()
+            source_time, source_raw, source_corrected, source_sampling_rate_hz = self._source_arrays_for_analysis(state)
+            state.time = source_time.copy()
+            state.raw = source_raw.copy()
+            state.corrected_source = source_corrected.copy()
+            state.corrected = source_corrected.copy()
+            state.sampling_rate_hz = source_sampling_rate_hz
             state.hybrid_denoised = None
             state.hybrid_denoised_cache_key = None
             state.hybrid_denoised_pending_key = None
@@ -5264,12 +7226,17 @@ class SpikeCurationMainWindow(QMainWindow):
             state.baseline = np.zeros_like(state.corrected, dtype=float)
             state.correction_baseline = None
             state.highpass_trace = None
+            state.lowpass_trace = None
             state.artifact_mask = None
             state.plateau_mask = None
             state.long_plateau_mask = None
             state.long_plateau_debug = None
             state.short_plateau_mask = None
             state.short_plateau_events = None
+            state.burst_plateau_mask = None
+            state.burst_plateau_events = None
+            state.burst_plateau_debug = None
+            state.plateau_signal_classification = None
             state.debug_threshold = None
             state.candidate_windows = []
             state.spikes = []
@@ -5280,8 +7247,8 @@ class SpikeCurationMainWindow(QMainWindow):
         state.analysis_error = ""
         state.analysis_generation = int(self._analysis_generation)
         self._refresh_trace_list_item(trace_name)
-        request = self._make_analysis_request(state)
-        task = _TraceAnalysisTask(request, self._hybrid_denoise_fn)
+        request = self._make_analysis_request(state, template_indices_override=template_indices)
+        task = _TraceAnalysisTask(request)
         task.signals.finished.connect(self._on_trace_analysis_finished)
         self._analysis_tasks.append(task)
         self._analysis_thread_pool.start(task, priority=int(priority))
@@ -5298,6 +7265,7 @@ class SpikeCurationMainWindow(QMainWindow):
             excel_path=self._pending_session.excel_path,
             detection_params=self._pending_session.detection_params,
             artifact_params=self._pending_session.artifact_params,
+            pipeline_config=dict(self._pending_session.pipeline_config),
             trace_states={trace_name: self._pending_session.trace_states[trace_name]},
         )
         apply_session_to_traces(trace_session, {trace_name: state})
@@ -5305,17 +7273,29 @@ class SpikeCurationMainWindow(QMainWindow):
     def _apply_analysis_result(self, state: TraceCuration, result: TraceAnalysisResult) -> None:
         detection = result.detection
         state.spikes = detection.spikes
+        state.time = np.asarray(result.time, dtype=float)
+        state.raw = np.asarray(result.raw, dtype=float)
+        state.corrected_source = np.asarray(result.corrected_source, dtype=float)
         state.corrected = result.corrected
         state.sampling_rate_hz = result.sampling_rate_hz
         state.hybrid_denoised = result.hybrid_denoised
         state.gonzalez_cwt_debug = dict(result.gonzalez_cwt_debug)
         state.gonzalez_cwt_debug_cache_key = self._gonzalez_cwt_debug_cache_key()
-        state.hybrid_denoised_cache_key = self._hybrid_cache_key()
+        state.hybrid_denoised_cache_key = self._denoise_cache_key()
         state.hybrid_denoised_pending_key = None
         state.smoothed = detection.smoothed
         state.baseline = detection.baseline
         state.correction_baseline = result.correction_baseline
-        state.highpass_trace = _detection_highpass_trace(detection, self.detection_params.use_highpass_filter)
+        state.highpass_trace = (
+            np.asarray(result.highpass_trace, dtype=float)
+            if result.highpass_trace is not None
+            else _detection_highpass_trace(detection, self.detection_params.use_highpass_filter)
+        )
+        state.lowpass_trace = (
+            np.asarray(result.lowpass_trace, dtype=float)
+            if result.lowpass_trace is not None
+            else _detection_lowpass_trace(detection, self.detection_params.use_lowpass_filter)
+        )
         state.artifact_mask = np.asarray(result.artifact_mask, dtype=bool)
         state.debug_threshold = detection.threshold
         state.candidate_windows = detection.candidate_windows
@@ -5324,6 +7304,10 @@ class SpikeCurationMainWindow(QMainWindow):
         state.long_plateau_debug = dict(result.long_plateau_debug)
         state.short_plateau_mask = _detection_mask(detection, "short_plateau_mask", fallback_key="")
         state.short_plateau_events = _detection_short_events(detection)
+        state.burst_plateau_mask = _detection_mask(detection, "burst_plateau_mask", fallback_key="")
+        state.burst_plateau_events = _detection_burst_events(detection)
+        state.burst_plateau_debug = _detection_burst_debug(detection)
+        state.plateau_signal_classification = list(result.plateau_signal_classification)
         state.analysis_status = "done"
         state.analysis_error = ""
         self._apply_saved_session_state_to_trace(state.trace_name)
@@ -5367,10 +7351,28 @@ class SpikeCurationMainWindow(QMainWindow):
             self._pending_session = None
             self._pending_session_generation = None
 
-    def on_trace_selected(self, row: int) -> None:
-        if row < 0 or row >= len(self.trace_names):
+    def _on_recording_selected(self, index: int) -> None:
+        if index < 0:
             return
-        self.current_trace_name = self.trace_names[row]
+        recording_id = self.recording_selector.itemData(index)
+        if recording_id is None:
+            return
+        self.current_recording_id = str(recording_id)
+        visible_names = self._visible_trace_names()
+        if visible_names:
+            self.current_trace_name = visible_names[0]
+        else:
+            self.current_trace_name = None
+        self._refresh_trace_list()
+        if self.current_trace_name:
+            self._start_analysis_for_trace(self.current_trace_name, priority=10)
+            self._render_current_trace(reset_view=True)
+
+    def on_trace_selected(self, row: int) -> None:
+        visible_names = self._visible_trace_names()
+        if row < 0 or row >= len(visible_names):
+            return
+        self.current_trace_name = visible_names[row]
         self._start_analysis_for_trace(self.current_trace_name, priority=10)
         self._render_current_trace(reset_view=True)
 
@@ -5390,34 +7392,79 @@ class SpikeCurationMainWindow(QMainWindow):
             show_corrected=self.chk_show_corrected.isChecked(),
             show_baseline=self.chk_show_baseline.isChecked(),
             show_highpass=self.chk_show_highpass.isChecked(),
+            show_lowpass=self.chk_show_lowpass.isChecked(),
             show_hybrid_denoised=self.chk_show_hybrid_denoised.isChecked(),
+            show_normalized_denoised=self.chk_show_normalized_denoised.isChecked(),
+            show_denoise_residual=self.chk_show_denoise_residual.isChecked(),
         )
 
         raw_for_view = np.asarray(state.raw, dtype=float)
         corrected_for_view = np.asarray(state.corrected, dtype=float)
         raw_baseline_for_view = _raw_baseline_for_display(raw_for_view, state.correction_baseline)
-        hybrid_for_view = _as_corrected_units(
+        denoised_for_view = _as_corrected_units(
             state.hybrid_denoised,
             corrected_reference=corrected_for_view,
             correction_baseline=state.correction_baseline,
         )
-        if hybrid_for_view is not None and state.hybrid_denoised is not None:
-            state.hybrid_denoised = np.asarray(hybrid_for_view, dtype=float)
+        if denoised_for_view is not None and state.hybrid_denoised is not None:
+            state.hybrid_denoised = np.asarray(denoised_for_view, dtype=float)
         corrected_baseline_for_view = _zero_baseline_for_corrected(corrected_for_view)
+        highpass_for_view = state.highpass_trace
+        lowpass_for_view = state.lowpass_trace
+        normalized_denoised_for_view = (
+            normalize_trace_values(denoised_for_view, state, NORMALIZATION_PERCENT_DFF)
+            if denoised_for_view is not None
+            else None
+        )
+        display_mode = self._display_normalization_mode()
+        if display_mode == NORMALIZATION_PERCENT_DFF:
+            raw_f0, _raw_f0_source, _raw_f0_median = f0_values_for_trace(state, raw_for_view.size)
+            raw_for_view = normalize_values_with_f0(raw_for_view - raw_f0, raw_f0)
+            raw_baseline_for_view = np.zeros_like(raw_for_view, dtype=float)
+            corrected_for_view = normalize_trace_values(corrected_for_view, state, display_mode)
+            corrected_baseline_for_view = np.zeros_like(corrected_for_view, dtype=float)
+            if denoised_for_view is not None:
+                denoised_for_view = normalize_trace_values(denoised_for_view, state, display_mode)
+            if highpass_for_view is not None:
+                highpass_for_view = normalize_trace_values(highpass_for_view, state, display_mode)
+            if lowpass_for_view is not None:
+                lowpass_for_view = normalize_trace_values(lowpass_for_view, state, display_mode)
+
+        selected_render_source = self._selected_render_source()
+        selected_overlay_for_view = self._selected_pipeline_signal_for_display(
+            selected_render_source,
+            raw=raw_for_view,
+            raw_baseline=raw_baseline_for_view,
+            corrected=corrected_for_view,
+            denoised=denoised_for_view,
+            normalized_denoised=normalized_denoised_for_view,
+            highpass=highpass_for_view,
+            lowpass=lowpass_for_view,
+        )
+        denoise_residual_for_view = (
+            corrected_for_view - denoised_for_view
+            if denoised_for_view is not None and np.asarray(denoised_for_view).shape == corrected_for_view.shape
+            else None
+        )
 
         self.plot.set_trace(
             time=state.time,
             raw=raw_for_view,
             corrected=corrected_for_view,
-            hybrid_denoised=hybrid_for_view,
-            highpass=state.highpass_trace,
+            hybrid_denoised=selected_overlay_for_view,
+            normalized_denoised=normalized_denoised_for_view,
+            denoise_residual=denoise_residual_for_view,
+            highpass=highpass_for_view,
+            lowpass=lowpass_for_view,
             raw_baseline=raw_baseline_for_view,
             corrected_baseline=corrected_baseline_for_view,
             spikes=spikes_for_plot,
             plateau_mask=state.plateau_mask,
             long_plateau_mask=state.long_plateau_mask,
             short_plateau_mask=state.short_plateau_mask,
+            burst_plateau_mask=state.burst_plateau_mask,
             artifact_mask=state.artifact_mask,
+            selected_overlay_label=_render_source_label(selected_render_source),
             reset_view=reset_view,
             refit_y=refit_y,
             startup_exclusion_ms=self.detection_params.startup_exclusion_ms,
@@ -5435,20 +7482,18 @@ class SpikeCurationMainWindow(QMainWindow):
         plateau_count = 0
         if state.plateau_mask is not None:
             plateau_count = len(_contiguous_true_regions(np.asarray(state.plateau_mask, dtype=bool)))
-        short_count = 0
-        if state.short_plateau_mask is not None:
-            short_count = len(_contiguous_true_regions(np.asarray(state.short_plateau_mask, dtype=bool)))
         hybrid_status = ""
         if self.chk_show_hybrid_denoised.isChecked():
-            mode = str(self.param_low_state_denoiser.currentData() or "gonzalez_full_trace")
-            label = "Gonzalez full-trace denoised" if mode == "gonzalez_full_trace" else "denoised"
-            hybrid_status = f" | {label}: shown" if state.hybrid_denoised is not None else ""
+            label = _render_source_label(selected_render_source)
+            hybrid_status = f" | overlay {label}: shown" if selected_overlay_for_view is not None else f" | overlay {label}: unavailable"
+        if self.chk_show_denoise_residual.isChecked():
+            hybrid_status += " | residual: shown" if denoise_residual_for_view is not None else ""
         fs_status = f" | fs: {_trace_sampling_rate_hz(state):.3g} Hz"
         self.status_label.setText(
-            f"Trace: {state.trace_name}{fs_status} | plateaus: {plateau_count} (short: {short_count}) | spikes: {len(state.spikes)}{hybrid_status}"
+            f"Trace: {state.trace_name}{fs_status} | plateaus: {plateau_count} | spikes: {len(state.spikes)}{hybrid_status}"
         )
 
-    def _low_state_denoise_kwargs(self) -> Dict[str, object]:
+    def _gonzalez_denoise_kwargs(self) -> Dict[str, object]:
         return {
             "threshold_sd": float(self.param_gonzalez_threshold_sd.value()),
             "max_clusters": int(self.param_gonzalez_max_clusters.value()),
@@ -5456,54 +7501,37 @@ class SpikeCurationMainWindow(QMainWindow):
             "attenuation_max": float(self.param_gonzalez_attenuation_max.value()),
             "enable_noise_cluster_rejection": bool(self.param_gonzalez_noise_cluster_rejection.isChecked()),
             "enable_event_template_rejection": bool(self.param_gonzalez_event_template_rejection.isChecked()),
-            "enable_low_state_safety_gate": bool(self.detection_params.enable_low_state_safety_gate),
+            "enable_denoise_safety_gate": bool(self.detection_params.enable_denoise_safety_gate),
             "min_event_peak_preservation": float(self.detection_params.min_event_peak_preservation),
             "min_local_max_ratio": float(self.detection_params.min_local_max_ratio),
-            "min_reliable_low_state_fraction": float(self.detection_params.min_reliable_low_state_fraction),
-            "min_reliable_low_state_samples": int(self.detection_params.min_reliable_low_state_samples),
-            "plateau_tv_min_duration_ms": float(self.detection_params.plateau_tv_min_duration_ms),
-            "plateau_tv_max_weight_factor": float(self.detection_params.plateau_tv_max_weight_factor),
         }
 
-    def _hybrid_cache_key(self) -> Tuple[object, ...]:
-        low_state_denoiser = str(self.param_low_state_denoiser.currentData() or "gonzalez_full_trace")
-        state_aware_mode = low_state_denoiser in {"gonzalez_adaptive_wavelet", "legacy_hybrid"}
-        plateau_tv_weight = (
-            float(self.param_plateau_tv_weight.value()) if state_aware_mode else None
-        )
-        boundary_protect_ms = (
-            float(self.param_low_state_boundary_protect_ms.value()) if state_aware_mode else None
-        )
+    def _denoise_cache_key(self) -> Tuple[object, ...]:
+        denoising_method = str(self.param_denoising_method.currentData() or "gonzalez_full_trace")
         return (
-            low_state_denoiser,
+            denoising_method,
             float(self.param_gonzalez_threshold_sd.value()),
             int(self.param_gonzalez_max_clusters.value()),
             float(self.param_gonzalez_attenuation_min.value()),
             float(self.param_gonzalez_attenuation_max.value()),
             bool(self.param_gonzalez_noise_cluster_rejection.isChecked()),
             bool(self.param_gonzalez_event_template_rejection.isChecked()),
-            bool(self.detection_params.enable_low_state_safety_gate),
+            bool(self.detection_params.enable_denoise_safety_gate),
             float(self.detection_params.min_event_peak_preservation),
             float(self.detection_params.min_local_max_ratio),
-            float(self.detection_params.min_reliable_low_state_fraction),
-            int(self.detection_params.min_reliable_low_state_samples),
-            float(self.detection_params.plateau_tv_min_duration_ms),
-            float(self.detection_params.plateau_tv_max_weight_factor),
-            plateau_tv_weight,
-            boundary_protect_ms,
         )
 
     def _gonzalez_cwt_debug_cache_key(self) -> Tuple[object, ...]:
         return (
             "gonzalez_full_trace_cwt_debug",
-            str(self.param_low_state_denoiser.currentData() or "gonzalez_full_trace"),
+            str(self.param_denoising_method.currentData() or "gonzalez_full_trace"),
             float(self.param_gonzalez_threshold_sd.value()),
             int(self.param_gonzalez_max_clusters.value()),
             float(self.param_gonzalez_attenuation_min.value()),
             float(self.param_gonzalez_attenuation_max.value()),
             bool(self.param_gonzalez_noise_cluster_rejection.isChecked()),
             bool(self.param_gonzalez_event_template_rejection.isChecked()),
-            bool(self.detection_params.enable_low_state_safety_gate),
+            bool(self.detection_params.enable_denoise_safety_gate),
             float(self.detection_params.min_event_peak_preservation),
             float(self.detection_params.min_local_max_ratio),
         )
@@ -5515,6 +7543,23 @@ class SpikeCurationMainWindow(QMainWindow):
             and state.gonzalez_cwt_debug_cache_key == cache_key
         ):
             return dict(state.gonzalez_cwt_debug)
+        mode = str(self.param_denoising_method.currentData() or "gonzalez_full_trace")
+        if mode == "none":
+            debug = dict(
+                denoise_trace_gonzalez_full_trace(
+                    np.asarray(state.corrected, dtype=float),
+                    fs=_trace_sampling_rate_hz(state),
+                    denoising_method="none",
+                    return_debug=True,
+                )
+            )
+            debug["wrapper_output"] = np.asarray(state.corrected, dtype=float).copy()
+            debug["wrapper_correction_component"] = np.zeros_like(np.asarray(state.corrected, dtype=float))
+            debug["wrapper_output_mode"] = mode
+            debug["wrapper_input_normalization"] = _denoising_input_normalization_label(mode)
+            state.gonzalez_cwt_debug = debug
+            state.gonzalez_cwt_debug_cache_key = cache_key
+            return dict(debug)
         debug = dict(
             denoise_gonzalez_adaptive_wavelet(
                 np.asarray(state.corrected, dtype=float),
@@ -5527,7 +7572,7 @@ class SpikeCurationMainWindow(QMainWindow):
                 attenuation_max=float(self.param_gonzalez_attenuation_max.value()),
                 enable_noise_cluster_rejection=bool(self.param_gonzalez_noise_cluster_rejection.isChecked()),
                 enable_event_template_rejection=bool(self.param_gonzalez_event_template_rejection.isChecked()),
-                enable_low_state_safety_gate=bool(self.detection_params.enable_low_state_safety_gate),
+                enable_denoise_safety_gate=bool(self.detection_params.enable_denoise_safety_gate),
                 min_event_peak_preservation=float(self.detection_params.min_event_peak_preservation),
                 min_local_max_ratio=float(self.detection_params.min_local_max_ratio),
             )
@@ -5539,13 +7584,14 @@ class SpikeCurationMainWindow(QMainWindow):
                 raw_output = np.asarray(debug.get("output", wrapper_output), dtype=float)
                 if raw_output.shape == wrapper_output.shape:
                     debug["wrapper_correction_component"] = wrapper_output - raw_output
-                debug["wrapper_output_mode"] = str(self.param_low_state_denoiser.currentData() or "gonzalez_full_trace")
+                debug["wrapper_output_mode"] = mode
+                debug["wrapper_input_normalization"] = _denoising_input_normalization_label(mode)
         state.gonzalez_cwt_debug = debug
         state.gonzalez_cwt_debug_cache_key = cache_key
         return dict(debug)
 
-    def _ensure_hybrid_denoised(self, state: TraceCuration) -> None:
-        cache_key = self._hybrid_cache_key()
+    def _ensure_denoised(self, state: TraceCuration) -> None:
+        cache_key = self._denoise_cache_key()
         if (
             state.hybrid_denoised is not None
             and len(state.hybrid_denoised) == len(state.corrected)
@@ -5555,27 +7601,22 @@ class SpikeCurationMainWindow(QMainWindow):
         if state.hybrid_denoised_pending_key == cache_key:
             return
         state.hybrid_denoised_pending_key = cache_key
-        low_state_denoiser = str(self.param_low_state_denoiser.currentData() or "gonzalez_full_trace")
-        plateau_mask = state.long_plateau_mask if state.long_plateau_mask is not None else state.plateau_mask
-        task = _HybridDenoiseTask(
+        denoising_method = str(self.param_denoising_method.currentData() or "gonzalez_full_trace")
+        task = _GonzalezDenoiseTask(
             trace_name=state.trace_name,
             cache_key=cache_key,
             corrected=state.corrected,
             fs=_trace_sampling_rate_hz(state),
             baseline=state.baseline,
-            plateau_mask=plateau_mask,
-            low_state_denoiser=low_state_denoiser,
-            low_state_kwargs=self._low_state_denoise_kwargs(),
-            plateau_tv_weight=float(self.param_plateau_tv_weight.value()),
-            boundary_protect_ms=float(self.param_low_state_boundary_protect_ms.value()),
-            legacy_denoise_fn=self._hybrid_denoise_fn,
+            denoising_method=denoising_method,
+            denoise_kwargs=self._gonzalez_denoise_kwargs(),
             normalization_baseline=state.correction_baseline,
         )
-        task.signals.finished.connect(self._on_hybrid_denoise_finished)
-        self._hybrid_tasks.append(task)
-        self._hybrid_thread_pool.start(task)
+        task.signals.finished.connect(self._on_denoise_finished)
+        self._denoise_tasks.append(task)
+        self._denoise_thread_pool.start(task)
 
-    def _detect_on_hybrid_denoised(
+    def _detect_on_denoised(
         self,
         trace_name: str,
         time: np.ndarray,
@@ -5583,17 +7624,15 @@ class SpikeCurationMainWindow(QMainWindow):
         artifact_mask: np.ndarray,
         sampling_rate_hz: Optional[float] = None,
     ):
-        """Detect plateaus on source data, then detect spikes on state-guided denoising."""
+        """Detect plateaus on source data, then detect spikes on Gonzalez denoising."""
         params = _clone_detection_params(self.detection_params)
-        params.low_state_denoiser = str(self.param_low_state_denoiser.currentData() or params.low_state_denoiser)
+        params.denoising_method = str(self.param_denoising_method.currentData() or params.denoising_method)
         params.gonzalez_threshold_sd = float(self.param_gonzalez_threshold_sd.value())
         params.gonzalez_max_clusters = int(self.param_gonzalez_max_clusters.value())
         params.gonzalez_attenuation_min = float(self.param_gonzalez_attenuation_min.value())
         params.gonzalez_attenuation_max = float(self.param_gonzalez_attenuation_max.value())
         params.gonzalez_enable_noise_cluster_rejection = bool(self.param_gonzalez_noise_cluster_rejection.isChecked())
         params.gonzalez_enable_event_template_rejection = bool(self.param_gonzalez_event_template_rejection.isChecked())
-        params.plateau_tv_weight = float(self.param_plateau_tv_weight.value())
-        params.low_state_boundary_protect_ms = float(self.param_low_state_boundary_protect_ms.value())
         request = TraceAnalysisRequest(
             trace_name=trace_name,
             time=np.asarray(time, dtype=float),
@@ -5602,19 +7641,20 @@ class SpikeCurationMainWindow(QMainWindow):
             sampling_rate_hz=float(sampling_rate_hz) if sampling_rate_hz is not None else _sampling_rate_hz(time),
             detection_params=params,
             artifact_params=_clone_artifact_params(self.artifact_params),
+            pipeline_config=self._pipeline_config_dict(),
             generation=int(self._analysis_generation),
         )
-        result = analyze_trace_data(request, legacy_denoise_fn=self._hybrid_denoise_fn)
+        result = analyze_trace_data(request)
         return result.corrected, result.hybrid_denoised, result.correction_baseline, result.detection
 
-    def _on_hybrid_denoise_finished(
+    def _on_denoise_finished(
         self,
         trace_name: str,
         cache_key: Tuple[object, ...],
         result: Optional[np.ndarray],
         error: Optional[str],
     ) -> None:
-        self._hybrid_tasks = [task for task in self._hybrid_tasks if task.cache_key != cache_key or task.trace_name != trace_name]
+        self._denoise_tasks = [task for task in self._denoise_tasks if task.cache_key != cache_key or task.trace_name != trace_name]
         state = self.traces.get(trace_name)
         if state is None or state.hybrid_denoised_pending_key != cache_key:
             return
@@ -5622,7 +7662,7 @@ class SpikeCurationMainWindow(QMainWindow):
             result_array = np.asarray(result, dtype=float)
             if result_array.shape != np.asarray(state.corrected).shape or not np.all(np.isfinite(result_array)):
                 result = None
-                error = "State-guided denoising returned invalid data"
+                error = "Gonzalez denoising returned invalid data"
         state.hybrid_denoised_pending_key = None
         if error is not None or result is None:
             state.hybrid_denoised = None
@@ -5649,18 +7689,28 @@ class SpikeCurationMainWindow(QMainWindow):
     def _refresh_table(self, state: TraceCuration) -> None:
         table_spikes = sorted(state.spikes, key=lambda spike: spike.spike_index)
         self._table_spikes = table_spikes
-        self.table.setRowCount(len(table_spikes))
-        for row, spike in enumerate(table_spikes):
-            values = [
+        signature = tuple(
+            (
                 str(spike.spike_index),
                 f"{spike.spike_time:.2f}",
                 f"{spike.amplitude_above_baseline:.2f}",
                 f"{spike.snr:.2f}",
                 f"{spike.prominence:.2f}",
-            ]
-            for col, value in enumerate(values):
-                item = QTableWidgetItem(value)
-                self.table.setItem(row, col, item)
+            )
+            for spike in table_spikes
+        )
+        if signature == self._table_signature:
+            return
+        self._table_signature = signature
+        self.table.setUpdatesEnabled(False)
+        try:
+            self.table.setRowCount(len(table_spikes))
+            for row, values in enumerate(signature):
+                for col, value in enumerate(values):
+                    item = QTableWidgetItem(value)
+                    self.table.setItem(row, col, item)
+        finally:
+            self.table.setUpdatesEnabled(True)
 
     def _nearest_sample_index(self, state: TraceCuration, clicked_time: float) -> int:
         return int(np.argmin(np.abs(state.time - clicked_time)))
@@ -5729,7 +7779,7 @@ class SpikeCurationMainWindow(QMainWindow):
 
     def next_trace(self) -> None:
         row = self.trace_list.currentRow()
-        if row < len(self.trace_names) - 1:
+        if row < len(self._visible_trace_names()) - 1:
             self.trace_list.setCurrentRow(row + 1)
 
     def prev_trace(self) -> None:

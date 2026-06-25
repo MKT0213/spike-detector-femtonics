@@ -7,11 +7,13 @@ import math
 import numpy as np
 from scipy.ndimage import gaussian_filter1d, median_filter, percentile_filter
 from scipy.signal import butter, find_peaks, sosfiltfilt, savgol_filter
+from scipy.stats import norm
+from sklearn.mixture import GaussianMixture
 
 from .models import DetectionParams, DetectionResult, SpikeRecord
 
 
-DETECTOR_BUILD_TAG = "state-guided-detectors-2026-06-11"
+DETECTOR_BUILD_TAG = "gonzalez-full-trace-denoising-2026-06-19"
 
 
 @dataclass(frozen=True)
@@ -22,18 +24,27 @@ class BaselineConfig:
 
 
 BASELINE_CFG = BaselineConfig()
-_LAST_SHORT_PLATEAU_DEBUG: Dict[str, np.ndarray] = {}
+_LAST_SHORT_PLATEAU_DEBUG: Dict[str, Any] = {}
 
 
-def _set_short_plateau_debug(n: int, **arrays: np.ndarray) -> None:
+def _set_short_plateau_debug(n: int, **arrays: Any) -> None:
     global _LAST_SHORT_PLATEAU_DEBUG
     base = {
+        "short_centering_baseline": np.zeros(int(max(0, n)), dtype=float),
+        "short_centered_trace": np.zeros(int(max(0, n)), dtype=float),
         "short_floor_envelope": np.zeros(int(max(0, n)), dtype=float),
         "short_step_up_score": np.zeros(int(max(0, n)), dtype=float),
         "short_step_down_score": np.zeros(int(max(0, n)), dtype=float),
         "short_support_mask": np.zeros(int(max(0, n)), dtype=bool),
+        "short_candidate_mask": np.zeros(int(max(0, n)), dtype=bool),
+        "short_candidate_score": np.zeros(int(max(0, n)), dtype=float),
+        "short_template_score": np.zeros(int(max(0, n)), dtype=float),
+        "short_template_recovery_mask": np.zeros(int(max(0, n)), dtype=bool),
         "short_refined_onset_score": np.zeros(int(max(0, n)), dtype=float),
         "short_refined_offset_score": np.zeros(int(max(0, n)), dtype=float),
+        "burst_plateau_candidate_mask": np.zeros(int(max(0, n)), dtype=bool),
+        "burst_plateau_candidate_score": np.zeros(int(max(0, n)), dtype=float),
+        "burst_plateau_candidate_rows": [],
     }
     base.update(arrays)
     _LAST_SHORT_PLATEAU_DEBUG = base
@@ -112,6 +123,35 @@ def _contiguous_regions(mask: np.ndarray) -> List[Tuple[int, int]]:
     return [(int(group[0]), int(group[-1]) + 1) for group in groups]
 
 
+def _fit_bool_mask(mask: np.ndarray, size: int, fill: bool = False) -> np.ndarray:
+    n = int(max(0, size))
+    arr = np.asarray(mask, dtype=bool).reshape(-1)
+    if arr.size == n:
+        return arr
+    if arr.size == 1:
+        return np.full(n, bool(arr[0]), dtype=bool)
+    out = np.full(n, bool(fill), dtype=bool)
+    count = min(n, arr.size)
+    if count > 0:
+        out[:count] = arr[:count]
+    return out
+
+
+def _fit_numeric_line(values: np.ndarray, size: int, fill: float = float("nan")) -> np.ndarray:
+    n = int(max(0, size))
+    arr = np.asarray(values, dtype=float).reshape(-1)
+    if arr.size == n:
+        return arr
+    if arr.size == 1:
+        return np.full(n, float(arr[0]), dtype=float)
+    pad_value = float(arr[-1]) if arr.size else float(fill)
+    out = np.full(n, pad_value, dtype=float)
+    count = min(n, arr.size)
+    if count > 0:
+        out[:count] = arr[:count]
+    return out
+
+
 def _merge_close_regions(regions: List[Tuple[int, int]], max_gap_samples: int) -> List[Tuple[int, int]]:
     if not regions:
         return []
@@ -185,7 +225,7 @@ def _baseline_seed(
         return y.copy()
     blocked = np.asarray(excluded, dtype=bool)
     if blocked.size != y.size:
-        blocked = np.resize(blocked, y.size)
+        blocked = _fit_bool_mask(blocked, y.size)
     baseline_input = _interpolate_masked_series(
         np.nan_to_num(y, nan=0.0),
         mask=(blocked | ~np.isfinite(y)),
@@ -380,7 +420,7 @@ def _interpolate_masked_series(values: np.ndarray, mask: np.ndarray) -> np.ndarr
     if y.size == 0:
         return y
     if mask_arr.size != y.size:
-        mask_arr = np.resize(mask_arr, y.size)
+        mask_arr = _fit_bool_mask(mask_arr, y.size)
 
     valid = np.isfinite(y) & ~mask_arr
     if int(np.sum(valid)) < 2:
@@ -415,7 +455,7 @@ def _estimate_local_noise_mad(
     b = b[:n]
     excluded = np.asarray(excluded_mask, dtype=bool)
     if excluded.size != n:
-        excluded = np.resize(excluded, n)
+        excluded = _fit_bool_mask(excluded, n)
 
     resid = np.abs(y - b)
     resid[~np.isfinite(resid)] = np.nan
@@ -454,7 +494,7 @@ def _estimate_drift_corrected_proxy(
     valid = np.asarray(valid_mask, dtype=bool)
     n = int(proxy.size)
     if valid.size != n:
-        valid = np.resize(valid, n)
+        valid = _fit_bool_mask(valid, n)
     if n == 0:
         return proxy.copy(), proxy.copy()
 
@@ -475,7 +515,7 @@ def _detrended_noise_scale(detrended_proxy: np.ndarray, valid_mask: np.ndarray) 
     valid = np.asarray(valid_mask, dtype=bool)
     values = np.asarray(detrended_proxy, dtype=float)
     if valid.size != values.size:
-        valid = np.resize(valid, values.size)
+        valid = _fit_bool_mask(valid, values.size)
     finite = values[valid & np.isfinite(values)]
     if finite.size == 0:
         return 0.0, 1e-9
@@ -502,11 +542,11 @@ def _hysteresis_plateau_mask(
     valid = np.asarray(valid_mask, dtype=bool)
     n = int(score.size)
     if high.size != n:
-        high = np.resize(high, n)
+        high = _fit_numeric_line(high, n)
     if low.size != n:
-        low = np.resize(low, n)
+        low = _fit_numeric_line(low, n)
     if valid.size != n:
-        valid = np.resize(valid, n)
+        valid = _fit_bool_mask(valid, n)
     if n == 0:
         return np.zeros(0, dtype=bool)
 
@@ -553,13 +593,13 @@ def _filter_otsu_hysteresis_candidates(
     valid = np.asarray(valid_mask, dtype=bool)
     n = int(signal.size)
     if candidate_mask.size != n:
-        candidate_mask = np.resize(candidate_mask, n)
+        candidate_mask = _fit_bool_mask(candidate_mask, n)
     if high.size != n:
-        high = np.resize(high, n)
+        high = _fit_numeric_line(high, n)
     if low.size != n:
-        low = np.resize(low, n)
+        low = _fit_numeric_line(low, n)
     if valid.size != n:
-        valid = np.resize(valid, n)
+        valid = _fit_bool_mask(valid, n)
 
     kept = np.zeros(n, dtype=bool)
     finite_valid = valid & np.isfinite(signal) & np.isfinite(high) & np.isfinite(low)
@@ -1139,11 +1179,155 @@ def _refine_short_plateau_edges(
     return best_onset, best_offset, onset_scores, offset_scores
 
 
+def _short_plateau_centering_baseline(
+    y: np.ndarray,
+    *,
+    fs: float,
+    valid: np.ndarray,
+    min_duration_ms: float,
+) -> np.ndarray:
+    """Estimate the local quiet floor used only for short-plateau detection."""
+    trace = np.asarray(y, dtype=float)
+    n = int(trace.size)
+    if n == 0:
+        return trace.copy()
+    good = np.asarray(valid, dtype=bool)
+    if good.size != n:
+        good = _fit_bool_mask(good, n)
+    finite_good = good & np.isfinite(trace)
+    if int(np.count_nonzero(finite_good)) < 3:
+        center = float(np.nanmedian(trace)) if np.any(np.isfinite(trace)) else 0.0
+        return np.full(n, center, dtype=float)
+
+    filled = _interpolate_masked_series(
+        np.nan_to_num(trace, nan=0.0),
+        mask=(~finite_good),
+    )
+    # A short plateau can be 25-200 ms; use a wider low-percentile floor so the
+    # event itself does not become the local zero reference.
+    window_ms = max(300.0, 8.0 * float(min_duration_ms))
+    baseline = _rolling_percentile(
+        filled,
+        fs=fs,
+        window_ms=window_ms,
+        percentile=20.0,
+    )
+    if not np.all(np.isfinite(baseline)):
+        fallback = float(np.median(trace[finite_good]))
+        baseline = np.nan_to_num(baseline, nan=fallback, posinf=fallback, neginf=fallback)
+    return np.asarray(baseline, dtype=float)
+
+
+def _resample_unit_profile(values: np.ndarray, size: int = 64) -> np.ndarray:
+    arr = np.asarray(values, dtype=float)
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return np.zeros(int(size), dtype=float)
+    if arr.size == 1:
+        return np.full(int(size), float(finite[0]), dtype=float)
+    x_old = np.linspace(0.0, 1.0, arr.size)
+    x_new = np.linspace(0.0, 1.0, int(size))
+    filled = arr.copy()
+    if not np.all(np.isfinite(filled)):
+        idx = np.arange(arr.size, dtype=float)
+        valid = np.isfinite(filled)
+        filled[~valid] = np.interp(idx[~valid], idx[valid], filled[valid])
+    return np.interp(x_new, x_old, filled)
+
+
+def _normalized_plateau_profile(y: np.ndarray, start: int, end: int, *, size: int = 64) -> np.ndarray | None:
+    trace = np.asarray(y, dtype=float)
+    s = int(max(0, start))
+    e = int(min(trace.size, end))
+    if e - s < 3:
+        return None
+    segment = trace[s:e]
+    if not np.any(np.isfinite(segment)):
+        return None
+    level = float(np.nanmedian(segment))
+    if not np.isfinite(level) or abs(level) <= 1e-12:
+        return None
+    profile = _resample_unit_profile(segment / level, size=size)
+    profile -= float(np.nanmedian(profile))
+    scale = float(np.nanpercentile(np.abs(profile), 90.0))
+    if not np.isfinite(scale) or scale <= 1e-12:
+        scale = 1.0
+    return profile / scale
+
+
+def _normalized_plateau_context_profile(
+    y: np.ndarray,
+    start: int,
+    end: int,
+    *,
+    fs: float,
+    size: int = 96,
+) -> np.ndarray | None:
+    trace = np.asarray(y, dtype=float)
+    s = int(max(0, start))
+    e = int(min(trace.size, end))
+    duration = int(e - s)
+    if duration < 3:
+        return None
+    side = min(max(3, duration // 2), _to_samples(60.0, fs, minimum=3))
+    lo = max(0, s - side)
+    hi = min(trace.size, e + side)
+    segment = trace[s:e]
+    context = trace[lo:hi]
+    if context.size < 5 or not np.any(np.isfinite(segment)):
+        return None
+    flank_parts: List[np.ndarray] = []
+    if s > lo:
+        flank_parts.append(trace[lo:s])
+    if hi > e:
+        flank_parts.append(trace[e:hi])
+    flank = np.concatenate(flank_parts) if flank_parts else np.zeros(0, dtype=float)
+    flank = flank[np.isfinite(flank)]
+    baseline = float(np.median(flank)) if flank.size else 0.0
+    height = float(np.nanmedian(segment) - baseline)
+    if not np.isfinite(height) or abs(height) <= 1e-12:
+        return None
+    profile = _resample_unit_profile((context - baseline) / height, size=size)
+    return np.nan_to_num(profile, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _short_plateau_seed_regions_from_long_debug(
+    long_plateau_debug: Dict[str, Any],
+    *,
+    n: int,
+    fs: float,
+    min_duration_ms: float,
+) -> List[Tuple[int, int]]:
+    rows = long_plateau_debug.get("long_plateau_region_debug_rows", []) if isinstance(long_plateau_debug, dict) else []
+    if not isinstance(rows, list):
+        return []
+    min_len = _to_samples(float(min_duration_ms), fs, minimum=3)
+    out: List[Tuple[int, int]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if bool(row.get("accepted", False)):
+            continue
+        if str(row.get("rejection_stage", "")) != "minimum_duration":
+            continue
+        try:
+            start = int(row.get("start_index", 0))
+            end = int(row.get("end_index_exclusive", start))
+        except (TypeError, ValueError):
+            continue
+        start = max(0, min(int(n), start))
+        end = max(start, min(int(n), end))
+        if end - start >= min_len:
+            out.append((start, end))
+    return _merge_close_regions(sorted(out), max_gap_samples=_to_samples(5.0, fs, minimum=1))
+
+
 def _detect_short_plateaus_baseline_corrected(
     corrected_trace: np.ndarray,
     fs: float,
     excluded_mask: np.ndarray | None = None,
     long_plateau_mask: np.ndarray | None = None,
+    template_seed_regions: List[Tuple[int, int]] | None = None,
     step_noise_k: float = 3.5,
     elevated_noise_k: float = 3.0,
     survival_noise_k: float = 2.0,
@@ -1155,18 +1339,26 @@ def _detect_short_plateaus_baseline_corrected(
     early_dwell_ms: float = 30.0,
     min_support_ms: float = 15.0,
     min_duration_ms: float = 25.0,
-) -> tuple[np.ndarray, np.ndarray]:
+    return_burst: bool = False,
+) -> tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Detect brief raised-floor plateaus on a baseline-corrected trace."""
     y_in = np.asarray(corrected_trace, dtype=float)
     n = int(y_in.size)
     _set_short_plateau_debug(n)
+    def _empty_result() -> tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        empty_mask = np.zeros(n, dtype=bool)
+        empty_short = np.zeros((0, 6), dtype=float)
+        if return_burst:
+            return empty_mask, empty_short, empty_mask.copy(), np.zeros((0, 8), dtype=float)
+        return empty_mask, empty_short
+
     if n <= 2:
-        return np.zeros(n, dtype=bool), np.zeros((0, 6), dtype=float)
+        return _empty_result()
 
     y = y_in.copy()
     finite = np.isfinite(y)
     if int(np.sum(finite)) < 3:
-        return np.zeros(n, dtype=bool), np.zeros((0, 6), dtype=float)
+        return _empty_result()
     if not np.all(finite):
         idx = np.arange(n, dtype=float)
         y[~finite] = np.interp(idx[~finite], idx[finite], y[finite])
@@ -1182,12 +1374,19 @@ def _detect_short_plateaus_baseline_corrected(
         long_mask[: min(n, lm.size)] = lm[: min(n, lm.size)]
 
     valid = finite & (~blocked) & (~long_mask)
+    centering_baseline = _short_plateau_centering_baseline(
+        y,
+        fs=fs,
+        valid=valid,
+        min_duration_ms=float(min_duration_ms),
+    )
+    y = y - centering_baseline
     reference = y[valid]
     if reference.size < 16:
         reference = y[finite & (~blocked)]
     reference = reference[np.isfinite(reference)]
     if reference.size < 8:
-        return np.zeros(n, dtype=bool), np.zeros((0, 6), dtype=float)
+        return _empty_result()
 
     ref_center = float(np.median(reference))
     low_reference = reference[reference <= ref_center]
@@ -1250,6 +1449,8 @@ def _detect_short_plateaus_baseline_corrected(
     refined_offset_score = np.zeros(n, dtype=float)
     _set_short_plateau_debug(
         n,
+        short_centering_baseline=centering_baseline,
+        short_centered_trace=y,
         short_floor_envelope=floor,
         short_step_up_score=step_up_score,
         short_step_down_score=step_down_score,
@@ -1476,20 +1677,356 @@ def _detect_short_plateaus_baseline_corrected(
         )
         next_available = offset + min_step_gap
 
-    if not events:
-        return mask, np.zeros((0, 6), dtype=float)
-    return mask, np.asarray(events, dtype=float)
+    candidate_mask = np.zeros(n, dtype=bool)
+    candidate_score = np.zeros(n, dtype=float)
+    template_score = np.zeros(n, dtype=float)
+    template_recovery_mask = np.zeros(n, dtype=bool)
+    burst_mask = np.zeros(n, dtype=bool)
+    burst_candidate_mask = np.zeros(n, dtype=bool)
+    burst_candidate_score = np.zeros(n, dtype=float)
+    burst_events: List[List[float]] = []
+    burst_candidate_rows: List[Dict[str, Any]] = []
+
+    accepted_regions = _contiguous_regions(mask)
+    template_bank: List[np.ndarray] = []
+    for start, stop in accepted_regions:
+        profile = _normalized_plateau_context_profile(y, start, stop, fs=fs)
+        if profile is not None:
+            template_bank.append(profile)
+
+    def _template_similarity(start: int, stop: int) -> float:
+        if not template_bank:
+            return 0.0
+        profile = _normalized_plateau_context_profile(y, start, stop, fs=fs, size=int(template_bank[0].size))
+        if profile is None:
+            return 0.0
+        p_norm = float(np.linalg.norm(profile))
+        if p_norm <= 1e-12:
+            return 0.0
+        best = 0.0
+        for template in template_bank:
+            t_norm = float(np.linalg.norm(template))
+            if t_norm <= 1e-12:
+                continue
+            corr = float(np.dot(profile, template) / (p_norm * t_norm))
+            best = max(best, corr)
+        return float(np.clip(best, 0.0, 1.0))
+
+    def _quiet_window_level(start: int, stop: int) -> tuple[float, float]:
+        values = y[start:stop][valid[start:stop] & np.isfinite(y[start:stop])]
+        if values.size < 3:
+            return float("nan"), float("nan")
+        return float(np.median(values)), _mad_unscaled(values)
+
+    def _try_recovery_candidate(start: int, stop: int, source_bonus: float = 0.0) -> None:
+        nonlocal candidate_mask, candidate_score, template_score, template_recovery_mask
+        onset = int(max(0, min(n, start)))
+        offset = int(max(onset, min(n, stop)))
+        if offset - onset < min_duration:
+            return
+        if np.any(mask[onset:offset]) or np.any(blocked[onset:offset]) or np.any(long_mask[onset:offset]):
+            return
+        event_valid = valid[onset:offset]
+        if int(np.count_nonzero(event_valid)) < min_duration:
+            return
+
+        local_noise = max(noise, _local_baseline_noise(onset, offset), 1e-9)
+        event_values = med[onset:offset][event_valid]
+        raw_event_values = y[onset:offset][event_valid]
+        event_floor_values = floor[onset:offset][event_valid]
+        if event_values.size == 0 or raw_event_values.size == 0:
+            return
+        median_level = float(np.median(event_values))
+        floor_median = float(np.median(event_floor_values)) if event_floor_values.size else 0.0
+        if (not np.isfinite(median_level)) or median_level < (median_k * local_noise):
+            return
+        if floor_median < (elevated_k * local_noise):
+            return
+
+        event_support = ((floor[onset:offset] > (elevated_k * local_noise)) & valid[onset:offset])[event_valid]
+        floor_support_fraction, longest_support = _support_stats(event_support)
+        recovery_support_min = max(0.65, min(0.90, support_fraction_min - 0.05))
+        if floor_support_fraction < recovery_support_min:
+            return
+        if longest_support < min_support:
+            return
+
+        side = _to_samples(20.0, fs, minimum=3)
+        pre_level, pre_noise = _quiet_window_level(max(0, onset - side), onset)
+        post_level, post_noise = _quiet_window_level(offset, min(n, offset + side))
+        flank_noise = max(local_noise, pre_noise if np.isfinite(pre_noise) else 0.0, post_noise if np.isfinite(post_noise) else 0.0, 1e-9)
+        if np.isfinite(pre_level) and abs(pre_level) > max(pre_quiet_k, 2.0) * flank_noise:
+            return
+        if np.isfinite(post_level) and abs(post_level) > max(2.0, loss_k + 0.75) * flank_noise:
+            return
+
+        if raw_event_values.size >= 4:
+            event_iqr = float(np.percentile(raw_event_values, 75.0) - np.percentile(raw_event_values, 25.0))
+            p95 = float(np.percentile(raw_event_values, 95.0))
+            peak_value = float(np.max(raw_event_values))
+            low_gap_fraction = float(np.mean(raw_event_values < max(1.5 * local_noise, 0.50 * median_level)))
+        else:
+            event_iqr = 0.0
+            p95 = float(np.max(raw_event_values))
+            peak_value = p95
+            low_gap_fraction = 0.0
+        if event_iqr > (4.5 * local_noise):
+            return
+        if low_gap_fraction > 0.18:
+            return
+        if low_gap_fraction > 0.08 and (peak_value - median_level) > (5.0 * local_noise):
+            return
+        if (p95 - median_level) > (6.0 * local_noise) and floor_support_fraction < 0.90:
+            return
+
+        edge_window = _to_samples(14.0, fs, minimum=2)
+        up_lo = max(0, onset - edge_window)
+        up_hi = min(n, onset + edge_window + 1)
+        down_lo = max(0, offset - edge_window)
+        down_hi = min(n, offset + edge_window + 1)
+        onset_edge = float(np.max(step_up_score[up_lo:up_hi])) if up_hi > up_lo else 0.0
+        offset_edge = float(-np.min(step_down_score[down_lo:down_hi])) if down_hi > down_lo else 0.0
+        edge_score = min(1.0, max(0.0, ((max(onset_edge, offset_edge) / local_noise) - step_k) / 6.0))
+        level_score = min(1.0, max(0.0, ((median_level / local_noise) - median_k) / 6.0))
+        support_score = min(1.0, max(0.0, (floor_support_fraction - recovery_support_min) / max(1.0 - recovery_support_min, 1e-9)))
+        flatness_score = min(1.0, max(0.0, 1.0 - (event_iqr / max(4.5 * local_noise, 1e-9))))
+        match_score = _template_similarity(onset, offset)
+        duration_ms = float((offset - onset) * 1000.0 / max(float(fs), 1e-9))
+        duration_score = min(1.0, max(0.0, (duration_ms - float(min_duration_ms)) / 75.0))
+        confidence = float(
+            min(
+                1.0,
+                max(
+                    0.0,
+                    (0.22 * level_score)
+                    + (0.22 * support_score)
+                    + (0.18 * flatness_score)
+                    + (0.16 * edge_score)
+                    + (0.12 * match_score)
+                    + (0.10 * duration_score)
+                    + float(source_bonus),
+                ),
+            )
+        )
+        if confidence < confidence_min:
+            return
+
+        mask[onset:offset] = True
+        candidate_mask[onset:offset] = True
+        template_recovery_mask[onset:offset] = True
+        candidate_score[onset:offset] = np.maximum(candidate_score[onset:offset], confidence)
+        template_score[onset:offset] = np.maximum(template_score[onset:offset], match_score)
+        events.append(
+            [
+                float(onset),
+                float(offset),
+                duration_ms,
+                median_level,
+                floor_support_fraction,
+                confidence,
+            ]
+        )
+
+    def _try_burst_candidate(start: int, stop: int, source: str, source_bonus: float = 0.0) -> None:
+        onset = int(max(0, min(n, start)))
+        offset = int(max(onset, min(n, stop)))
+        if offset - onset < min_duration:
+            return
+        if (
+            np.any(mask[onset:offset])
+            or np.any(burst_mask[onset:offset])
+            or np.any(blocked[onset:offset])
+            or np.any(long_mask[onset:offset])
+        ):
+            return
+        event_valid = valid[onset:offset]
+        if int(np.count_nonzero(event_valid)) < min_duration:
+            return
+
+        local_noise = max(noise, _local_baseline_noise(onset, offset), 1e-9)
+        event_values = med[onset:offset][event_valid]
+        raw_event_values = y[onset:offset][event_valid]
+        event_floor_values = floor[onset:offset][event_valid]
+        if event_values.size == 0 or raw_event_values.size < 4 or event_floor_values.size == 0:
+            return
+
+        median_level = float(np.median(event_values))
+        floor_median = float(np.median(event_floor_values))
+        event_support = ((floor[onset:offset] > (elevated_k * local_noise)) & valid[onset:offset])[event_valid]
+        floor_support_fraction, longest_support = _support_stats(event_support)
+        duration_ms = float((offset - onset) * 1000.0 / max(float(fs), 1e-9))
+        event_iqr = float(np.percentile(raw_event_values, 75.0) - np.percentile(raw_event_values, 25.0))
+        peak_value = float(np.max(raw_event_values))
+        p95 = float(np.percentile(raw_event_values, 95.0))
+        low_gap_fraction = float(np.mean(raw_event_values < max(1.5 * local_noise, 0.50 * median_level)))
+        peak_dominance = float((peak_value - median_level) / local_noise)
+        p95_dominance = float((p95 - median_level) / local_noise)
+        iqr_over_noise = float(event_iqr / local_noise)
+        burst_support_min = max(0.70, min(0.92, support_fraction_min - 0.05))
+
+        reasons: List[str] = []
+        if (not np.isfinite(median_level)) or median_level < (median_k * local_noise):
+            reasons.append("median_floor_below_threshold")
+        if floor_median < (elevated_k * local_noise):
+            reasons.append("floor_below_elevated_threshold")
+        if floor_support_fraction < burst_support_min:
+            reasons.append("insufficient_raised_floor_support")
+        if longest_support < min_support:
+            reasons.append("raised_floor_run_too_short")
+        if low_gap_fraction > 0.22:
+            reasons.append("too_many_internal_low_gaps")
+        if event_iqr > max(20.0 * local_noise, 2.5 * abs(median_level)) and low_gap_fraction > 0.08:
+            reasons.append("too_variable_even_for_burst_plateau")
+        if max(peak_dominance, p95_dominance) < 5.0:
+            reasons.append("not_burst_dominated")
+
+        level_score = min(1.0, max(0.0, ((median_level / local_noise) - median_k) / 8.0))
+        floor_score = min(1.0, max(0.0, ((floor_median / local_noise) - elevated_k) / 8.0))
+        support_score = min(1.0, max(0.0, (floor_support_fraction - burst_support_min) / max(1.0 - burst_support_min, 1e-9)))
+        gap_score = min(1.0, max(0.0, 1.0 - (low_gap_fraction / 0.22)))
+        burst_score = min(1.0, max(0.0, (max(peak_dominance, p95_dominance) - 5.0) / 10.0))
+        duration_score = min(1.0, max(0.0, (duration_ms - float(min_duration_ms)) / 75.0))
+        confidence = float(
+            min(
+                1.0,
+                max(
+                    0.0,
+                    (0.24 * support_score)
+                    + (0.22 * level_score)
+                    + (0.18 * floor_score)
+                    + (0.14 * gap_score)
+                    + (0.10 * burst_score)
+                    + (0.06 * duration_score)
+                    + float(source_bonus),
+                ),
+            )
+        )
+        if confidence < max(0.55, confidence_min - 0.10):
+            reasons.append("confidence_below_threshold")
+
+        row = {
+            "source": str(source),
+            "accepted": not reasons,
+            "start_index": int(onset),
+            "end_index_exclusive": int(offset),
+            "duration_ms": duration_ms,
+            "median_level": median_level,
+            "floor_median": floor_median,
+            "floor_support_fraction": floor_support_fraction,
+            "longest_support_samples": int(longest_support),
+            "low_gap_fraction": low_gap_fraction,
+            "peak_dominance_noise": peak_dominance,
+            "p95_dominance_noise": p95_dominance,
+            "iqr_over_noise": iqr_over_noise,
+            "confidence": confidence,
+            "rejection_reasons": ";".join(reasons),
+        }
+        burst_candidate_rows.append(row)
+        burst_candidate_mask[onset:offset] = True
+        burst_candidate_score[onset:offset] = np.maximum(burst_candidate_score[onset:offset], confidence)
+        if reasons:
+            return
+
+        burst_mask[onset:offset] = True
+        burst_events.append(
+            [
+                float(onset),
+                float(offset),
+                duration_ms,
+                median_level,
+                floor_support_fraction,
+                peak_dominance,
+                iqr_over_noise,
+                confidence,
+            ]
+        )
+
+    recovery_support = (
+        (floor > (elevated_k * noise))
+        & (med > (max(elevated_k, 0.75 * median_k) * noise))
+        & valid
+        & (~mask)
+    )
+    recovery_regions = _merge_close_regions(
+        _contiguous_regions(recovery_support),
+        max_gap_samples=_to_samples(6.0, fs, minimum=1),
+    )
+    seed_regions = []
+    if template_seed_regions is not None:
+        seed_regions = [
+            (max(0, min(n, int(start))), max(0, min(n, int(stop))))
+            for start, stop in template_seed_regions
+        ]
+    all_recovery_regions = _merge_close_regions(
+        sorted([(s, e) for s, e in [*recovery_regions, *seed_regions] if e > s]),
+        max_gap_samples=_to_samples(4.0, fs, minimum=1),
+    )
+    for start, stop in all_recovery_regions:
+        source_bonus = 0.06 if any(start <= seed_stop and stop >= seed_start for seed_start, seed_stop in seed_regions) else 0.0
+        _try_recovery_candidate(start, stop, source_bonus=source_bonus)
+
+    for start, stop in seed_regions:
+        _try_burst_candidate(start, stop, source="long_near_miss", source_bonus=0.08)
+    for start, stop in all_recovery_regions:
+        source_bonus = 0.04 if any(start <= seed_stop and stop >= seed_start for seed_start, seed_stop in seed_regions) else 0.0
+        _try_burst_candidate(start, stop, source="raised_floor_candidate", source_bonus=source_bonus)
+
+    if events:
+        events = sorted(events, key=lambda row: (row[0], row[1]))
+        deduped: List[List[float]] = []
+        for row in events:
+            if deduped and int(row[0]) < int(deduped[-1][1]):
+                if float(row[5]) > float(deduped[-1][5]):
+                    deduped[-1] = row
+                continue
+            deduped.append(row)
+        events = deduped
+
+    if burst_events:
+        burst_events = sorted(burst_events, key=lambda row: (row[0], row[1]))
+        deduped_burst: List[List[float]] = []
+        for row in burst_events:
+            if deduped_burst and int(row[0]) < int(deduped_burst[-1][1]):
+                if float(row[7]) > float(deduped_burst[-1][7]):
+                    deduped_burst[-1] = row
+                continue
+            deduped_burst.append(row)
+        burst_events = deduped_burst
+
+    _set_short_plateau_debug(
+        n,
+        short_centering_baseline=centering_baseline,
+        short_centered_trace=y,
+        short_floor_envelope=floor,
+        short_step_up_score=step_up_score,
+        short_step_down_score=step_down_score,
+        short_support_mask=support_mask,
+        short_candidate_mask=candidate_mask,
+        short_candidate_score=candidate_score,
+        short_template_score=template_score,
+        short_template_recovery_mask=template_recovery_mask,
+        short_refined_onset_score=refined_onset_score,
+        short_refined_offset_score=refined_offset_score,
+        burst_plateau_candidate_mask=burst_candidate_mask,
+        burst_plateau_candidate_score=burst_candidate_score,
+        burst_plateau_candidate_rows=burst_candidate_rows,
+    )
+
+    short_event_table = np.asarray(events, dtype=float) if events else np.zeros((0, 6), dtype=float)
+    burst_event_table = np.asarray(burst_events, dtype=float) if burst_events else np.zeros((0, 8), dtype=float)
+    if return_burst:
+        return mask, short_event_table, burst_mask, burst_event_table
+    return mask, short_event_table
 
 
-def _merge_plateau_masks(long_mask: np.ndarray, short_mask: np.ndarray, fs: float) -> np.ndarray:
-    n = max(int(np.asarray(long_mask).size), int(np.asarray(short_mask).size))
+def _merge_plateau_masks(*masks: np.ndarray, fs: float) -> np.ndarray:
+    n = max((int(np.asarray(mask).size) for mask in masks if mask is not None), default=0)
     combined = np.zeros(n, dtype=bool)
-    if long_mask is not None:
-        lm = np.asarray(long_mask, dtype=bool)
-        combined[: lm.size] |= lm
-    if short_mask is not None:
-        sm = np.asarray(short_mask, dtype=bool)
-        combined[: sm.size] |= sm
+    for mask in masks:
+        if mask is None:
+            continue
+        arr = np.asarray(mask, dtype=bool)
+        combined[: arr.size] |= arr
     if not np.any(combined):
         return combined
     merge_gap = _to_samples(5.0, fs, minimum=1)
@@ -1905,6 +2442,470 @@ def _detect_spikes_threshold(
     return spikes, threshold_line, analysis
 
 
+def _template_matching_center_and_noise(values: np.ndarray) -> Tuple[float, float]:
+    finite = np.asarray(values, dtype=float)
+    finite = finite[np.isfinite(finite)]
+    if finite.size == 0:
+        return 0.0, 1e-9
+    center = float(np.median(finite))
+    mad = float(np.median(np.abs(finite - center)) / 0.6745)
+    if (not np.isfinite(mad)) or mad <= 1e-12:
+        mad = float(np.std(finite))
+    if (not np.isfinite(mad)) or mad <= 1e-12:
+        mad = 1e-9
+    return center, max(mad, 1e-9)
+
+
+def _template_matching_polarity(filtered: np.ndarray, blocked: np.ndarray) -> int:
+    y = np.asarray(filtered, dtype=float)
+    valid = (~np.asarray(blocked, dtype=bool)) & np.isfinite(y)
+    values = y[valid]
+    if values.size == 0:
+        return 1
+    center = float(np.median(values))
+    high = float(np.nanpercentile(values - center, 99.5))
+    low = float(np.nanpercentile(center - values, 99.5))
+    return 1 if high >= low else -1
+
+
+def _template_matching_template_polarity(template_mean: np.ndarray) -> int:
+    mean = np.asarray(template_mean, dtype=float).reshape(-1)
+    if mean.size == 0:
+        return 1
+    baseline = float(mean[0])
+    peak = int(np.nanargmax(np.abs(mean - baseline)))
+    return -1 if float(mean[peak]) < baseline else 1
+
+
+def _estimate_template_matching_noise_std(filtered_centered: np.ndarray, blocked: np.ndarray, polarity: int) -> Tuple[float, str]:
+    y = np.asarray(filtered_centered, dtype=float)
+    valid = (~np.asarray(blocked, dtype=bool)) & np.isfinite(y)
+    values = y[valid]
+    if values.size < 8:
+        _, noise = _template_matching_center_and_noise(values)
+        return noise, "robust_std"
+
+    whole_std = float(np.std(values))
+    whole_std = max(whole_std, 1e-9)
+
+    try:
+        model = GaussianMixture(
+            n_components=2,
+            covariance_type="full",
+            random_state=0,
+            reg_covar=1e-6,
+            n_init=3,
+        )
+        model.fit(values.reshape(-1, 1))
+        means = np.asarray(model.means_, dtype=float).reshape(-1)
+        covariances = np.asarray(model.covariances_, dtype=float).reshape(2, -1)
+        noise_component = int(np.argmin(means) if int(polarity) >= 0 else np.argmax(means))
+        gmm_std = float(np.sqrt(max(float(covariances[noise_component, 0]), 1e-18)))
+        if np.isfinite(gmm_std) and 0.0 < gmm_std <= whole_std:
+            return max(gmm_std, 1e-9), "gaussian_mixture"
+    except Exception:
+        pass
+
+    center = float(np.median(values))
+    if int(polarity) >= 0:
+        noise_half = values[values <= center]
+        flipped = center + np.abs(noise_half - center)
+    else:
+        noise_half = values[values >= center]
+        flipped = center - np.abs(noise_half - center)
+    if noise_half.size:
+        mirrored = np.concatenate([noise_half, flipped])
+        flipped_std = float(np.std(mirrored[np.isfinite(mirrored)]))
+        if np.isfinite(flipped_std) and 0.0 < flipped_std <= whole_std:
+            return max(flipped_std, 1e-9), "asymmetric_flip"
+
+    return whole_std, "whole_trace_std"
+
+
+def _manual_template_matching_indices(value: object, size: int) -> np.ndarray:
+    if value is None:
+        return np.zeros(0, dtype=int)
+    if isinstance(value, str):
+        raw_items = value.replace(";", ",").split(",")
+    elif isinstance(value, (list, tuple, np.ndarray)):
+        raw_items = list(value)
+    else:
+        raw_items = []
+
+    indices: List[int] = []
+    for item in raw_items:
+        text = str(item).strip()
+        if not text:
+            continue
+        try:
+            idx = int(round(float(text)))
+        except ValueError:
+            continue
+        if 0 <= idx < int(size):
+            indices.append(idx)
+    if not indices:
+        return np.zeros(0, dtype=int)
+    return np.asarray(sorted(set(indices)), dtype=int)
+
+
+def _extract_manual_template_matching_templates(
+    filtered_centered: np.ndarray,
+    blocked: np.ndarray,
+    template_indices: np.ndarray,
+    pre_samples: int,
+    post_samples: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    y = np.asarray(filtered_centered, dtype=float)
+    excluded = np.asarray(blocked, dtype=bool)
+    valid = (~excluded) & np.isfinite(y)
+    n = int(y.size)
+    width = int(pre_samples + post_samples + 1)
+    if n == 0 or width <= 0:
+        return np.zeros((0, max(0, width)), dtype=float), np.zeros(0, dtype=int), np.zeros(0, dtype=float)
+
+    _, noise = _template_matching_center_and_noise(y[valid])
+    templates: List[np.ndarray] = []
+    kept: List[int] = []
+    snrs: List[float] = []
+    for idx in np.asarray(template_indices, dtype=int).reshape(-1):
+        start = int(idx) - int(pre_samples)
+        stop = int(idx) + int(post_samples) + 1
+        if start < 0 or stop > n:
+            continue
+        if not np.all(valid[start:stop]):
+            continue
+        segment = np.asarray(y[start:stop], dtype=float).copy()
+        base_stop = max(1, min(int(pre_samples), segment.size))
+        segment -= float(np.median(segment[:base_stop]))
+        templates.append(segment)
+        kept.append(int(idx))
+        snrs.append(float(abs(y[int(idx)]) / max(noise, 1e-9)))
+    if not templates:
+        return np.zeros((0, width), dtype=float), np.zeros(0, dtype=int), np.zeros(0, dtype=float)
+    return np.vstack(templates), np.asarray(kept, dtype=int), np.asarray(snrs, dtype=float)
+
+
+def _template_matching_log_likelihood_ratio_from_model(
+    filtered_centered: np.ndarray,
+    template_mean: np.ndarray,
+    signal_std: np.ndarray,
+    noise_std: float,
+    blocked: np.ndarray,
+    peak_offset: int,
+) -> np.ndarray:
+    y = np.asarray(filtered_centered, dtype=float)
+    mean = np.asarray(template_mean, dtype=float).reshape(-1)
+    sig = np.asarray(signal_std, dtype=float).reshape(-1)
+    n = int(y.size)
+    m = int(mean.size)
+    ratio = np.full(n, -np.inf, dtype=float)
+    if n == 0 or m == 0 or n < m:
+        return ratio
+
+    noise = max(float(noise_std), 1e-12)
+    sig = np.maximum(sig, max(noise / 100.0, 1e-12))
+    min_log_prob = float(np.log(np.nextafter(0.0, 1.0)))
+    windows = np.lib.stride_tricks.sliding_window_view(y, m)
+    valid = np.lib.stride_tricks.sliding_window_view(
+        (~np.asarray(blocked, dtype=bool)) & np.isfinite(y),
+        m,
+    )
+    valid_windows = np.all(valid, axis=1)
+
+    signal_log = np.zeros_like(windows, dtype=float)
+    noise_log = np.zeros_like(windows, dtype=float)
+    above_baseline = mean > 0.0
+    below_baseline = ~above_baseline
+    if np.any(above_baseline):
+        signal_log[:, above_baseline] = norm.logcdf(
+            windows[:, above_baseline],
+            loc=mean[above_baseline],
+            scale=sig[above_baseline],
+        )
+        noise_log[:, above_baseline] = norm.logsf(
+            windows[:, above_baseline],
+            loc=0.0,
+            scale=noise,
+        )
+    if np.any(below_baseline):
+        signal_log[:, below_baseline] = norm.logsf(
+            windows[:, below_baseline],
+            loc=mean[below_baseline],
+            scale=sig[below_baseline],
+        )
+        noise_log[:, below_baseline] = norm.logcdf(
+            windows[:, below_baseline],
+            loc=0.0,
+            scale=noise,
+        )
+    signal_log = np.nan_to_num(signal_log, nan=min_log_prob, neginf=min_log_prob, posinf=0.0)
+    noise_log = np.nan_to_num(noise_log, nan=min_log_prob, neginf=min_log_prob, posinf=0.0)
+    scores = np.sum(signal_log - noise_log, axis=1)
+    scores[~valid_windows] = -np.inf
+    start = int(np.clip(int(peak_offset), 0, m - 1))
+    ratio[start : start + scores.size] = scores
+    return ratio
+
+
+def _template_matching_threshold_from_noise(
+    template_mean: np.ndarray,
+    signal_std: np.ndarray,
+    noise_std: float,
+    peak_offset: int,
+    trace_length: int,
+    false_positive_rate: float,
+) -> Tuple[float, float, float, float]:
+    m = int(np.asarray(template_mean).size)
+    n = int(max(trace_length, m + 1))
+    num_windows = max(1, n - m + 1)
+    num_pieces = max(1, int(math.ceil(num_windows / max(1, m))))
+    total_fp = float(false_positive_rate)
+    if not np.isfinite(total_fp) or total_fp <= 0.0:
+        total_fp = 0.05
+    total_fp = float(np.clip(total_fp, 1e-9, 0.5))
+    per_piece_fp = float(np.clip(total_fp / float(num_pieces), 1e-12, 0.5))
+
+    rng = np.random.default_rng(0)
+    simulated = rng.normal(0.0, max(float(noise_std), 1e-12), size=n)
+    sim_blocked = np.zeros(simulated.shape, dtype=bool)
+    noise_ratio = _template_matching_log_likelihood_ratio_from_model(
+        simulated,
+        template_mean,
+        signal_std,
+        noise_std,
+        sim_blocked,
+        peak_offset,
+    )
+    finite = noise_ratio[np.isfinite(noise_ratio)]
+    if finite.size == 0:
+        return float("inf"), per_piece_fp, float("nan"), float("nan")
+
+    mean_boot = float(np.mean(finite))
+    std_boot = float(np.std(finite))
+    if (not np.isfinite(std_boot)) or std_boot <= 1e-12:
+        std_boot = 1e-9
+    threshold = float(norm.isf(per_piece_fp, loc=mean_boot, scale=std_boot))
+    return threshold, per_piece_fp, mean_boot, std_boot
+
+
+def _template_matching_threshold_regions(ratio: np.ndarray, threshold: float, blocked: np.ndarray) -> List[Tuple[int, int]]:
+    scores = np.asarray(ratio, dtype=float)
+    valid = (~np.asarray(blocked, dtype=bool)) & np.isfinite(scores)
+    if not np.isfinite(threshold):
+        return []
+    above = (scores > float(threshold)) & valid
+    return _contiguous_regions(above)
+
+
+def _detect_spikes_template_matching(
+    raw_signal: np.ndarray,
+    time: np.ndarray,
+    baseline: np.ndarray,
+    blocked: np.ndarray,
+    fs: float,
+    params: DetectionParams,
+    trace_name: str,
+) -> Tuple[List[SpikeRecord], np.ndarray, np.ndarray, Dict[str, np.ndarray]]:
+    raw = np.asarray(raw_signal, dtype=float)
+    t = np.asarray(time, dtype=float)
+    base = np.asarray(baseline, dtype=float)
+    excluded = np.asarray(blocked, dtype=bool)
+    n = int(raw.size)
+    display_threshold = np.full(n, np.nan, dtype=float)
+    empty_debug: Dict[str, np.ndarray] = {
+        "template_matching_likelihood_ratio": np.full(n, -np.inf, dtype=float),
+        "template_matching_likelihood_threshold_line": np.full(n, np.nan, dtype=float),
+        "template_matching_filtered_trace": np.zeros(n, dtype=float),
+        "template_matching_template_mean": np.zeros(0, dtype=float),
+        "template_matching_template_std": np.zeros(0, dtype=float),
+        "template_matching_requested_template_indices": np.zeros(0, dtype=int),
+        "template_matching_template_indices": np.zeros(0, dtype=int),
+        "template_matching_template_snr": np.zeros(0, dtype=float),
+        "template_matching_autopick_used": np.zeros(1, dtype=float),
+        "template_matching_autopick_indices": np.zeros(0, dtype=int),
+        "template_matching_autopick_threshold_line": np.full(n, np.nan, dtype=float),
+        "template_matching_autopick_signal": np.zeros(n, dtype=float),
+        "template_matching_noise_std": np.zeros(1, dtype=float),
+        "template_matching_threshold": np.zeros(1, dtype=float),
+        "template_matching_polarity": np.ones(1, dtype=float),
+        "template_matching_fp_per_piece": np.zeros(1, dtype=float),
+        "template_matching_noise_ratio_mean": np.zeros(1, dtype=float),
+        "template_matching_noise_ratio_std": np.zeros(1, dtype=float),
+    }
+    if n == 0:
+        return [], display_threshold, empty_debug["template_matching_likelihood_ratio"], empty_debug
+
+    cutoff_hz = float(getattr(params, "template_matching_filter_cutoff_hz", 20.0))
+    filtered = _butterworth_highpass(raw, fs=fs, cutoff_hz=cutoff_hz, order=2)
+    filtered = np.asarray(filtered, dtype=float)
+    filtered[~np.isfinite(filtered)] = 0.0
+    center, _seed_noise = _template_matching_center_and_noise(filtered[(~excluded) & np.isfinite(filtered)])
+    filtered_centered = filtered - center
+
+    polarity = _template_matching_polarity(filtered_centered, excluded)
+    pre_samples = _to_samples(float(getattr(params, "template_matching_pre_ms", 5.0)), fs, minimum=1)
+    post_samples = _to_samples(float(getattr(params, "template_matching_post_ms", 12.0)), fs, minimum=1)
+    requested_template_indices = _manual_template_matching_indices(
+        getattr(params, "template_matching_template_indices", []),
+        n,
+    )
+    autopick_used = False
+    autopick_indices = np.zeros(0, dtype=int)
+    autopick_threshold_line = np.full(n, np.nan, dtype=float)
+    autopick_signal = np.zeros(n, dtype=float)
+    if requested_template_indices.size == 0 and bool(getattr(params, "template_matching_enable_autopick", False)):
+        autopick_spikes, autopick_threshold_line, autopick_signal = _detect_spikes_threshold(
+            raw_signal=raw,
+            time=t,
+            baseline=base,
+            blocked=excluded,
+            fs=fs,
+            mode="std",
+            threshold_k=12.0,
+            prominence_k=float(getattr(params, "spike_prominence_k", 3.0)),
+            min_separation_ms=float(getattr(params, "min_separation_ms", 25.0)),
+            fwhm_half_window_ms=float(getattr(params, "spike_zoom_half_window_ms", 5.0)),
+            trace_name=trace_name,
+        )
+        autopick_indices = np.asarray([int(spike.spike_index) for spike in autopick_spikes], dtype=int)
+        requested_template_indices = _manual_template_matching_indices(autopick_indices, n)
+        autopick_used = requested_template_indices.size > 0
+    if requested_template_indices.size == 0:
+        debug = dict(empty_debug)
+        debug["template_matching_filtered_trace"] = filtered_centered
+        debug["template_matching_polarity"] = np.asarray([float(polarity)], dtype=float)
+        debug["template_matching_autopick_used"] = np.asarray([1.0 if autopick_used else 0.0], dtype=float)
+        debug["template_matching_autopick_indices"] = autopick_indices
+        debug["template_matching_autopick_threshold_line"] = autopick_threshold_line
+        debug["template_matching_autopick_signal"] = autopick_signal
+        return [], display_threshold, empty_debug["template_matching_likelihood_ratio"], debug
+
+    templates, template_indices, template_snr = _extract_manual_template_matching_templates(
+        filtered_centered,
+        excluded,
+        requested_template_indices,
+        pre_samples=pre_samples,
+        post_samples=post_samples,
+    )
+    if templates.size == 0:
+        debug = dict(empty_debug)
+        debug["template_matching_filtered_trace"] = filtered_centered
+        debug["template_matching_requested_template_indices"] = requested_template_indices
+        debug["template_matching_polarity"] = np.asarray([float(polarity)], dtype=float)
+        debug["template_matching_autopick_used"] = np.asarray([1.0 if autopick_used else 0.0], dtype=float)
+        debug["template_matching_autopick_indices"] = autopick_indices
+        debug["template_matching_autopick_threshold_line"] = autopick_threshold_line
+        debug["template_matching_autopick_signal"] = autopick_signal
+        return [], display_threshold, empty_debug["template_matching_likelihood_ratio"], debug
+
+    template_mean = np.mean(templates, axis=0)
+    polarity = _template_matching_template_polarity(template_mean)
+    noise_std, _noise_method = _estimate_template_matching_noise_std(filtered_centered, excluded, polarity)
+    if templates.shape[0] >= 10:
+        signal_std = np.std(templates, axis=0, ddof=1)
+    else:
+        signal_std = np.full(template_mean.shape, noise_std, dtype=float)
+    signal_std = np.maximum(signal_std, max(noise_std / 100.0, 1e-12))
+
+    ratio = _template_matching_log_likelihood_ratio_from_model(
+        filtered_centered,
+        template_mean,
+        signal_std,
+        noise_std,
+        excluded,
+        peak_offset=pre_samples,
+    )
+    threshold, fp_per_piece, noise_ratio_mean, noise_ratio_std = _template_matching_threshold_from_noise(
+        template_mean,
+        signal_std,
+        noise_std,
+        peak_offset=pre_samples,
+        trace_length=n,
+        false_positive_rate=float(getattr(params, "template_matching_false_positive_rate", 0.05)),
+    )
+    threshold_line = np.full(n, threshold, dtype=float)
+    regions = _template_matching_threshold_regions(ratio, threshold, excluded)
+
+    _, raw_noise = _template_matching_center_and_noise(raw[(~excluded) & np.isfinite(raw)])
+    search_half = _to_samples(10.0, fs, minimum=1)
+    refractory = _to_samples(float(getattr(params, "min_separation_ms", 25.0)), fs, minimum=1)
+    events: List[Tuple[int, int, int, int, float]] = []
+    signed_raw = float(polarity) * (raw - base)
+    for start, end in regions:
+        if end <= start:
+            continue
+        local = ratio[start:end]
+        if local.size == 0 or not np.any(np.isfinite(local)):
+            continue
+        ratio_peak = int(start + int(np.nanargmax(local)))
+        lo = max(0, ratio_peak - search_half)
+        hi = min(n, ratio_peak + search_half + 1)
+        if hi <= lo:
+            continue
+        raw_window = signed_raw[lo:hi].copy()
+        raw_window[excluded[lo:hi]] = -np.inf
+        if not np.any(np.isfinite(raw_window)):
+            continue
+        raw_peak = int(lo + int(np.nanargmax(raw_window)))
+        events.append((int(start), int(end), ratio_peak, raw_peak, float(ratio[ratio_peak])))
+
+    selected: List[Tuple[int, int, int, int, float]] = []
+    occupied: List[int] = []
+    for event in sorted(events, key=lambda item: item[4], reverse=True):
+        raw_peak = int(event[3])
+        if all(abs(raw_peak - existing) > refractory for existing in occupied):
+            selected.append(event)
+            occupied.append(raw_peak)
+    selected.sort(key=lambda item: item[3])
+
+    spikes: List[SpikeRecord] = []
+    for start, end, ratio_peak, raw_peak, score_value in selected:
+        baseline_value = float(base[raw_peak]) if raw_peak < base.size else 0.0
+        amplitude = float(raw[raw_peak] - baseline_value)
+        spikes.append(
+            SpikeRecord(
+                trace_name=trace_name,
+                candidate_index=int(ratio_peak),
+                spike_index=int(raw_peak),
+                spike_time=float(t[raw_peak]) if raw_peak < t.size else float(raw_peak / max(fs, 1e-9)),
+                spike_amplitude_raw_or_corrected=float(raw[raw_peak]),
+                baseline_at_spike=baseline_value,
+                amplitude_above_baseline=amplitude,
+                prominence=float(abs(amplitude)),
+                width=float(max(1, end - start)),
+                local_noise_estimate=max(float(raw_noise), 1e-9),
+                snr=float(abs(amplitude) / max(float(raw_noise), 1e-9)),
+                detection_threshold_used=float(threshold),
+                fwhm_ms=_measure_spike_fwhm_ms(raw, raw_peak, fs, half_window_ms=float(params.spike_zoom_half_window_ms)),
+                status="pending",
+                source="auto",
+                notes=f"template-matching score={score_value:.3g}",
+            )
+        )
+
+    debug = {
+        "template_matching_likelihood_ratio": ratio,
+        "template_matching_likelihood_threshold_line": threshold_line,
+        "template_matching_filtered_trace": filtered_centered,
+        "template_matching_template_mean": template_mean,
+        "template_matching_template_std": signal_std,
+        "template_matching_requested_template_indices": requested_template_indices,
+        "template_matching_template_indices": template_indices,
+        "template_matching_template_snr": template_snr,
+        "template_matching_autopick_used": np.asarray([1.0 if autopick_used else 0.0], dtype=float),
+        "template_matching_autopick_indices": autopick_indices,
+        "template_matching_autopick_threshold_line": autopick_threshold_line,
+        "template_matching_autopick_signal": autopick_signal,
+        "template_matching_noise_std": np.asarray([float(noise_std)], dtype=float),
+        "template_matching_threshold": np.asarray([float(threshold)], dtype=float),
+        "template_matching_polarity": np.asarray([float(polarity)], dtype=float),
+        "template_matching_fp_per_piece": np.asarray([float(fp_per_piece)], dtype=float),
+        "template_matching_noise_ratio_mean": np.asarray([float(noise_ratio_mean)], dtype=float),
+        "template_matching_noise_ratio_std": np.asarray([float(noise_ratio_std)], dtype=float),
+    }
+    return spikes, display_threshold, ratio, debug
+
+
 def detect_spikes(
     trace_name: str,
     time: np.ndarray,
@@ -1920,6 +2921,7 @@ def detect_spikes(
     fs = float(sampling_rate_hz) if sampling_rate_hz is not None and np.isfinite(sampling_rate_hz) and sampling_rate_hz > 0 else _estimate_sampling_rate(time)
 
     apply_highpass = bool(getattr(params, "use_highpass_filter", False)) and baseline_override is None
+    apply_lowpass = bool(getattr(params, "use_lowpass_filter", False)) and baseline_override is None
     if apply_highpass:
         processed_signal = _butterworth_highpass(
             signal,
@@ -1929,7 +2931,15 @@ def detect_spikes(
         )
     else:
         processed_signal = signal
-    highpass_signal = processed_signal if apply_highpass else np.zeros_like(processed_signal)
+    highpass_signal = processed_signal.copy() if apply_highpass else np.zeros_like(processed_signal)
+    if apply_lowpass:
+        processed_signal = _butterworth_lowpass(
+            processed_signal,
+            fs=fs,
+            cutoff_hz=float(getattr(params, "lowpass_cutoff_hz", 50.0)),
+            order=int(getattr(params, "lowpass_order", 5)),
+        )
+    lowpass_signal = processed_signal.copy() if apply_lowpass else np.zeros_like(processed_signal)
     # No smoothing/filtering beyond the optional explicit high-pass preprocessing.
     smoothed = processed_signal
 
@@ -2000,7 +3010,7 @@ def detect_spikes(
 
     # The long detector is used here as the baseline-exclusion/protection mask.
     long_plateau_mask = np.asarray(plateau_mask, dtype=bool).copy()
-    run_short_plateau_detector = baseline_override is not None
+    run_short_plateau_detector = True
     _set_short_plateau_debug(processed_signal.size)
     if run_short_plateau_detector:
         short_plateau_signal = processed_signal
@@ -2010,11 +3020,18 @@ def detect_spikes(
                 raise ValueError("short_plateau_trace_override must have the same shape as corrected")
             short_plateau_signal = _interpolate_invalid(time, override)
         baseline_corrected_signal = short_plateau_signal - baseline
-        short_plateau_mask, short_plateau_events = _detect_short_plateaus_baseline_corrected(
+        short_template_seed_regions = _short_plateau_seed_regions_from_long_debug(
+            long_plateau_debug,
+            n=int(processed_signal.size),
+            fs=fs,
+            min_duration_ms=float(params.short_plateau_min_duration_ms),
+        )
+        short_plateau_result = _detect_short_plateaus_baseline_corrected(
             baseline_corrected_signal,
             fs=fs,
             excluded_mask=blocked,
             long_plateau_mask=long_plateau_mask,
+            template_seed_regions=short_template_seed_regions,
             step_noise_k=float(params.short_plateau_step_noise_k),
             elevated_noise_k=float(params.short_plateau_elevated_noise_k),
             survival_noise_k=float(params.short_plateau_survival_noise_k),
@@ -2026,13 +3043,18 @@ def detect_spikes(
             early_dwell_ms=float(params.short_plateau_early_dwell_ms),
             min_support_ms=float(params.short_plateau_min_support_ms),
             min_duration_ms=float(params.short_plateau_min_duration_ms),
+            return_burst=True,
         )
+        short_plateau_mask, short_plateau_events, burst_plateau_mask, burst_plateau_events = short_plateau_result
         short_plateau_mask &= ~long_plateau_mask
+        burst_plateau_mask &= ~(long_plateau_mask | short_plateau_mask)
     else:
         short_plateau_mask = np.zeros_like(long_plateau_mask, dtype=bool)
         short_plateau_events = np.zeros((0, 6), dtype=float)
+        burst_plateau_mask = np.zeros_like(long_plateau_mask, dtype=bool)
+        burst_plateau_events = np.zeros((0, 8), dtype=float)
 
-    plateau_mask = _merge_plateau_masks(long_plateau_mask, short_plateau_mask, fs=fs)
+    plateau_mask = _merge_plateau_masks(long_plateau_mask, short_plateau_mask, burst_plateau_mask, fs=fs)
 
     # Compute a single noise estimate from truly quiet regions.
     quiet_mask = (~plateau_mask) & (~blocked)
@@ -2054,26 +3076,49 @@ def detect_spikes(
     old_prefix = "neuro" + "box" + "_"
     if mode.startswith(old_prefix):
         mode = mode.removeprefix(old_prefix)
-    if mode not in {"mad", "std", "snr"}:
+    if mode in {
+        "evans",
+        "evans_log_likelihood",
+        "evans-log-likelihood",
+        "log_likelihood",
+        "likelihood",
+        "template-matching",
+        "template matching",
+    }:
+        mode = "template_matching"
+    if mode not in {"mad", "std", "snr", "template_matching"}:
         mode = "mad"
-    spikes, threshold, detector_signal = _detect_spikes_threshold(
-        raw_signal=processed_signal,
-        time=time,
-        baseline=baseline,
-        blocked=blocked,
-        fs=fs,
-        mode=mode,
-        threshold_k=float(params.spike_noise_k),
-        prominence_k=float(params.spike_prominence_k),
-        min_separation_ms=float(params.min_separation_ms),
-        fwhm_half_window_ms=float(params.spike_zoom_half_window_ms),
-        trace_name=trace_name,
-    )
+    if mode == "template_matching":
+        spikes, threshold, detector_signal, template_matching_debug = _detect_spikes_template_matching(
+            raw_signal=processed_signal,
+            time=time,
+            baseline=baseline,
+            blocked=blocked,
+            fs=fs,
+            params=params,
+            trace_name=trace_name,
+        )
+    else:
+        spikes, threshold, detector_signal = _detect_spikes_threshold(
+            raw_signal=processed_signal,
+            time=time,
+            baseline=baseline,
+            blocked=blocked,
+            fs=fs,
+            mode=mode,
+            threshold_k=float(params.spike_noise_k),
+            prominence_k=float(params.spike_prominence_k),
+            min_separation_ms=float(params.min_separation_ms),
+            fwhm_half_window_ms=float(params.spike_zoom_half_window_ms),
+            trace_name=trace_name,
+        )
+        template_matching_debug = {}
 
     qc_plot_data: Dict[str, np.ndarray] = {
         "corrected_trace": processed_signal,
         "input_trace": signal,
         "highpass_signal": highpass_signal,
+        "lowpass_signal": lowpass_signal,
         "confirmation_threshold_line": threshold,
         "dff": np.zeros_like(smoothed, dtype=float),
         "residual": detector_signal,
@@ -2081,14 +3126,17 @@ def detect_spikes(
         "baseline_mask": plateau_mask,
         "long_plateau_mask": long_plateau_mask,
         "short_plateau_mask": short_plateau_mask,
+        "burst_plateau_mask": burst_plateau_mask,
         # Explicit aliases documenting the different roles without changing UI/export naming.
         "baseline_exclusion_mask": long_plateau_mask,
-        "detected_plateau_mask": short_plateau_mask,
+        "detected_plateau_mask": _merge_plateau_masks(short_plateau_mask, burst_plateau_mask, fs=fs),
         "short_plateau_event_table": short_plateau_events,
+        "burst_plateau_event_table": burst_plateau_events,
         "local_noise_estimate": local_noise_estimate,
         "plateau_debug_signal": plateau_debug_signal,
         "plateau_debug_threshold_line": plateau_debug_threshold_line,
     }
+    qc_plot_data.update(template_matching_debug)
     qc_plot_data.update(long_plateau_debug)
     qc_plot_data.update(_LAST_SHORT_PLATEAU_DEBUG)
 

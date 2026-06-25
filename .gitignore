@@ -17,11 +17,15 @@ env/
 build/
 dist/
 *.spec
+*.obj
+*.log
 
 # App/user outputs and local data
+analysis_outputs/
 exports/
 export/
 *_export/
+tmp/
 spike_session.json
 *.xlsx
 *.xls

@@ -93,9 +93,22 @@ class TracePlotWidget(QWidget):
             pen=pg.mkPen("#00897b", width=1.3, style=Qt.PenStyle.DashLine),
             name="High-pass",
         )
-        self.main_hybrid_denoised = self.main_plot.plot(pen=pg.mkPen("#8e24aa", width=1.8), name="State-Guided Denoised")
+        self.main_lowpass = self.main_plot.plot(
+            pen=pg.mkPen("#ef6c00", width=1.3, style=Qt.PenStyle.DashLine),
+            name="Low-pass",
+        )
+        self.main_hybrid_denoised = self.main_plot.plot(pen=pg.mkPen("#8e24aa", width=1.8), name="Gonzalez Denoised")
+        self.main_normalized_denoised = self.main_plot.plot(
+            pen=pg.mkPen("#00838f", width=1.4, style=Qt.PenStyle.DashLine),
+            name="Denoised % dF/F0",
+        )
+        self.main_denoise_residual = self.main_plot.plot(
+            pen=pg.mkPen("#d81b60", width=1.3, style=Qt.PenStyle.DashLine),
+            name="Denoise Residual",
+        )
         self.main_plateau = self.main_plot.plot(pen=pg.mkPen("#c62828", width=2.2), name="Long Plateau")
         self.main_short_plateau = self.main_plot.plot(pen=pg.mkPen("#1565c0", width=2.2), name="Short Plateau")
+        self.main_burst_plateau = self.main_plot.plot(pen=pg.mkPen("#7c3aed", width=2.2), name="Burst Plateau")
         self.main_raw_baseline = self.main_plot.plot(pen=pg.mkPen("#ff6d00", width=1.6), name="Raw Baseline")
         self.main_corrected_baseline = self.main_plot.plot(
             pen=pg.mkPen("#00a884", width=1.4, style=Qt.PenStyle.DashLine),
@@ -110,9 +123,13 @@ class TracePlotWidget(QWidget):
             self.main_raw,
             self.main_corrected,
             self.main_highpass,
+            self.main_lowpass,
             self.main_hybrid_denoised,
+            self.main_normalized_denoised,
+            self.main_denoise_residual,
             self.main_plateau,
             self.main_short_plateau,
+            self.main_burst_plateau,
             self.main_raw_baseline,
             self.main_corrected_baseline,
             self.compare_raw,
@@ -137,21 +154,34 @@ class TracePlotWidget(QWidget):
         self._plateau_regions: List[pg.LinearRegionItem] = []
         self._long_plateau_regions: List[pg.LinearRegionItem] = []
         self._short_plateau_regions: List[pg.LinearRegionItem] = []
+        self._burst_plateau_regions: List[pg.LinearRegionItem] = []
         self._artifact_regions: List[pg.LinearRegionItem] = []
         self._compare_artifact_regions: List[pg.LinearRegionItem] = []
+        self._plateau_region_key: Optional[tuple[object, ...]] = None
+        self._artifact_region_key: Optional[tuple[object, ...]] = None
         self._x_bounds: Optional[tuple[float, float]] = None
         self._view_initialized = False
         self._show_raw = True
         self._show_corrected = True
         self._show_baseline = True
         self._show_highpass = False
+        self._show_lowpass = False
         self._show_hybrid_denoised = False
+        self._show_normalized_denoised = False
+        self._show_denoise_residual = False
+        self._hybrid_denoised_label = "Gonzalez Denoised"
         self._has_raw_baseline = False
         self._has_corrected_baseline = False
         self._has_highpass = False
+        self._has_lowpass = False
         self._has_hybrid_denoised = False
+        self._has_normalized_denoised = False
+        self._has_denoise_residual = False
         self.main_highpass.setZValue(10)
+        self.main_lowpass.setZValue(10)
         self.main_hybrid_denoised.setZValue(11)
+        self.main_normalized_denoised.setZValue(11)
+        self.main_denoise_residual.setZValue(12)
         self._sync_legend()
 
         self.main_plot.scene().sigMouseClicked.connect(self._on_mouse_clicked)
@@ -167,6 +197,17 @@ class TracePlotWidget(QWidget):
         groups = np.split(idx, splits)
         return [(int(group[0]), int(group[-1]) + 1) for group in groups]
 
+    @staticmethod
+    def _array_cache_key(values: Optional[np.ndarray]) -> Optional[tuple[object, ...]]:
+        if values is None:
+            return None
+        arr = np.asarray(values)
+        owner = arr
+        while isinstance(getattr(owner, "base", None), np.ndarray):
+            owner = owner.base
+        pointer = int(arr.__array_interface__["data"][0]) if arr.size else 0
+        return (id(owner), pointer, tuple(arr.shape), str(arr.dtype), tuple(arr.strides))
+
     def _clear_artifact_regions(self) -> None:
         for region in self._artifact_regions:
             self.main_plot.removeItem(region)
@@ -174,6 +215,7 @@ class TracePlotWidget(QWidget):
             self.compare_plot.removeItem(region)
         self._artifact_regions = []
         self._compare_artifact_regions = []
+        self._artifact_region_key = None
 
     def _clear_plateau_regions(self) -> None:
         for region in self._plateau_regions:
@@ -181,6 +223,8 @@ class TracePlotWidget(QWidget):
         self._plateau_regions = []
         self._long_plateau_regions = []
         self._short_plateau_regions = []
+        self._burst_plateau_regions = []
+        self._plateau_region_key = None
 
     def _region_time_bounds(self, time: np.ndarray, start: int, stop: int) -> Optional[tuple[float, float]]:
         n = int(time.size)
@@ -233,10 +277,22 @@ class TracePlotWidget(QWidget):
         plateau_mask: Optional[np.ndarray],
         long_plateau_mask: Optional[np.ndarray] = None,
         short_plateau_mask: Optional[np.ndarray] = None,
+        burst_plateau_mask: Optional[np.ndarray] = None,
     ) -> None:
+        region_key = (
+            self._array_cache_key(self.time),
+            self._array_cache_key(plateau_mask),
+            self._array_cache_key(long_plateau_mask),
+            self._array_cache_key(short_plateau_mask),
+            self._array_cache_key(burst_plateau_mask),
+        )
+        if region_key == self._plateau_region_key:
+            return
         self._clear_plateau_regions()
+        self._plateau_region_key = region_key
         self.main_plateau.setData([], [])
         self.main_short_plateau.setData([], [])
+        self.main_burst_plateau.setData([], [])
         if self.time.size == 0:
             return
         long_mask = long_plateau_mask if long_plateau_mask is not None else plateau_mask
@@ -252,10 +308,20 @@ class TracePlotWidget(QWidget):
             pen=pg.mkPen(21, 101, 192, 0),
             target=self._short_plateau_regions,
         )
+        self._add_plateau_regions(
+            burst_plateau_mask,
+            brush=pg.mkBrush(124, 58, 237, 42),
+            pen=pg.mkPen(124, 58, 237, 0),
+            target=self._burst_plateau_regions,
+        )
         self._sync_legend()
 
     def _set_artifact_regions(self, artifact_mask: Optional[np.ndarray]) -> None:
+        region_key = (self._array_cache_key(self.time), self._array_cache_key(artifact_mask))
+        if region_key == self._artifact_region_key:
+            return
         self._clear_artifact_regions()
+        self._artifact_region_key = region_key
         if artifact_mask is None or self.time.size == 0:
             return
         mask = np.asarray(artifact_mask, dtype=bool)
@@ -325,9 +391,13 @@ class TracePlotWidget(QWidget):
             ("Raw", self.main_raw, self._show_raw and self._has_raw_baseline),
             ("Corrected", self.main_corrected, self._show_corrected),
             ("High-pass", self.main_highpass, self._show_highpass and self._has_highpass),
-            ("State-Guided Denoised", self.main_hybrid_denoised, self._show_hybrid_denoised and self._has_hybrid_denoised),
+            ("Low-pass", self.main_lowpass, self._show_lowpass and self._has_lowpass),
+            (self._hybrid_denoised_label, self.main_hybrid_denoised, self._show_hybrid_denoised and self._has_hybrid_denoised),
+            ("Denoised % dF/F0", self.main_normalized_denoised, self._show_normalized_denoised and self._has_normalized_denoised),
+            ("Denoise Residual", self.main_denoise_residual, self._show_denoise_residual and self._has_denoise_residual),
             ("Long Plateau", self.main_plateau, True),
             ("Short Plateau", self.main_short_plateau, True),
+            ("Burst Plateau", self.main_burst_plateau, True),
             ("Raw Baseline", self.compare_raw_baseline, self._show_baseline and self._show_raw and self._has_raw_baseline),
             ("Corrected Baseline", self.main_corrected_baseline, self._show_baseline and self._show_corrected and self._has_corrected_baseline),
         ]
@@ -425,7 +495,10 @@ class TracePlotWidget(QWidget):
         raw: np.ndarray,
         corrected: np.ndarray,
         hybrid_denoised: Optional[np.ndarray],
+        normalized_denoised: Optional[np.ndarray],
+        denoise_residual: Optional[np.ndarray],
         highpass: Optional[np.ndarray],
+        lowpass: Optional[np.ndarray],
         raw_baseline: Optional[np.ndarray],
         corrected_baseline: Optional[np.ndarray],
     ) -> None:
@@ -433,13 +506,18 @@ class TracePlotWidget(QWidget):
             raw=raw,
             corrected=corrected,
             hybrid_denoised=hybrid_denoised,
+            normalized_denoised=normalized_denoised,
+            denoise_residual=denoise_residual,
             highpass=highpass,
+            lowpass=lowpass,
             raw_baseline=raw_baseline,
             corrected_baseline=corrected_baseline,
         )
         if extent is None:
             return
+        self._set_main_y_range_from_extent(extent)
 
+    def _set_main_y_range_from_extent(self, extent: tuple[float, float]) -> None:
         y_min, y_max = extent
         if not np.isfinite(y_max) or not np.isfinite(y_min) or y_max <= y_min:
             y_min, y_max = max(0.0, y_min), max(1e-3, y_max)
@@ -452,7 +530,10 @@ class TracePlotWidget(QWidget):
         raw: np.ndarray,
         corrected: np.ndarray,
         hybrid_denoised: Optional[np.ndarray],
+        normalized_denoised: Optional[np.ndarray],
+        denoise_residual: Optional[np.ndarray],
         highpass: Optional[np.ndarray],
+        lowpass: Optional[np.ndarray],
         raw_baseline: Optional[np.ndarray],
         corrected_baseline: Optional[np.ndarray],
     ) -> Optional[tuple[float, float]]:
@@ -469,8 +550,14 @@ class TracePlotWidget(QWidget):
             core_parts.append(_trim_start(corrected))
         if self._show_hybrid_denoised and hybrid_denoised is not None:
             core_parts.append(_trim_start(hybrid_denoised))
+        if self._show_normalized_denoised and normalized_denoised is not None:
+            core_parts.append(_trim_start(normalized_denoised))
+        if self._show_denoise_residual and denoise_residual is not None:
+            core_parts.append(_trim_start(denoise_residual))
         if self._show_highpass and highpass is not None:
             core_parts.append(_trim_start(highpass))
+        if self._show_lowpass and lowpass is not None:
+            core_parts.append(_trim_start(lowpass))
         if self._show_raw and self._show_baseline and raw_baseline is not None:
             core_parts.append(_trim_start(raw_baseline))
             core_parts.append(_trim_start(raw))
@@ -545,19 +632,30 @@ class TracePlotWidget(QWidget):
         show_corrected: bool,
         show_baseline: bool,
         show_highpass: bool = False,
+        show_lowpass: bool = False,
         show_hybrid_denoised: bool = False,
+        show_normalized_denoised: bool = False,
+        show_denoise_residual: bool = False,
     ) -> None:
         self._show_raw = bool(show_raw)
         self._show_corrected = bool(show_corrected)
         self._show_baseline = bool(show_baseline)
         self._show_highpass = bool(show_highpass)
+        self._show_lowpass = bool(show_lowpass)
         self._show_hybrid_denoised = bool(show_hybrid_denoised)
+        self._show_normalized_denoised = bool(show_normalized_denoised)
+        self._show_denoise_residual = bool(show_denoise_residual)
         self.main_raw.setVisible(show_raw)
         self.main_corrected.setVisible(show_corrected)
         self.main_raw_baseline.setVisible(False)
         self.main_corrected_baseline.setVisible(show_baseline and show_corrected and self._has_corrected_baseline)
         self.main_highpass.setVisible(show_highpass and self._has_highpass)
+        self.main_lowpass.setVisible(show_lowpass and self._has_lowpass)
         self.main_hybrid_denoised.setVisible(show_hybrid_denoised and self._has_hybrid_denoised)
+        self.main_normalized_denoised.setVisible(
+            show_normalized_denoised and self._has_normalized_denoised
+        )
+        self.main_denoise_residual.setVisible(show_denoise_residual and self._has_denoise_residual)
         self._sync_legend()
 
     def set_trace(
@@ -566,20 +664,26 @@ class TracePlotWidget(QWidget):
         raw: np.ndarray,
         corrected: np.ndarray,
         hybrid_denoised: Optional[np.ndarray],
+        normalized_denoised: Optional[np.ndarray],
+        denoise_residual: Optional[np.ndarray],
         highpass: Optional[np.ndarray],
+        lowpass: Optional[np.ndarray],
         raw_baseline: Optional[np.ndarray],
         corrected_baseline: Optional[np.ndarray],
         spikes: Iterable[SpikeRecord],
         plateau_mask: Optional[np.ndarray] = None,
         long_plateau_mask: Optional[np.ndarray] = None,
         short_plateau_mask: Optional[np.ndarray] = None,
+        burst_plateau_mask: Optional[np.ndarray] = None,
         artifact_mask: Optional[np.ndarray] = None,
+        selected_overlay_label: str = "Gonzalez Denoised",
         reset_view: bool = False,
         refit_y: bool = False,
         startup_exclusion_ms: float = 0.0,
     ) -> None:
         self.time = np.asarray(time, dtype=float)
         self.corrected = np.asarray(corrected, dtype=float)
+        self._hybrid_denoised_label = str(selected_overlay_label or "Selected Overlay")
         startup_idx = 0
         
         # Exclude startup region from display if requested
@@ -595,8 +699,14 @@ class TracePlotWidget(QWidget):
                 corrected = np.asarray(corrected, dtype=float)[startup_idx:]
                 if hybrid_denoised is not None:
                     hybrid_denoised = np.asarray(hybrid_denoised, dtype=float)[startup_idx:]
+                if normalized_denoised is not None:
+                    normalized_denoised = np.asarray(normalized_denoised, dtype=float)[startup_idx:]
+                if denoise_residual is not None:
+                    denoise_residual = np.asarray(denoise_residual, dtype=float)[startup_idx:]
                 if highpass is not None:
                     highpass = np.asarray(highpass, dtype=float)[startup_idx:]
+                if lowpass is not None:
+                    lowpass = np.asarray(lowpass, dtype=float)[startup_idx:]
                 if raw_baseline is not None:
                     raw_baseline = np.asarray(raw_baseline, dtype=float)[startup_idx:]
                 if corrected_baseline is not None:
@@ -607,6 +717,8 @@ class TracePlotWidget(QWidget):
                     long_plateau_mask = np.asarray(long_plateau_mask, dtype=bool)[startup_idx:]
                 if short_plateau_mask is not None:
                     short_plateau_mask = np.asarray(short_plateau_mask, dtype=bool)[startup_idx:]
+                if burst_plateau_mask is not None:
+                    burst_plateau_mask = np.asarray(burst_plateau_mask, dtype=bool)[startup_idx:]
                 if artifact_mask is not None:
                     artifact_mask = np.asarray(artifact_mask, dtype=bool)[startup_idx:]
                 self.corrected = corrected
@@ -616,7 +728,12 @@ class TracePlotWidget(QWidget):
         raw_baseline_array = None if raw_baseline is None else np.asarray(raw_baseline, dtype=float)
         corrected_baseline_array = None if corrected_baseline is None else np.asarray(corrected_baseline, dtype=float)
         hybrid_array = None if hybrid_denoised is None else np.asarray(hybrid_denoised, dtype=float)
+        normalized_denoised_array = (
+            None if normalized_denoised is None else np.asarray(normalized_denoised, dtype=float)
+        )
+        denoise_residual_array = None if denoise_residual is None else np.asarray(denoise_residual, dtype=float)
         highpass_array = None if highpass is None else np.asarray(highpass, dtype=float)
+        lowpass_array = None if lowpass is None else np.asarray(lowpass, dtype=float)
         if (
             hybrid_array is not None
             and raw_baseline_array is not None
@@ -637,7 +754,16 @@ class TracePlotWidget(QWidget):
             corrected_baseline_array is not None and corrected_baseline_array.shape == corrected_array.shape
         )
         self._has_hybrid_denoised = bool(hybrid_array is not None and hybrid_array.shape == corrected_array.shape)
+        self._has_normalized_denoised = bool(
+            normalized_denoised_array is not None and normalized_denoised_array.shape == corrected_array.shape
+        )
         self._has_highpass = bool(highpass_array is not None and highpass_array.shape == corrected_array.shape)
+        self._has_lowpass = bool(lowpass_array is not None and lowpass_array.shape == corrected_array.shape)
+        if denoise_residual_array is None and self._has_hybrid_denoised and hybrid_array is not None:
+            denoise_residual_array = corrected_array - hybrid_array
+        self._has_denoise_residual = bool(
+            denoise_residual_array is not None and denoise_residual_array.shape == corrected_array.shape
+        )
 
         # The main plot is corrected-unit only. Raw-unit data stays in the lower
         # raw panel; if raw appears in the main plot, it is baseline-subtracted.
@@ -650,10 +776,22 @@ class TracePlotWidget(QWidget):
             self.main_highpass.setData(self.time, highpass_array)
         else:
             self.main_highpass.setData([], [])
+        if self._has_lowpass:
+            self.main_lowpass.setData(self.time, lowpass_array)
+        else:
+            self.main_lowpass.setData([], [])
         if self._has_hybrid_denoised:
             self.main_hybrid_denoised.setData(self.time, hybrid_array)
         else:
             self.main_hybrid_denoised.setData([], [])
+        if self._has_normalized_denoised:
+            self.main_normalized_denoised.setData(self.time, normalized_denoised_array)
+        else:
+            self.main_normalized_denoised.setData([], [])
+        if self._has_denoise_residual and denoise_residual_array is not None:
+            self.main_denoise_residual.setData(self.time, denoise_residual_array)
+        else:
+            self.main_denoise_residual.setData([], [])
 
         self.main_raw_baseline.setData([], [])
         if self._has_raw_baseline:
@@ -670,12 +808,18 @@ class TracePlotWidget(QWidget):
             self._show_baseline and self._show_corrected and self._has_corrected_baseline
         )
         self.main_highpass.setVisible(self._show_highpass and self._has_highpass)
+        self.main_lowpass.setVisible(self._show_lowpass and self._has_lowpass)
         self.main_hybrid_denoised.setVisible(self._show_hybrid_denoised and self._has_hybrid_denoised)
+        self.main_normalized_denoised.setVisible(
+            self._show_normalized_denoised and self._has_normalized_denoised
+        )
+        self.main_denoise_residual.setVisible(self._show_denoise_residual and self._has_denoise_residual)
 
         self._set_plateau_regions(
             plateau_mask=plateau_mask,
             long_plateau_mask=long_plateau_mask,
             short_plateau_mask=short_plateau_mask,
+            burst_plateau_mask=burst_plateau_mask,
         )
 
         self._set_artifact_regions(artifact_mask)
@@ -698,20 +842,16 @@ class TracePlotWidget(QWidget):
             raw=raw_main,
             corrected=corrected_array,
             hybrid_denoised=hybrid_array if self._has_hybrid_denoised else None,
+            normalized_denoised=normalized_denoised_array if self._has_normalized_denoised else None,
+            denoise_residual=denoise_residual_array if self._has_denoise_residual else None,
             highpass=highpass_array if self._has_highpass else None,
+            lowpass=lowpass_array if self._has_lowpass else None,
             raw_baseline=None,
             corrected_baseline=corrected_baseline_array if self._has_corrected_baseline else None,
         )
 
         if y_extent is not None and (reset_view or not self._view_initialized or refit_y):
-            self._set_main_y_range_from_data(
-                raw=raw_main,
-                corrected=corrected_array,
-                hybrid_denoised=hybrid_array if self._has_hybrid_denoised else None,
-                highpass=highpass_array if self._has_highpass else None,
-                raw_baseline=None,
-                corrected_baseline=corrected_baseline_array if self._has_corrected_baseline else None,
-            )
+            self._set_main_y_range_from_extent(y_extent)
         if reset_view or not self._view_initialized or refit_y:
             self._set_compare_y_range_from_data(raw_array, raw_baseline_array if self._has_raw_baseline else None)
 
@@ -744,12 +884,5 @@ class TracePlotWidget(QWidget):
         if y_extent is not None:
             view_y = self.main_plot.viewRange()[1]
             if y_extent[1] < float(view_y[0]) or y_extent[0] > float(view_y[1]):
-                self._set_main_y_range_from_data(
-                    raw=raw_main,
-                    corrected=corrected_array,
-                    hybrid_denoised=hybrid_array if self._has_hybrid_denoised else None,
-                    highpass=highpass_array if self._has_highpass else None,
-                    raw_baseline=None,
-                    corrected_baseline=corrected_baseline_array if self._has_corrected_baseline else None,
-                )
+                self._set_main_y_range_from_extent(y_extent)
                 self._set_compare_y_range_from_data(raw_array, raw_baseline_array if self._has_raw_baseline else None)

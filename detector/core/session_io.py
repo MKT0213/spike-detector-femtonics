@@ -59,7 +59,7 @@ def _burst_from_dict(data: Dict[str, object]) -> BurstRecord:
     )
 
 
-def _normalize_spike_payload(data: object) -> List[Dict[str, object]]:
+def _normalize_record_payload(data: object) -> List[Dict[str, object]]:
     if not isinstance(data, list):
         return []
     return [item for item in data if isinstance(item, dict)]
@@ -71,12 +71,19 @@ def save_session(
     detection_params: DetectionParams,
     artifact_params: ArtifactParams,
     traces: Dict[str, TraceCuration],
+    pipeline_config: Dict[str, object] | None = None,
 ) -> None:
-    session = AppSession(excel_path=excel_path, detection_params=detection_params, artifact_params=artifact_params)
+    session = AppSession(
+        excel_path=excel_path,
+        detection_params=detection_params,
+        artifact_params=artifact_params,
+        pipeline_config=dict(pipeline_config or {}),
+    )
 
     for trace_name, trace_state in traces.items():
         session.trace_states[trace_name] = {
             "spikes": [s.to_dict() for s in trace_state.spikes],
+            "deleted_spikes": [s.to_dict() for s in trace_state.deleted_spikes],
             "bursts": [b.to_dict() for b in trace_state.bursts],
             "deleted_bursts": [b.to_dict() for b in trace_state.deleted_bursts],
         }
@@ -85,6 +92,7 @@ def save_session(
         "excel_path": session.excel_path,
         "detection_params": session.detection_params.to_dict(),
         "artifact_params": session.artifact_params.to_dict(),
+        "pipeline_config": session.pipeline_config,
         "trace_states": session.trace_states,
     }
 
@@ -100,16 +108,25 @@ def load_session(path: str) -> AppSession:
         excel_path=str(payload.get("excel_path", "")),
         detection_params=DetectionParams.from_dict(payload.get("detection_params", {})),
         artifact_params=ArtifactParams.from_dict(payload.get("artifact_params", {})),
+        pipeline_config=dict(payload.get("pipeline_config", {}))
+        if isinstance(payload.get("pipeline_config", {}), dict)
+        else {},
     )
 
     raw_states = payload.get("trace_states", {})
     if isinstance(raw_states, dict):
         for trace_name, state in raw_states.items():
-            spikes_data: List[Dict[str, object]] = []
+            trace_payload: Dict[str, List[Dict[str, object]]] = {
+                "spikes": [],
+                "deleted_spikes": [],
+                "bursts": [],
+                "deleted_bursts": [],
+            }
             if isinstance(state, dict):
-                spikes_data = _normalize_spike_payload(state.get("spikes", []))
+                for key in trace_payload:
+                    trace_payload[key] = _normalize_record_payload(state.get(key, []))
             app_session.trace_states[trace_name] = {
-                "spikes": spikes_data,
+                key: list(value) for key, value in trace_payload.items()
             }
 
     return app_session
@@ -120,7 +137,12 @@ def apply_session_to_traces(app_session: AppSession, traces: Dict[str, TraceCura
         state = app_session.trace_states.get(trace_name)
         if not state:
             continue
-        spikes_data = _normalize_spike_payload(state.get("spikes", []))
+        spikes_data = _normalize_record_payload(state.get("spikes", []))
+        deleted_spikes_data = _normalize_record_payload(state.get("deleted_spikes", []))
+        bursts_data = _normalize_record_payload(state.get("bursts", []))
+        deleted_bursts_data = _normalize_record_payload(state.get("deleted_bursts", []))
         trace_state.spikes = [_spike_from_dict(item) for item in spikes_data]
-        trace_state.deleted_spikes = []
+        trace_state.deleted_spikes = [_spike_from_dict(item) for item in deleted_spikes_data]
+        trace_state.bursts = [_burst_from_dict(item) for item in bursts_data]
+        trace_state.deleted_bursts = [_burst_from_dict(item) for item in deleted_bursts_data]
         trace_state.sort_spikes()

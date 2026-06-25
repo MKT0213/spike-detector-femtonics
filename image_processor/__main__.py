@@ -1,6 +1,8 @@
+"""Command-line entry point for the Femtonics image processor."""
+
 from __future__ import annotations
 
-from detector.analysis.main import main
+from .app import main
 
 
 if __name__ == "__main__":

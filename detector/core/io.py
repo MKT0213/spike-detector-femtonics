@@ -20,6 +20,31 @@ TIME_CANDIDATES = [
     "ms",
 ]
 
+FRAME_COLUMN_NAMES = {
+    "frame",
+    "frames",
+    "frameid",
+    "frameidx",
+    "frameindex",
+    "frameno",
+    "framenum",
+    "framenumber",
+}
+
+
+def _canonical_column_name(column: object) -> str:
+    return "".join(ch for ch in str(column).lower().strip() if ch.isalnum())
+
+
+def is_ignored_trace_column(column: object) -> bool:
+    """Return True for import metadata columns that should not become traces."""
+    name = _canonical_column_name(column)
+    if name in FRAME_COLUMN_NAMES:
+        return True
+    if name.endswith("corrected") and name[: -len("corrected")] in FRAME_COLUMN_NAMES:
+        return True
+    return False
+
 
 def _pick_time_column(columns: List[object]) -> object:
     lowered = {str(col).lower().strip(): col for col in columns}
@@ -83,6 +108,9 @@ def _load_single_sheet(
         time = time[valid_time]
 
     work = df.drop(columns=[time_col]).copy()
+    ignored_columns = [column for column in work.columns if is_ignored_trace_column(column)]
+    if ignored_columns:
+        work = work.drop(columns=ignored_columns)
     if work.empty:
         raise ValueError(f"No trace columns found in sheet '{sheet}' after removing time column.")
 

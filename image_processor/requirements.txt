@@ -1,0 +1,6 @@
+numpy
+Pillow
+tifffile
+zarr
+openpyxl
+PySide6

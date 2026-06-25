@@ -8,3 +8,5 @@ pyqtgraph
 PyWavelets
 scikit-learn
 kneed
+tifffile
+zarr
