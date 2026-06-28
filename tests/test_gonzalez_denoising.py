@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 
 import numpy as np
+import pywt
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -83,6 +84,90 @@ def test_gonzalez_full_trace_dff_uses_supplied_baseline() -> None:
     assert np.allclose(debug["working_dff"], trace / baseline)
 
 
+def test_guarded_full_trace_restores_positive_events_but_not_negative_noise(monkeypatch) -> None:
+    fs = 1000.0
+    trace = np.zeros(180, dtype=float)
+    trace[60] = 10.0
+    trace[110] = -10.0
+
+    def compressed_core(values, fs, return_debug=False, **kwargs):
+        output = np.asarray(values, dtype=float).copy()
+        output[60] = 2.0
+        output[110] = 0.0
+        return {"output": output} if return_debug else output
+
+    monkeypatch.setattr(gonzalez_denoising, "denoise_gonzalez_adaptive_wavelet", compressed_core)
+
+    original = denoise_trace_gonzalez_full_trace(
+        trace,
+        fs=fs,
+        denoising_method="gonzalez_full_trace",
+        return_debug=True,
+    )
+    guarded = denoise_trace_gonzalez_full_trace(
+        trace,
+        fs=fs,
+        denoising_method="gonzalez_full_trace_guarded",
+        return_debug=True,
+    )
+
+    assert original["safety"]["amplitude_preservation_merge"]["event_polarity"] == "absolute"
+    assert guarded["safety"]["amplitude_preservation_merge"]["event_polarity"] == "positive"
+    assert guarded["guarded_artifact_preset"]["enabled"] is True
+    assert np.asarray(original["output"])[60] > 8.0
+    assert np.asarray(original["output"])[110] < -8.0
+    assert np.asarray(guarded["output"])[60] > 8.0
+    assert abs(float(np.asarray(guarded["output"])[110])) < 3.0
+
+
+def test_guarded_full_trace_repairs_denoised_only_downward_trough(monkeypatch) -> None:
+    fs = 1000.0
+    trace = np.zeros(180, dtype=float)
+    trace[60] = 10.0
+
+    def artifact_core(values, fs, return_debug=False, **kwargs):
+        output = np.asarray(values, dtype=float).copy()
+        output[60] = 10.0
+        output[110] = -10.0
+        return {"output": output} if return_debug else output
+
+    monkeypatch.setattr(gonzalez_denoising, "denoise_gonzalez_adaptive_wavelet", artifact_core)
+
+    guarded = denoise_trace_gonzalez_full_trace(
+        trace,
+        fs=fs,
+        denoising_method="gonzalez_full_trace_guarded",
+        return_debug=True,
+    )
+
+    guard = guarded["safety"]["downward_artifact_guard"]
+    assert guard["enabled"] is True
+    assert guard["repair_count"] >= 1
+    assert any(repair["target"] == "raw" for repair in guard["repairs"])
+    assert np.asarray(guarded["output"])[60] > 8.0
+    assert abs(float(np.asarray(guarded["output"])[110])) < 3.0
+
+
+def test_gonzalez_dff_rejects_frame_like_normalization_baseline() -> None:
+    fs = 1000.0
+    trace = 0.1 * np.sin(2.0 * np.pi * 7.0 * np.arange(240, dtype=float) / fs)
+    frame_like_baseline = np.linspace(1.0, 1000.0, trace.size)
+
+    debug = denoise_trace_gonzalez_full_trace(
+        trace,
+        fs=fs,
+        denoising_method="gonzalez_s7_dff",
+        normalization_baseline=frame_like_baseline,
+        return_debug=True,
+        n_freqs=12,
+    )
+
+    assert debug["fallback_triggered"] is True
+    assert "normalization_baseline_dynamic_range_too_large_for_dff" in debug["fallback_reasons"]
+    assert debug["normalization_baseline_validation"]["valid"] is False
+    assert np.allclose(debug["output"], trace)
+
+
 def test_full_trace_and_dff_use_same_core_after_input_preparation(monkeypatch) -> None:
     fs = 1000.0
     trace = _synthetic_trace(fs=fs)
@@ -139,15 +224,114 @@ def test_gonzalez_s7_mode_uses_dff_and_s7_structural_steps() -> None:
 
     assert debug["denoiser_used"] == "gonzalez_s7_dff"
     assert debug["input_normalization"] == "dff_detector_baseline"
+    assert debug["s7_reproduction_preset"]["enabled"] is True
+    assert debug["s7_reproduction_preset"]["frequency_cluster_mode"] == "ward_silhouette_up_to_20_clusters"
+    assert debug["s7_reproduction_preset"]["ward_max_clusters"] == 20
+    assert debug["s7_reproduction_preset"]["cluster_selection_strategy"] == "parsimonious_silhouette"
+    assert debug["s7_reproduction_preset"]["removed_reconstruction_gain_mode"] == "unit"
+    assert debug["s7_reproduction_preset"]["threshold_mask_padding_periods"] == 8.0
+    assert debug["s7_reproduction_preset"]["event_protected_thresholding"] is False
+    assert debug["s7_reproduction_preset"]["post_processing_merges"] == "disabled"
     assert np.allclose(debug["working_dff"], trace / baseline)
     assert np.asarray(debug["output"]).shape == trace.shape
     assert core_debug["enable_noise_cluster_rejection"] is True
     assert core_debug["enable_event_template_rejection"] is True
     assert core_debug["event_template_rejection_mode"] == "pc1_negative"
+    assert core_debug["event_rejection_application"] == "coefficient_time_mask"
     assert core_debug["low_frequency_gaussian_branch"]["enabled"] is True
+    assert core_debug["reconstruction_mode"] == "residual_subtractive"
+    assert core_debug["removed_reconstruction_gain_mode"] == "unit"
+    assert core_debug["max_clusters"] == 20
+    assert core_debug["chosen_cluster_count"] <= 20
+    assert core_debug["cluster_selection_strategy"] == "parsimonious_silhouette"
+    assert core_debug["cluster_selection_relative_score"] == 0.85
+    assert core_debug["coefficient_threshold_domain"] == "normalized_magnitude"
+    assert core_debug["threshold_mask_padding_periods"] == 8.0
+    assert core_debug["attenuation_min"] == 0.5
+    assert core_debug["attenuation_max"] == 0.5
+    assert core_debug["coefficient_event_protection"]["enabled"] is False
+    assert core_debug["event_attenuation_min"] == 0.5
+    assert core_debug["event_attenuation_max"] == 0.5
+    assert core_debug["event_detection"]["z_threshold"] == 12.0
+    assert core_debug["event_detection"]["prominence_z"] == 1.0
+    assert core_debug["event_detection"]["min_distance_ms"] == 3.0
+    assert core_debug["event_detection"]["polarity"] == "positive"
+    assert core_debug["event_detection"]["use_threshold_crossings"] is False
     assert np.asarray(core_debug["s7_low_frequency_trace"]).shape == trace.shape
     assert debug["safety"]["level_preservation_merge"]["status"] == "skipped_for_s7_reproduction"
-    assert debug["safety"]["amplitude_preservation_merge"]["status"] == "skipped_for_s7_reproduction"
+    assert debug["safety"]["amplitude_preservation_merge"]["status"] == "skipped_for_paper_s7_reproduction"
+
+
+def test_residual_subtractive_reconstruction_is_identity_when_nothing_is_removed() -> None:
+    fs = 1000.0
+    trace = _synthetic_trace(n=256, fs=fs)
+
+    debug = gonzalez_denoising.denoise_gonzalez_adaptive_wavelet(
+        trace,
+        fs=fs,
+        input_mode="corrected",
+        return_debug=True,
+        n_freqs=18,
+        max_clusters=4,
+        attenuation_min=0.0,
+        attenuation_max=0.0,
+        reconstruction_mode="residual_subtractive",
+    )
+
+    assert debug["reconstruction_mode"] == "residual_subtractive"
+    assert np.allclose(debug["output"], trace)
+
+
+def test_regularized_dual_frame_inverse_reconstructs_cwt_better_than_weighted_sum() -> None:
+    fs = 1000.0
+    time = np.arange(1024, dtype=float) / fs
+    trace = np.sin(2.0 * np.pi * 30.0 * time) + 0.5 * np.sin(2.0 * np.pi * 110.0 * time)
+    frequencies = np.linspace(10.0, 250.0, 48)
+    wavelet = "cmor1.5-1.0"
+    scales = pywt.frequency2scale(wavelet, frequencies / fs)
+    coeffs, _returned_freqs = pywt.cwt(
+        trace,
+        scales,
+        wavelet,
+        sampling_period=1.0 / fs,
+        method="fft",
+        precision=gonzalez_denoising._GONZALEZ_CWT_PRECISION,
+    )
+    filter_fft = gonzalez_denoising._gonzalez_cwt_analysis_filter_fft(
+        trace.size,
+        scales,
+        wavelet,
+        precision=gonzalez_denoising._GONZALEZ_CWT_PRECISION,
+    )
+
+    dual = gonzalez_denoising._gonzalez_inverse_cwt(
+        coeffs,
+        scales,
+        wavelet,
+        filter_fft=filter_fft,
+        precision=gonzalez_denoising._GONZALEZ_CWT_PRECISION,
+    )
+    dual_gain, dual_offset, _dual_diag = gonzalez_denoising._gonzalez_reconstruction_calibration(dual, trace)
+    calibrated_dual = dual_offset + (dual_gain * dual)
+
+    weighted = gonzalez_denoising._gonzalez_inverse_cwt(
+        coeffs,
+        scales,
+        wavelet,
+        method="weighted_sum",
+    )
+    weighted_gain, weighted_offset, _weighted_diag = gonzalez_denoising._gonzalez_reconstruction_calibration(
+        weighted,
+        trace,
+    )
+    calibrated_weighted = weighted_offset + (weighted_gain * weighted)
+
+    dual_rms = float(np.sqrt(np.mean((calibrated_dual - trace) ** 2)))
+    weighted_rms = float(np.sqrt(np.mean((calibrated_weighted - trace) ** 2)))
+
+    assert float(np.corrcoef(calibrated_dual, trace)[0, 1]) > 0.99
+    assert dual_rms < 0.15 * float(np.std(trace))
+    assert dual_rms < 0.35 * weighted_rms
 
 
 def test_analysis_passes_first_pass_baseline_to_dff_denoiser(monkeypatch) -> None:
@@ -213,6 +397,7 @@ def test_detection_params_migrates_removed_denoising_keys() -> None:
     )
 
     assert params.denoising_method == "gonzalez_full_trace"
+    assert DetectionParams.from_dict({"denoising_method": "guarded"}).denoising_method == "gonzalez_full_trace_guarded"
     assert DetectionParams.from_dict({"low_state_denoiser": "none"}).denoising_method == "none"
 
 
@@ -226,11 +411,23 @@ def test_ui_only_exposes_active_gonzalez_denoising_methods() -> None:
         ]
 
         assert DetectionParams().denoising_method == "gonzalez_full_trace"
-        assert methods == ["gonzalez_full_trace", "gonzalez_full_trace_dff", "gonzalez_s7_dff", "none"]
+        assert methods == [
+            "gonzalez_full_trace",
+            "gonzalez_full_trace_guarded",
+            "gonzalez_full_trace_dff",
+            "gonzalez_s7_dff",
+            "none",
+        ]
         assert [
             str(window.param_denoising_method.itemText(index))
             for index in range(window.param_denoising_method.count())
-        ] == ["On (corrected trace)", "On (dF/F0 input)", "S7 reproduction (dF/F0)", "Off"]
+        ] == [
+            "On (corrected trace)",
+            "Guarded (corrected trace)",
+            "On (dF/F0 input)",
+            "S7 reproduction (dF/F0)",
+            "Off",
+        ]
         assert window.param_denoising_method.currentData() == "gonzalez_full_trace"
         assert window.param_denoising_method.currentText() == "On (corrected trace)"
         assert window.param_denoising_input_normalization.text() == "Corrected trace"
@@ -273,14 +470,31 @@ def test_ui_only_exposes_active_gonzalez_denoising_methods() -> None:
             np.array([1.0, 2.0]),
         )
         assert window._raw_overlay_signal(np.array([101.0, 102.0]), None) is None
+        window.param_denoising_method.setCurrentIndex(
+            window.param_denoising_method.findData("gonzalez_full_trace_guarded")
+        )
+        assert window.param_denoising_method.currentText() == "Guarded (corrected trace)"
+        assert (
+            window.param_denoising_input_normalization.text()
+            == "Corrected trace + positive-event/downward-artifact guard"
+        )
         window.param_denoising_method.setCurrentIndex(window.param_denoising_method.findData("gonzalez_full_trace_dff"))
         assert window.param_denoising_method.currentText() == "On (dF/F0 input)"
         assert window.param_denoising_input_normalization.text() == "dF/F0 using detector baseline"
         window.param_denoising_method.setCurrentIndex(window.param_denoising_method.findData("gonzalez_s7_dff"))
         assert window.param_denoising_method.currentText() == "S7 reproduction (dF/F0)"
         assert window.param_denoising_input_normalization.text() == "dF/F0 using detector baseline + S7 low-frequency branch"
+        assert window.param_gonzalez_threshold_sd.isEnabled()
+        assert window.param_gonzalez_max_clusters.isEnabled()
+        assert not window.param_gonzalez_attenuation_min.isEnabled()
+        assert not window.param_gonzalez_attenuation_max.isEnabled()
+        assert "20 clusters" in window.param_gonzalez_max_clusters.toolTip().lower()
         window.param_denoising_method.setCurrentIndex(window.param_denoising_method.findData("none"))
         assert window.param_denoising_input_normalization.text() == "Off"
+        assert not window.param_gonzalez_threshold_sd.isEnabled()
+        assert not window.param_gonzalez_max_clusters.isEnabled()
+        assert not window.param_gonzalez_attenuation_min.isEnabled()
+        assert not window.param_gonzalez_attenuation_max.isEnabled()
         assert not hasattr(window, "param_plateau_tv_weight")
         assert not hasattr(window, "param_low_state_boundary_protect_ms")
     finally:

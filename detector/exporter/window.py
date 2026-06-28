@@ -221,9 +221,9 @@ class ExporterWindow(QMainWindow):
         self.chk_shade_plateaus.setChecked(True)
         self.chk_spike_markers.setChecked(True)
         self.chk_shade_plateaus.setToolTip(
-            "Used by Debug dots + shading mode. Bars only mode uses colored plateau bars instead of shaded regions."
+            "Used by Debug dots + shading mode. Plateau-bar mode uses colored plateau bars instead of shaded regions."
         )
-        self.chk_spike_markers.setToolTip("Turn off to export spike plots without yellow peak dots.")
+        self.chk_spike_markers.setToolTip("Turn off to export spike plots without spike markers.")
         self.chk_label_spikes.setToolTip("Turn on to draw S0001-style labels at spike peaks.")
         self.chk_label_plateaus.setToolTip("Turn on to draw P0001-style labels next to plateau regions.")
         self.chk_recording_aligned_trace_panels_raw.setToolTip(
@@ -233,7 +233,7 @@ class ExporterWindow(QMainWindow):
             "Export one event-only raster per recording: spike ticks by time, with colored plateau interval bars."
         )
         self.marker_style_combo.setToolTip(
-            "Debug mode draws yellow spike dots with shaded plateaus. Bars mode draws black spike ticks and colored plateau interval bars only."
+            "Debug mode draws yellow spike dots with shaded plateaus. Plateau-bar mode draws hollow black spike circles and colored plateau interval bars."
         )
         marker_style_row = QHBoxLayout()
         marker_style_row.addWidget(QLabel("Event mode"))

@@ -81,7 +81,13 @@ The bundled motion hook defaults to the adapted shared-template residual method:
 `method=shared_template_residual; max_shift_px=2; subpixel=false;
 residual_max_shift_px=1; residual_min_peak_ratio=1.10`. It performs a shared
 global correction first, then accepts conservative per-rectangle residual shifts
-only when the residual match is confident enough.
+only when the residual match is confident enough. It also writes pixel-correlation
+QC outputs by default: a frame-vs-correlation PNG, per-frame CSV, mean-image PNG,
+and JSON summary using each raw frame's Pearson correlation against the mean
+image. To disable that diagnostic export, add
+`export_pixel_correlation_qc=false` to Motion params.
+For motion-frame QC without rewriting the TIFF, use the QC-only hook
+`image_processor.pixel_motion_qc:motion_hook`.
 For a single-frame 2D TIFF, the bundled motion hook intentionally returns
 `motion_skipped` plus `*_motion_qc.json` instead of creating a fake corrected
 movie; segmentation can still run on that frame.

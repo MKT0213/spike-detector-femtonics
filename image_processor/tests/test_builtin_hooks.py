@@ -37,6 +37,9 @@ class BuiltInHookTests(unittest.TestCase):
             self.assertTrue(corrected_tiff.exists())
             self.assertTrue(Path(result["qc_json"]).exists())
             self.assertTrue(Path(result["shifts_csv"]).exists())
+            self.assertTrue(Path(result["correlation_plot_png"]).exists())
+            self.assertTrue(Path(result["correlation_scores_csv"]).exists())
+            self.assertTrue(Path(result["correlation_qc_json"]).exists())
             self.assertTrue(metadata_path_for_tiff(corrected_tiff).exists())
 
             corrected_frames = [np.asarray(frame) for frame in iter_tiff_frames(corrected_tiff)]
@@ -59,6 +62,8 @@ class BuiltInHookTests(unittest.TestCase):
             self.assertEqual(result["layout_source"], "metadata_tiles")
             self.assertNotIn("corrected_tiff", result)
             self.assertNotIn("shifts_csv", result)
+            self.assertTrue(Path(result["correlation_plot_png"]).exists())
+            self.assertTrue(Path(result["correlation_scores_csv"]).exists())
             qc_path = Path(result["qc_json"])
             self.assertTrue(qc_path.exists())
             qc = json.loads(qc_path.read_text(encoding="utf-8"))

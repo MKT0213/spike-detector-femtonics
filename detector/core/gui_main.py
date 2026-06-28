@@ -90,6 +90,8 @@ def _denoising_input_normalization_label(method: str) -> str:
         return "dF/F0 using detector baseline + S7 low-frequency branch"
     if str(method) == "gonzalez_full_trace_dff":
         return "dF/F0 using detector baseline"
+    if str(method) == "gonzalez_full_trace_guarded":
+        return "Corrected trace + positive-event/downward-artifact guard"
     if str(method) == "none":
         return "Off"
     return "Corrected trace"
@@ -4849,8 +4851,8 @@ class SpikeCurationMainWindow(QMainWindow):
         left_layout.addStretch(1)
 
         self.param_detection_mode = QComboBox()
-        self.param_detection_mode.addItem("MAD threshold", "mad")
         self.param_detection_mode.addItem("STD threshold", "std")
+        self.param_detection_mode.addItem("MAD threshold", "mad")
         self.param_detection_mode.addItem("SNR threshold", "snr")
         self.param_detection_mode.addItem("Template matching", "template_matching")
         self.param_detection_mode.setToolTip(
@@ -5001,6 +5003,7 @@ class SpikeCurationMainWindow(QMainWindow):
 
         self.param_denoising_method = QComboBox()
         self.param_denoising_method.addItem("On (corrected trace)", "gonzalez_full_trace")
+        self.param_denoising_method.addItem("Guarded (corrected trace)", "gonzalez_full_trace_guarded")
         self.param_denoising_method.addItem("On (dF/F0 input)", "gonzalez_full_trace_dff")
         self.param_denoising_method.addItem("S7 reproduction (dF/F0)", "gonzalez_s7_dff")
         self.param_denoising_method.addItem("Off", "none")
@@ -5908,7 +5911,7 @@ class SpikeCurationMainWindow(QMainWindow):
         self._render_current_trace(refit_y=True)
 
     def _pull_params_from_widgets(self) -> None:
-        self.detection_params.detection_mode = str(self.param_detection_mode.currentData() or "mad")
+        self.detection_params.detection_mode = str(self.param_detection_mode.currentData() or "std")
         self.detection_params.baseline_mode = str(self.param_baseline_mode.currentData() or "percentile")
         self.detection_params.startup_exclusion_ms = float(self.param_startup_exclusion_ms.value())
         self.detection_params.baseline_rolling_window_ms = float(self.param_baseline_rolling_window_ms.value())
@@ -6041,6 +6044,32 @@ class SpikeCurationMainWindow(QMainWindow):
     def _update_denoise_control_state(self, *_args: object) -> None:
         denoising_method = str(self.param_denoising_method.currentData() or "gonzalez_full_trace")
         self.param_denoising_input_normalization.setText(_denoising_input_normalization_label(denoising_method))
+        denoising_enabled = denoising_method != "none"
+        uses_s7 = denoising_method == "gonzalez_s7_dff"
+        self.param_gonzalez_threshold_sd.setEnabled(denoising_enabled)
+        self.param_gonzalez_max_clusters.setEnabled(denoising_enabled)
+        self.param_gonzalez_attenuation_min.setEnabled(denoising_enabled and not uses_s7)
+        self.param_gonzalez_attenuation_max.setEnabled(denoising_enabled and not uses_s7)
+        if uses_s7:
+            self.param_gonzalez_max_clusters.setToolTip(
+                "For S7 reproduction, Ward/silhouette clustering searches up to 20 clusters and keeps broad paper-style domains with wavelet mask support."
+            )
+            self.param_gonzalez_attenuation_min.setToolTip(
+                "Fixed at 0.5 in paper S7 reproduction."
+            )
+            self.param_gonzalez_attenuation_max.setToolTip(
+                "Fixed at 0.5 for paper S7 thresholding and PC1 noisy-event cleanup."
+            )
+        else:
+            self.param_gonzalez_max_clusters.setToolTip(
+                "Number of wavelet-frequency groups used before thresholding; higher values separate frequency bands more finely."
+            )
+            self.param_gonzalez_attenuation_min.setToolTip(
+                "Minimum suppression applied to samples below the wavelet threshold."
+            )
+            self.param_gonzalez_attenuation_max.setToolTip(
+                "Maximum suppression applied to below-threshold wavelet coefficients; lower values preserve more signal."
+            )
         self.chk_show_hybrid_denoised.setText("Show selected overlay")
         if hasattr(self, "pipeline_chk_show_hybrid_denoised"):
             self.pipeline_chk_show_hybrid_denoised.setText("Show selected overlay")

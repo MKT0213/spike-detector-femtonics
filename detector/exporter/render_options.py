@@ -32,7 +32,7 @@ MARKER_STYLE_DOT: str = "dot"
 MARKER_STYLE_BAR: str = "bar"
 MARKER_STYLE_DEFINITIONS: Tuple[Tuple[str, str], ...] = (
     (MARKER_STYLE_DOT, "Debug dots + shading"),
-    (MARKER_STYLE_BAR, "Bars only"),
+    (MARKER_STYLE_BAR, "Plateau bars + hollow circles"),
 )
 
 

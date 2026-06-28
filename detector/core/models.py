@@ -51,7 +51,7 @@ class DetectionParams:
     # Optional fixed offset added on top of the auto-threshold.
     auto_threshold_offset: float = 0.0
     # Legacy spike-threshold multiplier kept for backward compatibility.
-    spike_noise_k: float = 7.0
+    spike_noise_k: float = 12.0
     # find_peaks prominence multiplier for MAD/STD spike threshold modes.
     spike_prominence_k: float = 3.0
     # Template-matching detector controls.
@@ -132,6 +132,14 @@ class DetectionParams:
             return "none"
         if mode in {"gonzalez_s7_dff", "gonzalez_s7", "s7", "s7_dff", "gonzalez_s7_reproduction"}:
             return "gonzalez_s7_dff"
+        if mode in {
+            "gonzalez_full_trace_guarded",
+            "full_trace_guarded",
+            "guarded",
+            "artifact_guarded",
+            "gonzalez_guarded",
+        }:
+            return "gonzalez_full_trace_guarded"
         if mode in {"gonzalez_full_trace_dff", "full_trace_dff", "full_trace_gonzalez_dff", "gonzalez_dff"}:
             return "gonzalez_full_trace_dff"
         if mode in {"gonzalez_full_trace", "full_trace_gonzalez", "full_gonzalez", "gonzalez_all_states", ""}:

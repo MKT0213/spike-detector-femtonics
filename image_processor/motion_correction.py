@@ -20,6 +20,7 @@ try:
         save_tiff_array_stack,
         validate_tiff_matches_metadata,
     )
+    from .pixel_motion_qc import write_pixel_correlation_outputs
     from .tiff_backend import iter_tiff_frames
 except ImportError:  # pragma: no cover - supports direct script-style imports.
     from roi_core import (
@@ -31,6 +32,7 @@ except ImportError:  # pragma: no cover - supports direct script-style imports.
         save_tiff_array_stack,
         validate_tiff_matches_metadata,
     )
+    from pixel_motion_qc import write_pixel_correlation_outputs
     from tiff_backend import iter_tiff_frames
 
 
@@ -721,6 +723,14 @@ def motion_hook(
     template_iterations = int(kwargs.get("template_iterations", kwargs.get("iterations", 1)))
     residual_max_shift_px = int(kwargs.get("residual_max_shift_px", 1))
     residual_min_peak_ratio = _as_optional_float(kwargs.get("residual_min_peak_ratio", 1.10))
+    export_pixel_correlation_qc = _as_bool(kwargs.get("export_pixel_correlation_qc"), default=True)
+    pixel_correlation_threshold_mad = float(kwargs.get("pixel_correlation_threshold_mad", 3.0))
+    raw_correlation_threshold = kwargs.get("pixel_correlation_threshold")
+    pixel_correlation_threshold = (
+        None
+        if raw_correlation_threshold is None or str(raw_correlation_threshold).strip() == ""
+        else float(raw_correlation_threshold)
+    )
 
     result = correct_tiff_stack(
         source,
@@ -741,6 +751,14 @@ def motion_hook(
     hook_result["qc_json"] = str(qc_path)
     if shifts_path is not None:
         hook_result["shifts_csv"] = str(shifts_path)
+    if export_pixel_correlation_qc:
+        pixel_qc = write_pixel_correlation_outputs(
+            source,
+            target_dir,
+            threshold_mad=pixel_correlation_threshold_mad,
+            correlation_threshold=pixel_correlation_threshold,
+        )
+        hook_result.update(pixel_qc)
     return hook_result
 
 

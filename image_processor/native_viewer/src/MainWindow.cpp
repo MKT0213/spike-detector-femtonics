@@ -2854,6 +2854,7 @@ QString MainWindow::findPreferredDisplayPathFromManifest(
             candidate = firstExistingPath(
                 actions.value(QStringLiteral("motion_correction")).toObject(),
                 QStringList{
+                    QStringLiteral("correlation_plot_png"),
                     QStringLiteral("corrected_tiff"),
                     QStringLiteral("corrected_tiff_path"),
                     QStringLiteral("output_tiff"),
@@ -3046,6 +3047,10 @@ QStringList MainWindow::findResultPathsFromManifest(
                 QStringLiteral("downstream_tiff"),
                 QStringLiteral("qc_json"),
                 QStringLiteral("shifts_csv"),
+                QStringLiteral("correlation_scores_csv"),
+                QStringLiteral("correlation_plot_png"),
+                QStringLiteral("mean_image_png"),
+                QStringLiteral("correlation_qc_json"),
             });
 
         const QJsonObject roiAction = actions.value(QStringLiteral("roi_detection")).toObject();

@@ -20,6 +20,25 @@ from sklearn.cluster import AgglomerativeClustering
 from sklearn.decomposition import PCA
 from sklearn.metrics import silhouette_score
 
+_GONZALEZ_CWT_PRECISION = 12
+_GONZALEZ_INVERSE_CWT_REGULARIZATION = 1e-3
+_GONZALEZ_S7_WARD_MAX_CLUSTERS = 20
+_GONZALEZ_S7_ATTENUATION_MIN = 0.5
+_GONZALEZ_S7_ATTENUATION_MAX = 0.5
+_GONZALEZ_S7_CLUSTER_SELECTION_RELATIVE_SCORE = 0.85
+_GONZALEZ_S7_THRESHOLD_MASK_PADDING_PERIODS = 8.0
+_GONZALEZ_S7_EVENT_ATTENUATION_MIN = 0.5
+_GONZALEZ_S7_EVENT_ATTENUATION_MAX = 0.5
+_GONZALEZ_S7_EVENT_DETECTION_Z = 12.0
+_GONZALEZ_S7_EVENT_DETECTION_PROMINENCE_Z = 1.0
+_GONZALEZ_S7_EVENT_DETECTION_MIN_DISTANCE_MS = 3.0
+_GONZALEZ_S7_EVENT_PROTECTION_WINDOW_MS = 12.0
+_GONZALEZ_S7_EVENT_PROTECTION_FLOOR = 0.98
+_GONZALEZ_S7_COEFFICIENT_EVENT_PROTECTION_WINDOW_MS = 18.0
+_GONZALEZ_GUARDED_DOWNWARD_REPAIR_WINDOW_MS = 25.0
+_GONZALEZ_GUARDED_DOWNWARD_BASELINE_WINDOW_MS = 50.0
+_GONZALEZ_GUARDED_DOWNWARD_MAX_WIDTH_MS = 12.0
+
 
 def _validate_trace(values: np.ndarray, fs: float) -> np.ndarray:
     trace = np.asarray(values, dtype=float)
@@ -43,6 +62,86 @@ def _event_windows(trace: np.ndarray, peaks: np.ndarray, half_width: int) -> np.
     width = (2 * int(half_width)) + 1
     padded = np.pad(trace, (half_width, half_width), mode="reflect" if trace.size > 1 else "edge")
     return np.asarray([padded[int(peak) : int(peak) + width] for peak in peaks], dtype=float)
+
+
+def _boolean_regions(mask: np.ndarray, merge_gap: int = 0) -> list[tuple[int, int]]:
+    values = np.asarray(mask, dtype=bool).reshape(-1)
+    if values.size == 0 or not np.any(values):
+        return []
+    padded = np.r_[False, values, False]
+    edges = np.diff(padded.astype(np.int8))
+    starts = np.flatnonzero(edges == 1)
+    stops = np.flatnonzero(edges == -1)
+    regions = [(int(start), int(stop)) for start, stop in zip(starts, stops)]
+    gap = max(0, int(merge_gap))
+    if gap <= 0 or len(regions) <= 1:
+        return regions
+    merged: list[tuple[int, int]] = []
+    cur_start, cur_stop = regions[0]
+    for start, stop in regions[1:]:
+        if int(start) - int(cur_stop) <= gap:
+            cur_stop = int(stop)
+        else:
+            merged.append((int(cur_start), int(cur_stop)))
+            cur_start, cur_stop = int(start), int(stop)
+    merged.append((int(cur_start), int(cur_stop)))
+    return merged
+
+
+def _peaks_from_threshold_regions(
+    scores: np.ndarray,
+    candidate_mask: np.ndarray,
+    min_height: float,
+    min_prominence: float,
+    distance: int,
+    merge_gap: int,
+) -> np.ndarray:
+    scores = np.asarray(scores, dtype=float)
+    regions = _boolean_regions(candidate_mask, merge_gap=merge_gap)
+    peaks: list[int] = []
+    for start, stop in regions:
+        if stop <= start:
+            continue
+        segment = scores[start:stop]
+        if segment.size == 0:
+            continue
+        local_peaks, _props = find_peaks(
+            segment,
+            height=max(float(min_height), 0.0),
+            distance=max(1, int(distance)),
+            prominence=max(float(min_prominence), 0.0),
+        )
+        if local_peaks.size == 0:
+            local_peak = int(np.argmax(segment))
+            if float(segment[local_peak]) >= float(min_height):
+                peaks.append(int(start + local_peak))
+        else:
+            peaks.extend(int(start + peak) for peak in local_peaks)
+    if not peaks:
+        return np.asarray([], dtype=int)
+    peaks_array = np.asarray(sorted(set(peaks)), dtype=int)
+    if peaks_array.size <= 1:
+        return peaks_array
+    order = np.argsort(scores[peaks_array])[::-1]
+    kept: list[int] = []
+    for peak in peaks_array[order]:
+        if all(abs(int(peak) - int(existing)) >= int(distance) for existing in kept):
+            kept.append(int(peak))
+    return np.asarray(sorted(kept), dtype=int)
+
+
+def _dilate_boolean_mask(mask: np.ndarray, radius: int) -> np.ndarray:
+    values = np.asarray(mask, dtype=bool).reshape(-1)
+    if values.size == 0 or not np.any(values):
+        return values.copy()
+    pad = max(0, int(radius))
+    if pad <= 0:
+        return values.copy()
+    out = np.zeros(values.shape, dtype=bool)
+    for start, stop in _boolean_regions(values):
+        out[max(0, start - pad) : min(values.size, stop + pad)] = True
+    return out
+
 
 def _robust_sigma(values: np.ndarray) -> float:
     finite = np.asarray(values, dtype=float)
@@ -183,6 +282,34 @@ def _safe_f0_denominator(f0: np.ndarray) -> np.ndarray:
     return np.where(np.abs(f0) < eps, signs * eps, f0)
 
 
+def _dff_normalization_baseline_validation(f0: np.ndarray) -> dict:
+    baseline = np.asarray(f0, dtype=float)
+    finite = baseline[np.isfinite(baseline)]
+    if finite.size == 0:
+        return {
+            "valid": False,
+            "reason": "normalization_baseline_has_no_finite_values",
+            "robust_dynamic_ratio": float("nan"),
+        }
+    abs_finite = np.abs(finite)
+    reference = float(np.nanmedian(abs_finite))
+    eps = max(1e-9, 1e-6 * reference)
+    p01 = float(np.nanpercentile(abs_finite, 1.0))
+    p99 = float(np.nanpercentile(abs_finite, 99.0))
+    robust_ratio = float(p99 / max(p01, eps))
+    valid = bool(np.isfinite(robust_ratio) and robust_ratio <= 50.0)
+    reason = None if valid else "normalization_baseline_dynamic_range_too_large_for_dff"
+    return {
+        "valid": valid,
+        "reason": reason,
+        "robust_dynamic_ratio": robust_ratio,
+        "abs_p01": p01,
+        "abs_p99": p99,
+        "abs_median": reference,
+        "max_allowed_robust_dynamic_ratio": 50.0,
+    }
+
+
 def _gonzalez_pca_features(normalized_magnitude: np.ndarray) -> Tuple[np.ndarray, np.ndarray, int]:
     # Paper-specified dimensionality reduction: each frequency band is one
     # sample, and its temporal coefficient pattern is the feature vector.
@@ -213,6 +340,8 @@ def _gonzalez_ward_clusters(
     features: np.ndarray,
     selected_pc_count: int,
     max_clusters: int,
+    selection_strategy: str = "max_silhouette",
+    relative_score: float = 1.0,
 ) -> Tuple[np.ndarray, int, Dict[int, float]]:
     # Paper-specified clustering: Ward hierarchical clustering in PCA space.
     x = np.asarray(features[:, : max(1, int(selected_pc_count))], dtype=float)
@@ -233,7 +362,15 @@ def _gonzalez_ward_clusters(
     finite_scores = {k: v for k, v in scores.items() if np.isfinite(v)}
     if not finite_scores:
         return np.zeros(n_freqs, dtype=int), 1, scores
-    chosen = max(finite_scores, key=finite_scores.get)
+    strategy = str(selection_strategy).strip().lower()
+    if strategy in {"parsimonious", "parsimonious_silhouette", "broad_silhouette"}:
+        best_score = max(finite_scores.values())
+        rel = float(np.clip(relative_score, 0.0, 1.0))
+        cutoff = best_score * rel if best_score >= 0.0 else best_score / max(rel, 1e-12)
+        candidates = [k for k, score in finite_scores.items() if score >= cutoff]
+        chosen = min(candidates) if candidates else max(finite_scores, key=finite_scores.get)
+    else:
+        chosen = max(finite_scores, key=finite_scores.get)
     return labels_by_k[chosen], int(chosen), scores
 
 
@@ -253,20 +390,130 @@ def _gonzalez_inverse_cwt(
     coeffs: np.ndarray,
     scales: np.ndarray,
     wavelet: str,
+    *,
+    filter_fft: np.ndarray | None = None,
+    denominator_filter_fft: np.ndarray | None = None,
+    precision: int = _GONZALEZ_CWT_PRECISION,
+    regularization: float = _GONZALEZ_INVERSE_CWT_REGULARIZATION,
+    method: str = "regularized_dual_frame",
 ) -> np.ndarray:
-    # Under-specified implementation detail: PyWavelets has CWT but no fully
-    # standard inverse CWT. This approximate synthesis follows the common
-    # scale-normalized coefficient summation strategy and is calibrated later
-    # against the original dF/F trace for amplitude diagnostics.
     if coeffs.size == 0:
         return np.asarray([], dtype=float)
-    selected = np.asarray(coeffs)
+    selected = np.asarray(coeffs, dtype=np.complex128)
+    if selected.ndim == 1:
+        selected = selected[None, :]
+    if selected.ndim != 2:
+        raise ValueError("coeffs must be a 2D array of CWT coefficients")
+    if selected.shape[1] == 0:
+        return np.asarray([], dtype=float)
     scale_values = np.maximum(np.asarray(scales, dtype=float), 1e-12)
-    weighted = np.real(selected) / np.sqrt(scale_values)[:, None]
-    weight_sum = float(np.sum(1.0 / np.sqrt(scale_values)))
-    if weight_sum <= 1e-12:
+    if selected.shape[0] != scale_values.size:
+        raise ValueError("number of coefficient rows must match number of scales")
+    if str(method).strip().lower() in {"weighted_sum", "legacy", "scale_weighted_sum"}:
+        weighted = np.real(selected) / np.sqrt(scale_values)[:, None]
+        weight_sum = float(np.sum(1.0 / np.sqrt(scale_values)))
+        if weight_sum <= 1e-12:
+            return np.zeros(selected.shape[1], dtype=float)
+        return np.sum(weighted, axis=0) / weight_sum
+
+    # PyWavelets exposes CWT but not an inverse CWT for this transform. The
+    # reconstruction below inverts the same sampled analysis filters used by
+    # pywt.cwt in a regularized least-squares sense. This is a numerical inverse
+    # of the CWT operator, not an extra denoising rule.
+    if filter_fft is None:
+        filter_fft = _gonzalez_cwt_analysis_filter_fft(
+            selected.shape[1],
+            scale_values,
+            wavelet,
+            precision=precision,
+        )
+    analysis_fft = np.asarray(filter_fft, dtype=np.complex128)
+    if analysis_fft.shape != selected.shape:
+        raise ValueError("filter_fft shape must match coeffs shape")
+    denominator_fft = analysis_fft if denominator_filter_fft is None else np.asarray(denominator_filter_fft, dtype=np.complex128)
+    if denominator_fft.ndim != 2 or denominator_fft.shape[1] != selected.shape[1]:
+        raise ValueError("denominator_filter_fft must be a 2D array with the same sample length as coeffs")
+
+    coeff_fft = np.fft.fft(selected, axis=-1)
+    denominator = np.sum(np.abs(denominator_fft) ** 2, axis=0)
+    numerator = np.sum(np.conj(analysis_fft) * coeff_fft, axis=0)
+    max_denominator = float(np.max(denominator)) if denominator.size else 0.0
+    if max_denominator <= 1e-18:
         return np.zeros(selected.shape[1], dtype=float)
-    return np.sum(weighted, axis=0) / weight_sum
+    lambda_value = max(0.0, float(regularization)) * max_denominator
+    if lambda_value > 0.0:
+        spectrum = numerator / (denominator + lambda_value)
+    else:
+        floor = max(1e-18, np.finfo(float).eps * max_denominator)
+        spectrum = numerator / np.where(denominator > floor, denominator, np.inf)
+    return np.real(np.fft.ifft(spectrum))
+
+
+def _gonzalez_cwt_analysis_filter_fft(
+    n_samples: int,
+    scales: np.ndarray,
+    wavelet: str,
+    *,
+    precision: int = _GONZALEZ_CWT_PRECISION,
+) -> np.ndarray:
+    n = int(n_samples)
+    if n <= 0:
+        return np.empty((0, 0), dtype=np.complex128)
+    scale_values = np.maximum(np.asarray(scales, dtype=float), 1e-12)
+    if scale_values.size == 0:
+        return np.empty((0, n), dtype=np.complex128)
+
+    if isinstance(wavelet, (pywt.ContinuousWavelet, pywt.Wavelet)):
+        wavelet_obj = wavelet
+    else:
+        wavelet_obj = pywt.ContinuousWavelet(str(wavelet))
+    int_psi, x = pywt.integrate_wavelet(wavelet_obj, precision=int(precision))
+    if getattr(wavelet_obj, "complex_cwt", False):
+        int_psi = np.conj(int_psi)
+    int_psi = np.asarray(int_psi, dtype=np.complex128)
+    x = np.asarray(x, dtype=float)
+    if int_psi.size < 2 or x.size < 2:
+        return np.zeros((scale_values.size, n), dtype=np.complex128)
+    step = float(x[1] - x[0])
+    if not np.isfinite(step) or abs(step) <= 1e-18:
+        return np.zeros((scale_values.size, n), dtype=np.complex128)
+
+    filters = np.zeros((scale_values.size, n), dtype=np.complex128)
+    span = float(x[-1] - x[0])
+    for row, scale in enumerate(scale_values):
+        j = np.arange((float(scale) * span) + 1.0) / (float(scale) * step)
+        j = j.astype(int)
+        if j.size == 0:
+            continue
+        if j[-1] >= int_psi.size:
+            j = np.extract(j < int_psi.size, j)
+        if j.size < 2:
+            continue
+        int_psi_scale = int_psi[j][::-1]
+        impulse_response = -np.sqrt(float(scale)) * np.diff(int_psi_scale)
+        if impulse_response.size == 0:
+            continue
+        crop_start = int(np.floor((impulse_response.size - 1) / 2.0))
+        circular_filter = np.zeros(n, dtype=np.complex128)
+        positions = (np.arange(impulse_response.size, dtype=int) - crop_start) % n
+        np.add.at(circular_filter, positions, impulse_response)
+        filters[row] = np.fft.fft(circular_filter)
+    return filters
+
+
+def _gonzalez_inverse_cwt_info(
+    regularization: float,
+    precision: int,
+) -> dict:
+    return {
+        "method": "regularized_dual_frame",
+        "regularization": float(regularization),
+        "wavelet_precision": int(precision),
+        "note": (
+            "Regularized least-squares inverse of the same sampled Morlet CWT "
+            "analysis filters used by pywt.cwt."
+        ),
+    }
 
 
 def _gonzalez_reconstruction_calibration(
@@ -286,7 +533,7 @@ def _gonzalez_reconstruction_calibration(
     residual = calibrated - target
     corr = float(np.corrcoef(calibrated, target)[0, 1]) if raw.size > 1 and np.std(calibrated) > 1e-12 else float("nan")
     return gain, offset, {
-        "inverse_cwt_note": "Approximate PyWavelets inverse CWT calibrated by least-squares gain/offset.",
+        "inverse_cwt_note": "Regularized dual-frame inverse CWT calibrated by least-squares gain/offset.",
         "gain": gain,
         "offset": offset,
         "raw_reconstruction_std": float(np.std(raw)),
@@ -306,12 +553,22 @@ def _gonzalez_event_template_rejection(
     attenuation_max: float,
     enabled: bool,
     mode: str = "correlation",
+    event_z_threshold: float = 3.0,
+    event_prominence_z: float = 1.0,
+    event_min_distance_ms: float = 3.0,
+    event_detection_polarity: str = "both",
+    event_candidate_mask: np.ndarray | None = None,
 ) -> Tuple[np.ndarray, dict]:
     # Under-specified in Gonzalez et al.: candidate event detection and the PC
     # cutoff are not given. This implementation detects both polarities from a
     # robust z-score, aligns event windows by polarity, uses PC1 as the event
     # template, and rejects low-template-correlation windows.
     trace = np.asarray(cluster_trace, dtype=float)
+    candidate_mask = np.ones(trace.shape, dtype=bool)
+    if event_candidate_mask is not None:
+        candidate_mask = np.asarray(event_candidate_mask, dtype=bool)
+        if candidate_mask.shape != trace.shape:
+            candidate_mask = np.ones(trace.shape, dtype=bool)
     debug: dict[str, Any] = {
         "cluster_id": int(cluster_id),
         "enabled": bool(enabled),
@@ -325,6 +582,13 @@ def _gonzalez_event_template_rejection(
         "cutoff": None,
         "polarity": "both",
         "mode": str(mode),
+        "event_detection": {
+            "z_threshold": float(event_z_threshold),
+            "prominence_z": float(event_prominence_z),
+            "min_distance_ms": float(event_min_distance_ms),
+            "polarity": str(event_detection_polarity),
+            "candidate_fraction": float(np.mean(candidate_mask)) if candidate_mask.size else 0.0,
+        },
         "note": "Event detection and PC cutoff are under-specified by the paper.",
     }
     if not enabled or trace.size < 5:
@@ -334,29 +598,68 @@ def _gonzalez_event_template_rejection(
     if sigma <= 1e-12:
         return trace.copy(), debug
     z = (trace - center) / sigma
-    distance = max(1, int(round(0.003 * float(fs))))
-    peaks, _props = find_peaks(np.abs(z), height=3.0, distance=distance, prominence=1.0)
-    if peaks.size < 3:
-        debug["event_indices"] = np.asarray(peaks, dtype=int)
-        return trace.copy(), debug
+    polarity_mode = str(event_detection_polarity).strip().lower()
+    if polarity_mode not in {"positive", "negative", "both"}:
+        polarity_mode = "both"
+    if polarity_mode == "positive":
+        event_scores = z
+    elif polarity_mode == "negative":
+        event_scores = -z
+    else:
+        event_scores = np.abs(z)
+    distance = max(1, int(round(float(event_min_distance_ms) * float(fs) / 1000.0)))
     half_width = int(round(float(fs) / max(float(max_frequency), 1e-9)))
     half_width = int(np.clip(half_width, 2, max(2, int(round(0.05 * float(fs))))))
+    eligible = np.asarray(candidate_mask, dtype=bool)
+    if event_candidate_mask is not None:
+        peaks = _peaks_from_threshold_regions(
+            event_scores,
+            eligible,
+            min_height=max(float(event_z_threshold), 0.0),
+            min_prominence=max(float(event_prominence_z), 0.0),
+            distance=distance,
+            merge_gap=max(distance, half_width),
+        )
+        detection_source = "adaptive_threshold_regions"
+    else:
+        peaks, _props = find_peaks(
+            np.where(eligible, event_scores, 0.0),
+            height=max(float(event_z_threshold), 0.0),
+            distance=distance,
+            prominence=max(float(event_prominence_z), 0.0),
+        )
+        peaks = np.asarray([int(peak) for peak in peaks if eligible[int(peak)]], dtype=int)
+        detection_source = "robust_zscore_peaks"
+    if peaks.size < 3:
+        debug["event_indices"] = np.asarray(peaks, dtype=int)
+        debug["event_detection"]["distance_samples"] = int(distance)
+        debug["event_detection"]["half_width_samples"] = int(half_width)
+        debug["event_detection"]["source"] = detection_source
+        debug["event_detection"]["polarity"] = polarity_mode
+        return trace.copy(), debug
     windows = _event_windows(trace - center, np.asarray(peaks, dtype=int), half_width)
-    polarities = np.where(z[peaks] < 0.0, -1.0, 1.0)
+    if polarity_mode == "positive":
+        polarities = np.ones(peaks.shape, dtype=float)
+    elif polarity_mode == "negative":
+        polarities = -np.ones(peaks.shape, dtype=float)
+    else:
+        polarities = np.where(z[peaks] < 0.0, -1.0, 1.0)
     aligned = windows * polarities[:, None]
-    scale = np.maximum(aligned.std(axis=1, keepdims=True), 1e-12)
-    normalized = (aligned - aligned.mean(axis=1, keepdims=True)) / scale
+    # Preserve event amplitude in PC1 scores. Per-event variance normalization
+    # makes weak noise wiggles look as important as real events, which defeats
+    # the paper's PC1-coefficient cleanup of small/noisy events.
+    normalized = aligned - aligned.mean(axis=1, keepdims=True)
     if normalized.shape[0] < 3 or normalized.shape[1] < 2:
         debug["event_indices"] = np.asarray(peaks, dtype=int)
         debug["event_windows"] = windows
         return trace.copy(), debug
     pca = PCA(n_components=1, svd_solver="full")
-    coefficients = pca.fit_transform(normalized).reshape(-1)
+    pca.fit(normalized)
     template = np.asarray(pca.components_[0], dtype=float)
     if np.dot(template, normalized.mean(axis=0)) < 0.0:
         template = -template
-        coefficients = -coefficients
     template /= np.linalg.norm(template) + 1e-12
+    coefficients = normalized @ template
     correlations = (normalized @ template) / (np.linalg.norm(normalized, axis=1) + 1e-12)
     event_mode = str(mode).strip().lower()
     corr_cutoff = 0.25
@@ -397,6 +700,18 @@ def _gonzalez_event_template_rejection(
             "cutoff": cutoff,
             "half_width_samples": int(half_width),
             "event_polarities": polarities,
+            "pc1_input_normalization": "per_event_demean_preserve_amplitude",
+            "pc1_coefficient_method": "uncentered_projection_onto_oriented_pc1_template",
+            "event_detection": {
+                "z_threshold": float(event_z_threshold),
+                "prominence_z": float(event_prominence_z),
+                "min_distance_ms": float(event_min_distance_ms),
+                "polarity": polarity_mode,
+                "distance_samples": int(distance),
+                "half_width_samples": int(half_width),
+                "candidate_fraction": float(np.mean(candidate_mask)) if candidate_mask.size else 0.0,
+                "source": detection_source,
+            },
         }
     )
     return trace * gain, debug
@@ -480,24 +795,125 @@ def _gonzalez_rejected_frequency_clusters(
     return rejected, decisions
 
 
+def _gonzalez_event_protection_weights(
+    trace: np.ndarray,
+    fs: float,
+    *,
+    enabled: bool,
+    window_ms: float = _GONZALEZ_S7_COEFFICIENT_EVENT_PROTECTION_WINDOW_MS,
+    baseline_window_ms: float = 50.0,
+    min_peak_distance_ms: float = 2.0,
+) -> Tuple[np.ndarray, dict]:
+    values = np.asarray(trace, dtype=float)
+    weights = np.zeros(values.shape, dtype=float)
+    debug: dict[str, Any] = {
+        "enabled": bool(enabled),
+        "status": "disabled" if not enabled else "not_evaluated",
+        "window_ms": float(window_ms),
+        "baseline_window_ms": float(baseline_window_ms),
+        "protected_peak_count": 0,
+        "protected_fraction": 0.0,
+        "peak_indices": np.asarray([], dtype=int),
+    }
+    if not enabled:
+        return weights, debug
+    if values.size < 3:
+        debug["status"] = "empty_or_too_short"
+        return weights, debug
+    finite = np.isfinite(values)
+    if np.count_nonzero(finite) < 3:
+        debug["status"] = "insufficient_finite_samples"
+        return weights, debug
+
+    hp_window = _odd_window_ms(baseline_window_ms, fs)
+    hp_window = min(hp_window, values.size if values.size % 2 == 1 else max(1, values.size - 1))
+    if hp_window < 3:
+        high = values - float(np.nanmedian(values[finite]))
+    else:
+        high = values - median_filter(values, size=hp_window, mode="nearest")
+    selected = high[finite]
+    noise = max(_robust_sigma(selected), 1e-12)
+    max_abs = float(np.max(np.abs(selected))) if selected.size else 0.0
+    threshold = max(4.0 * noise, 0.20 * max_abs, 1e-12)
+    distance = max(1, int(round(float(min_peak_distance_ms) * float(fs) / 1000.0)))
+    masked_abs = np.where(finite, np.abs(high), 0.0)
+    peaks, _props = find_peaks(masked_abs, height=threshold, distance=distance)
+    peaks = np.asarray([int(peak) for peak in peaks if finite[int(peak)]], dtype=int)
+    if peaks.size == 0:
+        debug.update(
+            {
+                "status": "no_events_detected",
+                "noise_sigma": float(noise),
+                "peak_threshold": float(threshold),
+                "baseline_window_samples": int(hp_window),
+            }
+        )
+        return weights, debug
+
+    half_window = max(1, int(round(float(window_ms) * float(fs) / 1000.0)))
+    for peak in peaks:
+        start = max(0, int(peak) - half_window)
+        stop = min(values.size, int(peak) + half_window + 1)
+        width = stop - start
+        if width <= 1:
+            weights[start:stop] = 1.0
+            continue
+        x = np.linspace(-1.0, 1.0, width)
+        local_weights = 0.5 * (1.0 + np.cos(np.pi * np.clip(x, -1.0, 1.0)))
+        weights[start:stop] = np.maximum(weights[start:stop], local_weights)
+
+    debug.update(
+        {
+            "status": "evaluated",
+            "protected_peak_count": int(peaks.size),
+            "protected_fraction": float(np.mean(weights > 1e-6)),
+            "peak_indices": peaks,
+            "noise_sigma": float(noise),
+            "peak_threshold": float(threshold),
+            "baseline_window_samples": int(hp_window),
+            "half_window_samples": int(half_window),
+        }
+    )
+    return weights, debug
+
+
 def denoise_gonzalez_adaptive_wavelet(
     trace,
     fs,
     input_mode="fluorescence",
     rolling_baseline_seconds=4.0,
     wavelet="cmor1.5-1.0",
+    wavelet_precision=_GONZALEZ_CWT_PRECISION,
     min_freq=1.0,
     max_freq=None,
     n_freqs=100,
     max_clusters=20,
+    cluster_selection_strategy="max_silhouette",
+    cluster_selection_relative_score=1.0,
     threshold_sd=2.0,
     attenuation_min=0.5,
     attenuation_max=1.0,
+    coefficient_threshold_domain="raw_magnitude",
+    threshold_mask_padding_periods=0.0,
     enable_noise_cluster_rejection=False,
     enable_event_template_rejection=False,
     event_template_rejection_mode="correlation",
+    event_attenuation_min=None,
+    event_attenuation_max=None,
+    event_rejection_application="coefficient",
+    event_detection_z_threshold=3.0,
+    event_detection_prominence_z=1.0,
+    event_detection_min_distance_ms=3.0,
+    event_detection_polarity="both",
+    event_detection_use_threshold_crossings=False,
+    enable_coefficient_event_protection=False,
+    coefficient_event_protection_window_ms=_GONZALEZ_S7_COEFFICIENT_EVENT_PROTECTION_WINDOW_MS,
     enable_low_frequency_gaussian_branch=False,
     low_frequency_cutoff_hz=1.0,
+    inverse_cwt_regularization=_GONZALEZ_INVERSE_CWT_REGULARIZATION,
+    reconstruction_mode="residual_subtractive",
+    removed_reconstruction_gain_mode="calibrated",
+    removed_reconstruction_gain_scale=1.0,
     enable_denoise_safety_gate=False,
     min_event_peak_preservation=0.95,
     min_local_max_ratio=0.95,
@@ -510,8 +926,8 @@ def denoise_gonzalez_adaptive_wavelet(
     ``input_mode="corrected"`` uses the provided baseline-corrected trace
     directly and returns corrected-trace units. The older ``"dff"`` spelling is
     accepted only as a compatibility alias for ``"corrected"``.
-    PyWavelets does not provide a standard inverse CWT here, so reconstruction
-    is approximate plus calibration rather than mathematically exact.
+    PyWavelets does not provide a public inverse CWT here, so reconstruction
+    uses a regularized dual-frame inverse of the same sampled CWT filters.
     Morphology safety gates should pass before denoised output is used as a
     detection aid.
     """
@@ -555,6 +971,9 @@ def denoise_gonzalez_adaptive_wavelet(
             "selected_pc_count": 0,
             "ward_cluster_labels": np.asarray([], dtype=int),
             "chosen_cluster_count": 0,
+            "cluster_selection_strategy": str(cluster_selection_strategy),
+            "cluster_selection_relative_score": float(cluster_selection_relative_score),
+            "threshold_mask_padding_periods": float(threshold_mask_padding_periods),
             "silhouette_scores": {},
             "rejected_frequency_clusters": [],
             "threshold_per_cluster": {},
@@ -564,7 +983,27 @@ def denoise_gonzalez_adaptive_wavelet(
             "enable_noise_cluster_rejection": bool(enable_noise_cluster_rejection),
             "enable_event_template_rejection": bool(enable_event_template_rejection),
             "event_template_rejection_mode": str(event_template_rejection_mode),
+            "event_attenuation_min": None if event_attenuation_min is None else float(event_attenuation_min),
+            "event_attenuation_max": None if event_attenuation_max is None else float(event_attenuation_max),
+            "event_rejection_application": str(event_rejection_application),
+            "event_detection": {
+                "z_threshold": float(event_detection_z_threshold),
+                "prominence_z": float(event_detection_prominence_z),
+                "min_distance_ms": float(event_detection_min_distance_ms),
+                "polarity": str(event_detection_polarity),
+                "use_threshold_crossings": bool(event_detection_use_threshold_crossings),
+            },
+            "coefficient_event_protection": {
+                "enabled": bool(enable_coefficient_event_protection),
+                "status": "empty_trace",
+                "window_ms": float(coefficient_event_protection_window_ms),
+            },
             "low_frequency_gaussian_branch": {"enabled": False, "status": "empty_trace"},
+            "reconstruction_mode": str(reconstruction_mode),
+            "inverse_cwt": _gonzalez_inverse_cwt_info(
+                regularization=float(inverse_cwt_regularization),
+                precision=int(wavelet_precision),
+            ),
             "cwt_working_trace": values.copy(),
             "final_denoised_working_trace": values.copy(),
             "final_denoised_dff": None if mode == "corrected" else values.copy(),
@@ -607,9 +1046,16 @@ def denoise_gonzalez_adaptive_wavelet(
         wavelet=wavelet,
         sampling_period=1.0 / float(fs),
         method="fft",
+        precision=int(wavelet_precision),
     )
     coeffs = np.asarray(coeffs)
     magnitudes = np.abs(coeffs)
+    analysis_filter_fft = _gonzalez_cwt_analysis_filter_fft(
+        coeffs.shape[1],
+        scales,
+        wavelet,
+        precision=int(wavelet_precision),
+    )
 
     # Paper-specified normalization: each frequency row is centered and scaled
     # by its own temporal coefficient-magnitude statistics.
@@ -622,8 +1068,17 @@ def denoise_gonzalez_adaptive_wavelet(
         pca_features,
         selected_pc_count=selected_pc_count,
         max_clusters=max_clusters,
+        selection_strategy=str(cluster_selection_strategy),
+        relative_score=float(cluster_selection_relative_score),
     )
-    cluster_info = _gonzalez_cluster_thresholds(magnitudes, frequencies, labels, fs, threshold_sd)
+    threshold_domain = str(coefficient_threshold_domain).strip().lower()
+    if threshold_domain in {"normalized", "normalized_magnitude", "zscore", "z_score"}:
+        threshold_magnitudes = normalized
+        threshold_domain = "normalized_magnitude"
+    else:
+        threshold_magnitudes = magnitudes
+        threshold_domain = "raw_magnitude"
+    cluster_info = _gonzalez_cluster_thresholds(threshold_magnitudes, frequencies, labels, fs, threshold_sd)
     rejected_clusters, rejection_decisions = _gonzalez_rejected_frequency_clusters(
         cluster_info,
         max_frequency=float(np.max(frequencies)),
@@ -631,7 +1086,14 @@ def denoise_gonzalez_adaptive_wavelet(
         enabled=bool(enable_noise_cluster_rejection),
     )
 
-    raw_reconstruction = _gonzalez_inverse_cwt(coeffs, scales, wavelet)
+    raw_reconstruction = _gonzalez_inverse_cwt(
+        coeffs,
+        scales,
+        wavelet,
+        filter_fft=analysis_filter_fft,
+        precision=int(wavelet_precision),
+        regularization=float(inverse_cwt_regularization),
+    )
     raw_gain, raw_offset, amplitude_diagnostics = _gonzalez_reconstruction_calibration(
         raw_reconstruction,
         cwt_working_trace,
@@ -644,14 +1106,44 @@ def denoise_gonzalez_adaptive_wavelet(
     retained_cluster_ids: List[int] = []
     cleaned_coeffs_full = np.zeros_like(coeffs)
     identity_coeffs_full = np.zeros_like(coeffs)
+    trace_domain_event_removal = np.zeros(values.shape, dtype=float)
 
     attenuation_min = float(np.clip(attenuation_min, 0.0, 1.0))
     attenuation_max = float(np.clip(attenuation_max, attenuation_min, 1.0))
+    if event_attenuation_min is None:
+        event_attenuation_min = attenuation_min
+    if event_attenuation_max is None:
+        event_attenuation_max = event_attenuation_min
+    event_attenuation_min = float(np.clip(event_attenuation_min, 0.0, 1.0))
+    event_attenuation_max = float(np.clip(event_attenuation_max, event_attenuation_min, 1.0))
+    coefficient_event_weights, coefficient_event_debug = _gonzalez_event_protection_weights(
+        working_trace,
+        fs=fs,
+        enabled=bool(enable_coefficient_event_protection),
+        window_ms=float(coefficient_event_protection_window_ms),
+    )
+    event_rejection_application_normalized = str(event_rejection_application).strip().lower()
+    use_trace_domain_event_rejection = event_rejection_application_normalized in {
+        "trace",
+        "trace_domain",
+        "reconstructed_trace",
+        "paper_trace",
+    }
     for cluster_id, info in cluster_info.items():
         indices = np.asarray(info["indices"], dtype=int)
         identity_coeffs_full[indices] = coeffs[indices]
         threshold = np.asarray(info["threshold"], dtype=float)
         activity = np.asarray(info["activity"], dtype=float)
+        padding_samples = max(
+            0,
+            int(
+                round(
+                    float(threshold_mask_padding_periods)
+                    * float(fs)
+                    / max(float(info["max_frequency"]), 1e-9)
+                )
+            ),
+        )
         threshold_debug[int(cluster_id)] = {
             "activity": activity.copy(),
             "threshold": threshold,
@@ -660,53 +1152,146 @@ def denoise_gonzalez_adaptive_wavelet(
             "moving_average_window_samples": int(info["moving_average_window_samples"]),
             "max_frequency": float(info["max_frequency"]),
             "frequency_indices": indices.copy(),
+            "threshold_mask_padding_periods": float(threshold_mask_padding_periods),
+            "threshold_mask_padding_samples": int(padding_samples),
         }
         if int(cluster_id) in rejected_clusters:
-            attenuation_debug[int(cluster_id)] = np.zeros(values.shape, dtype=float)
-            cleaned_cluster_traces[int(cluster_id)] = np.zeros(values.shape, dtype=float)
-            event_debug[int(cluster_id)] = {"enabled": False, "reason": "frequency_cluster_rejected_as_noise"}
+            gain_mask = coefficient_event_weights.copy() if bool(enable_coefficient_event_protection) else np.zeros(values.shape, dtype=float)
+            attenuation_debug[int(cluster_id)] = gain_mask.copy()
+            cleaned_cluster_coeffs = coeffs[indices] * gain_mask[None, :]
+            if np.any(gain_mask > 1e-12):
+                cleaned_coeffs_full[indices] = cleaned_cluster_coeffs
+                cleaned_cluster_traces[int(cluster_id)] = _gonzalez_inverse_cwt(
+                    cleaned_cluster_coeffs,
+                    scales[indices],
+                    wavelet,
+                    filter_fft=analysis_filter_fft[indices],
+                    precision=int(wavelet_precision),
+                    regularization=float(inverse_cwt_regularization),
+                )
+            else:
+                cleaned_cluster_traces[int(cluster_id)] = np.zeros(values.shape, dtype=float)
+            event_debug[int(cluster_id)] = {
+                "enabled": False,
+                "reason": "frequency_cluster_rejected_as_noise",
+                "event_coefficients_preserved": bool(np.any(gain_mask > 1e-12)),
+            }
             continue
 
         retained_cluster_ids.append(int(cluster_id))
-        below = activity <= threshold
+        above = activity > threshold
+        if padding_samples > 0:
+            above = _dilate_boolean_mask(above, radius=padding_samples)
+        below = ~above
         gap = np.maximum(threshold - activity, 0.0)
         denom = max(float(np.max(gap[below])) if np.any(below) else 0.0, 1e-12)
         severity = np.clip(gap / denom, 0.0, 1.0)
         attenuation_fraction = attenuation_min + severity * (attenuation_max - attenuation_min)
         gain_mask = np.where(below, 1.0 - attenuation_fraction, 1.0)
+        if bool(enable_coefficient_event_protection):
+            gain_mask = gain_mask + ((1.0 - gain_mask) * coefficient_event_weights)
         attenuation_debug[int(cluster_id)] = gain_mask.copy()
 
         # Paper-specified masking: attenuate the original complex coefficients
         # for the cluster, not the magnitude-only representation.
         cleaned_cluster_coeffs = coeffs[indices] * gain_mask[None, :]
-        reconstructed = _gonzalez_inverse_cwt(cleaned_cluster_coeffs, scales[indices], wavelet)
+        reconstructed = _gonzalez_inverse_cwt(
+            cleaned_cluster_coeffs,
+            scales[indices],
+            wavelet,
+            filter_fft=analysis_filter_fft[indices],
+            denominator_filter_fft=analysis_filter_fft if use_trace_domain_event_rejection else None,
+            precision=int(wavelet_precision),
+            regularization=float(inverse_cwt_regularization),
+        )
         event_processed, event_info = _gonzalez_event_template_rejection(
             reconstructed,
             fs=fs,
             cluster_id=int(cluster_id),
             max_frequency=float(info["max_frequency"]),
-            attenuation_min=attenuation_min,
-            attenuation_max=attenuation_max,
+            attenuation_min=event_attenuation_min,
+            attenuation_max=event_attenuation_max,
             enabled=bool(enable_event_template_rejection),
             mode=str(event_template_rejection_mode),
+            event_z_threshold=float(event_detection_z_threshold),
+            event_prominence_z=float(event_detection_prominence_z),
+            event_min_distance_ms=float(event_detection_min_distance_ms),
+            event_detection_polarity=str(event_detection_polarity),
+            event_candidate_mask=(activity > threshold) if bool(event_detection_use_threshold_crossings) else None,
         )
         event_gain = np.asarray(event_info.get("event_gain", np.ones(values.shape, dtype=float)), dtype=float)
         if event_gain.shape != values.shape:
             event_gain = np.ones(values.shape, dtype=float)
             event_info["event_gain"] = event_gain
             event_info["event_gain_shape_warning"] = "event_gain shape mismatch; coefficient event attenuation skipped"
-        cleaned_cluster_coeffs = cleaned_cluster_coeffs * event_gain[None, :]
+        if use_trace_domain_event_rejection:
+            trace_domain_event_removal = trace_domain_event_removal + (reconstructed - event_processed)
+            event_info["application"] = "trace_domain_after_cluster_iwt"
+        else:
+            cleaned_cluster_coeffs = cleaned_cluster_coeffs * event_gain[None, :]
+            event_info["application"] = "coefficient_time_mask"
         cleaned_coeffs_full[indices] = cleaned_cluster_coeffs
         cleaned_cluster_traces[int(cluster_id)] = event_processed
         event_debug[int(cluster_id)] = event_info
 
-    raw_full = _gonzalez_inverse_cwt(coeffs, scales, wavelet)
-    identity_full = _gonzalez_inverse_cwt(identity_coeffs_full, scales, wavelet)
+    raw_full = _gonzalez_inverse_cwt(
+        coeffs,
+        scales,
+        wavelet,
+        filter_fft=analysis_filter_fft,
+        precision=int(wavelet_precision),
+        regularization=float(inverse_cwt_regularization),
+    )
+    identity_full = _gonzalez_inverse_cwt(
+        identity_coeffs_full,
+        scales,
+        wavelet,
+        filter_fft=analysis_filter_fft,
+        precision=int(wavelet_precision),
+        regularization=float(inverse_cwt_regularization),
+    )
     consistency_error = (
         float(np.max(np.abs(raw_full - identity_full))) if raw_full.shape == identity_full.shape and raw_full.size else 0.0
     )
-    denoised_raw = _gonzalez_inverse_cwt(cleaned_coeffs_full, scales, wavelet)
-    denoised_working_trace = raw_offset + (raw_gain * denoised_raw)
+    denoised_raw = _gonzalez_inverse_cwt(
+        cleaned_coeffs_full,
+        scales,
+        wavelet,
+        filter_fft=analysis_filter_fft,
+        precision=int(wavelet_precision),
+        regularization=float(inverse_cwt_regularization),
+    )
+    removed_raw = _gonzalez_inverse_cwt(
+        coeffs - cleaned_coeffs_full,
+        scales,
+        wavelet,
+        filter_fft=analysis_filter_fft,
+        precision=int(wavelet_precision),
+        regularization=float(inverse_cwt_regularization),
+    )
+    reconstruction_mode_normalized = str(reconstruction_mode).strip().lower()
+    if reconstruction_mode_normalized in {"residual_subtractive", "subtract_removed", "paper_safe"}:
+        removed_gain_mode = str(removed_reconstruction_gain_mode).strip().lower()
+        removed_gain_scale = float(removed_reconstruction_gain_scale)
+        if removed_gain_mode in {"unit", "uncalibrated", "none", "raw_inverse"}:
+            removed_gain = removed_gain_scale
+            removed_gain_mode = "unit"
+        else:
+            removed_gain = raw_gain * removed_gain_scale
+            removed_gain_mode = "calibrated"
+        denoised_working_trace = cwt_working_trace - (removed_gain * removed_raw)
+        reconstruction_note = (
+            "Residual-subtractive reconstruction: regularized inverse CWT is applied to removed coefficients only, "
+            "then subtracted from the original CWT input."
+        )
+    else:
+        removed_gain_mode = "not_applicable"
+        removed_gain = raw_gain
+        removed_gain_scale = 1.0
+        denoised_working_trace = raw_offset + (raw_gain * denoised_raw)
+        reconstruction_note = "Direct regularized inverse CWT of cleaned coefficients."
+    if use_trace_domain_event_rejection:
+        denoised_working_trace = denoised_working_trace - (raw_gain * trace_domain_event_removal)
     if bool(enable_low_frequency_gaussian_branch):
         denoised_working_trace = denoised_working_trace + low_frequency_branch
     full_matrix_residual = denoised_working_trace - working_trace
@@ -716,6 +1301,11 @@ def denoise_gonzalez_adaptive_wavelet(
         "gain": raw_gain,
         "offset": raw_offset,
         "raw_reconstruction_std": float(np.std(denoised_raw)),
+        "removed_reconstruction_std": float(np.std(removed_raw)),
+        "trace_domain_event_removal_std": float(np.std(trace_domain_event_removal)),
+        "removed_reconstruction_gain_mode": removed_gain_mode,
+        "removed_reconstruction_gain": float(removed_gain),
+        "removed_reconstruction_gain_scale": float(removed_gain_scale),
         "target_working_trace_std": float(np.std(working_trace)),
         "calibrated_reconstruction_std": float(np.std(denoised_working_trace)),
         "calibrated_rms_error": (
@@ -728,6 +1318,12 @@ def denoise_gonzalez_adaptive_wavelet(
         ),
         "retained_cluster_count": int(len(retained_cluster_ids)),
         "rejected_cluster_count": int(len(rejected_clusters)),
+        "reconstruction_mode": reconstruction_mode_normalized,
+        "reconstruction_note": reconstruction_note,
+        "inverse_cwt": _gonzalez_inverse_cwt_info(
+            regularization=float(inverse_cwt_regularization),
+            precision=int(wavelet_precision),
+        ),
     }
     denoised_working_trace = np.asarray(denoised_working_trace, dtype=float)
     candidate_output = (
@@ -793,9 +1389,27 @@ def denoise_gonzalez_adaptive_wavelet(
         "input_mode": mode,
         "input_mode_alias": mode_alias,
         "wavelet": str(wavelet),
+        "wavelet_precision": int(wavelet_precision),
         "threshold_sd": float(threshold_sd),
+        "threshold_mask_padding_periods": float(threshold_mask_padding_periods),
+        "coefficient_threshold_domain": threshold_domain,
         "attenuation_min": float(attenuation_min),
         "attenuation_max": float(attenuation_max),
+        "event_attenuation_min": float(event_attenuation_min),
+        "event_attenuation_max": float(event_attenuation_max),
+        "event_rejection_application": (
+            "trace_domain_after_cluster_iwt" if use_trace_domain_event_rejection else "coefficient_time_mask"
+        ),
+        "event_detection": {
+            "z_threshold": float(event_detection_z_threshold),
+            "prominence_z": float(event_detection_prominence_z),
+            "min_distance_ms": float(event_detection_min_distance_ms),
+            "polarity": str(event_detection_polarity),
+            "use_threshold_crossings": bool(event_detection_use_threshold_crossings),
+        },
+        "max_clusters": int(max_clusters),
+        "cluster_selection_strategy": str(cluster_selection_strategy),
+        "cluster_selection_relative_score": float(cluster_selection_relative_score),
         "working_trace_label": working_label,
         "F0": None if f0 is None else f0.copy(),
         "working_trace": working_trace.copy(),
@@ -823,7 +1437,15 @@ def denoise_gonzalez_adaptive_wavelet(
         "enable_noise_cluster_rejection": bool(enable_noise_cluster_rejection),
         "enable_event_template_rejection": bool(enable_event_template_rejection),
         "event_template_rejection_mode": str(event_template_rejection_mode),
+        "coefficient_event_protection": coefficient_event_debug,
         "low_frequency_gaussian_branch": low_frequency_debug,
+        "reconstruction_mode": reconstruction_mode_normalized,
+        "removed_reconstruction_gain_mode": str(removed_reconstruction_gain_mode),
+        "removed_reconstruction_gain_scale": float(removed_reconstruction_gain_scale),
+        "inverse_cwt": _gonzalez_inverse_cwt_info(
+            regularization=float(inverse_cwt_regularization),
+            precision=int(wavelet_precision),
+        ),
         "amplitude_preservation_diagnostics": amplitude_diagnostics,
         "final_denoised_working_trace": denoised_working_trace.copy(),
         "final_denoised_dff": denoised_working_trace.copy() if mode == "fluorescence" else None,
@@ -839,7 +1461,7 @@ def denoise_gonzalez_adaptive_wavelet(
             "corrected_input_mode": "Uses the input directly as a corrected working trace; no rolling F0 or fluorescence conversion.",
             "noise_cluster_rejection": "Optional and disabled by default because frequency-cluster cleanup can suppress true spike content.",
             "moving_average_window": "Two periods of the maximum cluster frequency; paper under-specifies exact formula.",
-            "inverse_cwt": "Approximate PyWavelets inverse CWT with amplitude diagnostics; not guaranteed to be quantitative amplitude-preserving reconstruction.",
+            "inverse_cwt": "Regularized dual-frame inverse of PyWavelets Morlet CWT filters with amplitude diagnostics.",
             "event_template_rejection": "Optional cleanup disabled by default because template rejection is under-specified.",
         },
     }
@@ -933,6 +1555,28 @@ def _contiguous_true_regions(mask: np.ndarray) -> List[Tuple[int, int]]:
     return [(int(start), int(stop)) for start, stop in zip(starts, stops)]
 
 
+def _normalize_event_polarity(value: str) -> str:
+    polarity = str(value).strip().lower()
+    if polarity in {"absolute", "abs", "both", "either"}:
+        return "absolute"
+    if polarity in {"positive", "up", "upward", "pos"}:
+        return "positive"
+    if polarity in {"negative", "down", "downward", "neg"}:
+        return "negative"
+    raise ValueError("event polarity must be one of: absolute, positive, negative")
+
+
+def _polarity_peak_signal(values: np.ndarray, finite: np.ndarray, polarity: str) -> np.ndarray:
+    data = np.asarray(values, dtype=float)
+    mask = np.asarray(finite, dtype=bool)
+    mode = _normalize_event_polarity(polarity)
+    if mode == "positive":
+        return np.where(mask, data, -np.inf)
+    if mode == "negative":
+        return np.where(mask, -data, -np.inf)
+    return np.where(mask, np.abs(data), 0.0)
+
+
 def _event_preservation_metrics(
     raw: np.ndarray,
     candidate: np.ndarray,
@@ -943,6 +1587,7 @@ def _event_preservation_metrics(
     baseline_window_ms: float = 50.0,
     local_window_ms: float = 5.0,
     min_peak_distance_ms: float = 2.0,
+    event_polarity: str = "absolute",
 ) -> dict:
     """Check that denoising preserves sharp morphology.
 
@@ -954,6 +1599,7 @@ def _event_preservation_metrics(
     output = np.asarray(candidate, dtype=float)
     mask = np.asarray(evaluation_mask, dtype=bool)
     reasons: List[str] = []
+    polarity_mode = _normalize_event_polarity(event_polarity)
     metrics: dict[str, Any] = {
         "enabled": True,
         "status": "not_evaluated",
@@ -967,6 +1613,7 @@ def _event_preservation_metrics(
         "median_local_max_ratio": float("nan"),
         "minimum_local_max_ratio": float("nan"),
         "polarity_flipped": False,
+        "event_polarity": polarity_mode,
     }
     if source.shape != output.shape:
         reasons.append("shape_mismatch")
@@ -1000,11 +1647,11 @@ def _event_preservation_metrics(
     max_abs = float(np.max(np.abs(selected))) if selected.size else 0.0
     peak_threshold = max(4.0 * noise, 0.20 * max_abs, 1e-12)
     distance = max(1, int(round(float(min_peak_distance_ms) * float(fs) / 1000.0)))
-    masked_abs_raw = np.where(finite, np.abs(raw_high), 0.0)
-    raw_peaks, _ = find_peaks(masked_abs_raw, height=peak_threshold, distance=distance)
+    raw_peak_signal = _polarity_peak_signal(raw_high, finite, polarity_mode)
+    raw_peaks, _ = find_peaks(raw_peak_signal, height=peak_threshold, distance=distance)
     raw_peaks = np.asarray([int(p) for p in raw_peaks if finite[int(p)]], dtype=int)
-    masked_abs_candidate = np.where(finite, np.abs(cand_high), 0.0)
-    candidate_peaks, _ = find_peaks(masked_abs_candidate, height=peak_threshold, distance=distance)
+    candidate_peak_signal = _polarity_peak_signal(cand_high, finite, polarity_mode)
+    candidate_peaks, _ = find_peaks(candidate_peak_signal, height=peak_threshold, distance=distance)
     candidate_peaks = np.asarray([int(p) for p in candidate_peaks if finite[int(p)]], dtype=int)
     metrics["event_count_before"] = int(raw_peaks.size)
     metrics["event_count_after"] = int(candidate_peaks.size)
@@ -1082,13 +1729,16 @@ def _restore_event_amplitudes(
     baseline_window_ms: float = 50.0,
     local_window_ms: float = 5.0,
     min_peak_distance_ms: float = 2.0,
+    event_polarity: str = "absolute",
 ) -> Tuple[np.ndarray, dict]:
     source = np.asarray(raw, dtype=float)
     output = np.asarray(candidate, dtype=float).copy()
     mask = np.asarray(evaluation_mask, dtype=bool)
+    polarity_mode = _normalize_event_polarity(event_polarity)
     debug: dict[str, Any] = {
         "enabled": True,
         "status": "not_evaluated",
+        "event_polarity": polarity_mode,
         "restored_event_count": 0,
         "restored_events": [],
     }
@@ -1114,8 +1764,8 @@ def _restore_event_amplitudes(
     max_abs = float(np.max(np.abs(selected))) if selected.size else 0.0
     peak_threshold = max(4.0 * noise, 0.20 * max_abs, 1e-12)
     distance = max(1, int(round(float(min_peak_distance_ms) * float(fs) / 1000.0)))
-    masked_abs_raw = np.where(finite, np.abs(raw_high), 0.0)
-    raw_peaks, _ = find_peaks(masked_abs_raw, height=peak_threshold, distance=distance)
+    raw_peak_signal = _polarity_peak_signal(raw_high, finite, polarity_mode)
+    raw_peaks, _ = find_peaks(raw_peak_signal, height=peak_threshold, distance=distance)
     raw_peaks = np.asarray([int(p) for p in raw_peaks if finite[int(p)]], dtype=int)
     if raw_peaks.size == 0:
         debug["status"] = "no_events_evaluated"
@@ -1164,6 +1814,7 @@ def _restore_event_amplitudes(
                 "stop": int(stop),
                 "peak_ratio_before": float(peak_ratio),
                 "local_ratio_before": float(local_ratio),
+                "raw_peak_sign": float(np.sign(float(raw_high[int(peak)]))),
                 "polarity_flipped": bool(polarity_flipped),
             }
         )
@@ -1181,6 +1832,145 @@ def _restore_event_amplitudes(
                 "baseline_window_samples": int(hp_window),
                 "local_window_samples": int(half_window),
             },
+        }
+    )
+    return output, debug
+
+
+def _repair_downward_denoising_artifacts(
+    raw: np.ndarray,
+    pre_restore: np.ndarray,
+    restored: np.ndarray,
+    fs: float,
+    *,
+    enabled: bool = True,
+    baseline_window_ms: float = _GONZALEZ_GUARDED_DOWNWARD_BASELINE_WINDOW_MS,
+    repair_window_ms: float = _GONZALEZ_GUARDED_DOWNWARD_REPAIR_WINDOW_MS,
+    max_width_ms: float = _GONZALEZ_GUARDED_DOWNWARD_MAX_WIDTH_MS,
+    min_peak_distance_ms: float = 2.0,
+    raw_support_ratio: float = 0.60,
+    pre_restore_support_ratio: float = 0.60,
+) -> Tuple[np.ndarray, dict]:
+    source = np.asarray(raw, dtype=float)
+    pre = np.asarray(pre_restore, dtype=float)
+    output = np.asarray(restored, dtype=float).copy()
+    debug: dict[str, Any] = {
+        "enabled": bool(enabled),
+        "status": "not_evaluated",
+        "repair_count": 0,
+        "repairs": [],
+    }
+    if not bool(enabled):
+        debug["status"] = "disabled"
+        return output, debug
+    if source.shape != pre.shape or source.shape != output.shape or source.size == 0:
+        debug["status"] = "shape_mismatch_or_empty"
+        return output, debug
+    finite = np.isfinite(source) & np.isfinite(pre) & np.isfinite(output)
+    if np.count_nonzero(finite) < 3:
+        debug["status"] = "no_samples_evaluated"
+        return output, debug
+
+    hp_window = _odd_window_ms(float(baseline_window_ms), fs)
+    hp_window = min(hp_window, source.size if source.size % 2 == 1 else max(1, source.size - 1))
+    if hp_window < 3:
+        raw_high = source - float(np.median(source[finite]))
+        pre_high = pre - float(np.median(pre[finite]))
+        out_high = output - float(np.median(output[finite]))
+    else:
+        raw_high = source - median_filter(source, size=hp_window, mode="nearest")
+        pre_high = pre - median_filter(pre, size=hp_window, mode="nearest")
+        out_high = output - median_filter(output, size=hp_window, mode="nearest")
+
+    selected = out_high[finite]
+    noise = max(_robust_sigma(selected), 1e-12)
+    max_abs = float(np.max(np.abs(selected))) if selected.size else 0.0
+    trough_threshold = max(4.0 * noise, 0.20 * max_abs, 1e-12)
+    distance = max(1, int(round(float(min_peak_distance_ms) * float(fs) / 1000.0)))
+    max_width_samples = max(1, int(round(float(max_width_ms) * float(fs) / 1000.0)))
+    trough_signal = np.where(finite, -out_high, 0.0)
+    troughs, props = find_peaks(
+        trough_signal,
+        height=trough_threshold,
+        distance=distance,
+        width=(1, max_width_samples),
+    )
+    troughs = np.asarray([int(p) for p in troughs if finite[int(p)]], dtype=int)
+    if troughs.size == 0:
+        debug.update(
+            {
+                "status": "evaluated",
+                "threshold": float(trough_threshold),
+                "baseline_window_samples": int(hp_window),
+                "repair_window_samples": int(max(1, int(round(float(repair_window_ms) * float(fs) / 1000.0)))),
+                "max_width_samples": int(max_width_samples),
+            }
+        )
+        return output, debug
+
+    repair_half_width = max(1, int(round(float(repair_window_ms) * float(fs) / 1000.0)))
+    widths = np.asarray(props.get("widths", np.full(troughs.shape, np.nan)), dtype=float)
+    repairs: List[dict] = []
+    repaired_mask = np.zeros(output.shape, dtype=bool)
+    for row, trough in enumerate(troughs):
+        raw_drop = max(0.0, -float(raw_high[int(trough)]))
+        pre_drop = max(0.0, -float(pre_high[int(trough)]))
+        out_drop = max(0.0, -float(out_high[int(trough)]))
+        if out_drop < trough_threshold:
+            continue
+
+        target: np.ndarray | None = None
+        reason = ""
+        raw_supports_trough = raw_drop >= float(raw_support_ratio) * out_drop
+        pre_suppressed_trough = pre_drop <= float(pre_restore_support_ratio) * max(raw_drop, 1e-12)
+        raw_lacks_trough = raw_drop <= float(raw_support_ratio) * out_drop
+        if raw_supports_trough and pre_suppressed_trough:
+            target = pre
+            reason = "raw_negative_transient_not_restored"
+        elif raw_lacks_trough:
+            target = source
+            reason = "denoised_only_negative_trough_repaired_to_raw"
+        else:
+            continue
+
+        start = max(0, int(trough) - repair_half_width)
+        stop = min(output.size, int(trough) + repair_half_width + 1)
+        if stop <= start:
+            continue
+        width = stop - start
+        if width <= 1:
+            output[start:stop] = target[start:stop]
+            weights = np.ones(width, dtype=float)
+        else:
+            x = np.linspace(-1.0, 1.0, width)
+            weights = 0.5 * (1.0 + np.cos(np.pi * np.clip(x, -1.0, 1.0)))
+            output[start:stop] = (weights * target[start:stop]) + ((1.0 - weights) * output[start:stop])
+        repaired_mask[start:stop] = True
+        repairs.append(
+            {
+                "trough": int(trough),
+                "start": int(start),
+                "stop": int(stop),
+                "reason": reason,
+                "target": "pre_restore" if target is pre else "raw",
+                "raw_drop": float(raw_drop),
+                "pre_restore_drop": float(pre_drop),
+                "restored_drop": float(out_drop),
+                "width_samples": float(widths[row]) if row < widths.size else float("nan"),
+                "max_blend_weight": float(np.max(weights)) if weights.size else float("nan"),
+            }
+        )
+
+    debug.update(
+        {
+            "status": "evaluated",
+            "repair_count": int(len(repairs)),
+            "repaired_sample_count": int(np.count_nonzero(repaired_mask)),
+            "repairs": repairs,
+            "threshold": float(trough_threshold),
+            "baseline_window_samples": int(hp_window),
+            "repair_window_samples": int(repair_half_width),
+            "max_width_samples": int(max_width_samples),
         }
     )
     return output, debug
@@ -1230,6 +2020,14 @@ def normalize_gonzalez_denoising_method(value: str) -> str:
         return "none"
     if method in {"gonzalez_s7_dff", "gonzalez_s7", "s7", "s7_dff", "gonzalez_s7_reproduction"}:
         return "gonzalez_s7_dff"
+    if method in {
+        "gonzalez_full_trace_guarded",
+        "full_trace_guarded",
+        "guarded",
+        "artifact_guarded",
+        "gonzalez_guarded",
+    }:
+        return "gonzalez_full_trace_guarded"
     if method in {"gonzalez_full_trace_dff", "full_trace_dff", "full_trace_gonzalez_dff", "gonzalez_dff"}:
         return "gonzalez_full_trace_dff"
     if method in {"gonzalez_full_trace", "full_trace_gonzalez", "full_gonzalez", "gonzalez_all_states", ""}:
@@ -1238,7 +2036,10 @@ def normalize_gonzalez_denoising_method(value: str) -> str:
         # Removed modes are migrated to the current full-trace Gonzalez route
         # instead of being silently preserved.
         return "gonzalez_full_trace"
-    raise ValueError("denoising_method must be one of: gonzalez_full_trace, gonzalez_full_trace_dff, gonzalez_s7_dff, none")
+    raise ValueError(
+        "denoising_method must be one of: gonzalez_full_trace, "
+        "gonzalez_full_trace_guarded, gonzalez_full_trace_dff, gonzalez_s7_dff, none"
+    )
 
 
 def denoise_trace_gonzalez_full_trace(
@@ -1255,6 +2056,8 @@ def denoise_trace_gonzalez_full_trace(
     """Run the active full-trace Gonzalez denoiser.
 
     ``gonzalez_full_trace`` denoises the corrected trace directly.
+    ``gonzalez_full_trace_guarded`` uses the same corrected-trace route, then
+    applies positive-event restoration and a local downward-artifact guard.
     ``gonzalez_full_trace_dff`` first normalizes by the detector baseline and
     converts the denoised result back to corrected units. ``gonzalez_s7_dff``
     uses the same dF/F0 wrapper but enables the S7-style Gonzalez settings.
@@ -1291,13 +2094,16 @@ def denoise_trace_gonzalez_full_trace(
         }
 
     uses_s7 = method == "gonzalez_s7_dff"
+    uses_guarded = method == "gonzalez_full_trace_guarded"
     uses_dff = method in {"gonzalez_full_trace_dff", "gonzalez_s7_dff"}
+    normalization_baseline_validation: dict[str, Any] = {"valid": True, "reason": None}
     if uses_dff:
         if normalization_baseline is None:
             raise ValueError("normalization_baseline is required for gonzalez_full_trace_dff")
         f0 = _validate_trace(np.asarray(normalization_baseline, dtype=float), fs)
         if f0.shape != trace.shape:
             raise ValueError("normalization_baseline must have the same shape as corrected")
+        normalization_baseline_validation = _dff_normalization_baseline_validation(f0)
         safe_f0 = _safe_f0_denominator(f0)
         gonzalez_input = trace / safe_f0
     else:
@@ -1308,34 +2114,76 @@ def denoise_trace_gonzalez_full_trace(
     allowed = {
         "rolling_baseline_seconds",
         "wavelet",
+        "wavelet_precision",
         "min_freq",
         "max_freq",
         "n_freqs",
         "max_clusters",
+        "cluster_selection_strategy",
+        "cluster_selection_relative_score",
         "threshold_sd",
+        "coefficient_threshold_domain",
+        "threshold_mask_padding_periods",
         "attenuation_min",
         "attenuation_max",
         "enable_noise_cluster_rejection",
         "enable_event_template_rejection",
         "event_template_rejection_mode",
+        "event_attenuation_min",
+        "event_attenuation_max",
+        "event_rejection_application",
+        "event_detection_z_threshold",
+        "event_detection_prominence_z",
+        "event_detection_min_distance_ms",
+        "event_detection_polarity",
+        "event_detection_use_threshold_crossings",
+        "enable_coefficient_event_protection",
+        "coefficient_event_protection_window_ms",
         "enable_low_frequency_gaussian_branch",
         "low_frequency_cutoff_hz",
+        "inverse_cwt_regularization",
+        "reconstruction_mode",
+        "removed_reconstruction_gain_mode",
+        "removed_reconstruction_gain_scale",
         "enable_denoise_safety_gate",
         "min_event_peak_preservation",
         "min_local_max_ratio",
+        "event_restore_polarity",
+        "enable_downward_artifact_guard",
     }
     kwargs = {key: value for key, value in gonzalez_kwargs.items() if key in allowed}
+    event_restore_polarity = _normalize_event_polarity(str(kwargs.pop("event_restore_polarity", "absolute")))
+    enable_downward_artifact_guard = bool(kwargs.pop("enable_downward_artifact_guard", False))
     if uses_s7:
-        kwargs.setdefault("min_freq", 3.0)
-        kwargs.setdefault("max_clusters", 20)
+        kwargs["min_freq"] = 3.0
         kwargs.setdefault("threshold_sd", 2.0)
-        kwargs.setdefault("attenuation_min", 0.5)
-        kwargs.setdefault("attenuation_max", 1.0)
+        kwargs.setdefault("n_freqs", 80)
+        kwargs["max_clusters"] = _GONZALEZ_S7_WARD_MAX_CLUSTERS
+        kwargs["cluster_selection_strategy"] = "parsimonious_silhouette"
+        kwargs["cluster_selection_relative_score"] = _GONZALEZ_S7_CLUSTER_SELECTION_RELATIVE_SCORE
+        kwargs["attenuation_min"] = _GONZALEZ_S7_ATTENUATION_MIN
+        kwargs["attenuation_max"] = _GONZALEZ_S7_ATTENUATION_MAX
+        kwargs["coefficient_threshold_domain"] = "normalized_magnitude"
+        kwargs["threshold_mask_padding_periods"] = _GONZALEZ_S7_THRESHOLD_MASK_PADDING_PERIODS
+        kwargs["event_attenuation_min"] = _GONZALEZ_S7_EVENT_ATTENUATION_MIN
+        kwargs["event_attenuation_max"] = _GONZALEZ_S7_EVENT_ATTENUATION_MAX
+        kwargs["enable_coefficient_event_protection"] = False
         kwargs["enable_noise_cluster_rejection"] = True
         kwargs["enable_event_template_rejection"] = True
         kwargs["event_template_rejection_mode"] = "pc1_negative"
+        kwargs["event_rejection_application"] = "coefficient"
+        kwargs["event_detection_z_threshold"] = _GONZALEZ_S7_EVENT_DETECTION_Z
+        kwargs["event_detection_prominence_z"] = _GONZALEZ_S7_EVENT_DETECTION_PROMINENCE_Z
+        kwargs["event_detection_min_distance_ms"] = _GONZALEZ_S7_EVENT_DETECTION_MIN_DISTANCE_MS
+        kwargs["event_detection_polarity"] = "positive"
+        kwargs["event_detection_use_threshold_crossings"] = False
         kwargs["enable_low_frequency_gaussian_branch"] = True
         kwargs["low_frequency_cutoff_hz"] = 1.0
+        kwargs["reconstruction_mode"] = "residual_subtractive"
+        kwargs["removed_reconstruction_gain_mode"] = "unit"
+    if uses_guarded:
+        event_restore_polarity = "positive"
+        enable_downward_artifact_guard = True
     kwargs.update(
         {
             "input_mode": "corrected",
@@ -1347,39 +2195,54 @@ def denoise_trace_gonzalez_full_trace(
 
     gonzalez_debug = None
     fallback_reasons: List[str] = []
-    try:
-        result = denoise_gonzalez_adaptive_wavelet(
-            gonzalez_input,
-            fs=fs,
-            return_debug=return_debug,
-            **kwargs,
-        )
-        if return_debug:
-            gonzalez_debug = dict(result)
-            gonzalez_output = np.asarray(gonzalez_debug.get("output", gonzalez_input), dtype=float)
-        else:
-            gonzalez_output = np.asarray(result, dtype=float)
-        output = np.asarray(gonzalez_output * safe_f0 if uses_dff else gonzalez_output, dtype=float)
-        if output.shape != trace.shape:
-            fallback_reasons.append("shape_mismatch")
-        elif output.size and not np.all(np.isfinite(output)):
-            fallback_reasons.append("non_finite_output")
-    except Exception as exc:
+    if uses_dff and not bool(normalization_baseline_validation.get("valid", True)):
+        fallback_reasons.append(str(normalization_baseline_validation.get("reason") or "invalid_dff_normalization_baseline"))
         output = trace.copy()
         gonzalez_output = gonzalez_input.copy()
-        fallback_reasons.append("gonzalez_exception")
         if return_debug:
-            gonzalez_debug = {"error": str(exc)}
+            gonzalez_debug = {
+                "skipped": True,
+                "reason": "invalid_dff_normalization_baseline",
+                "normalization_baseline_validation": normalization_baseline_validation,
+                "output": gonzalez_input.copy(),
+            }
+    else:
+        try:
+            result = denoise_gonzalez_adaptive_wavelet(
+                gonzalez_input,
+                fs=fs,
+                return_debug=return_debug,
+                **kwargs,
+            )
+            if return_debug:
+                gonzalez_debug = dict(result)
+                gonzalez_output = np.asarray(gonzalez_debug.get("output", gonzalez_input), dtype=float)
+            else:
+                gonzalez_output = np.asarray(result, dtype=float)
+            output = np.asarray(gonzalez_output * safe_f0 if uses_dff else gonzalez_output, dtype=float)
+            if output.shape != trace.shape:
+                fallback_reasons.append("shape_mismatch")
+            elif output.size and not np.all(np.isfinite(output)):
+                fallback_reasons.append("non_finite_output")
+        except Exception as exc:
+            output = trace.copy()
+            gonzalez_output = gonzalez_input.copy()
+            fallback_reasons.append("gonzalez_exception")
+            if return_debug:
+                gonzalez_debug = {"error": str(exc)}
 
     level_restore: dict[str, Any] = {"enabled": False, "status": "not_run"}
     amplitude_restore: dict[str, Any] = {"enabled": False, "status": "not_run"}
+    downward_artifact_guard: dict[str, Any] = {"enabled": False, "status": "not_run"}
     morphology = {"status": "not_evaluated", "fallback_reasons": []}
     if not fallback_reasons:
         if uses_s7:
             level_restore = {"enabled": False, "status": "skipped_for_s7_reproduction"}
-            amplitude_restore = {"enabled": False, "status": "skipped_for_s7_reproduction"}
+            amplitude_restore = {"enabled": False, "status": "skipped_for_paper_s7_reproduction"}
+            downward_artifact_guard = {"enabled": False, "status": "skipped_for_s7_reproduction"}
         else:
             output, level_restore = _preserve_low_frequency_envelope(trace, output, fs=fs)
+            pre_amplitude_restore_output = np.asarray(output, dtype=float).copy()
             output, amplitude_restore = _restore_event_amplitudes(
                 trace,
                 output,
@@ -1387,6 +2250,14 @@ def denoise_trace_gonzalez_full_trace(
                 evaluation_mask=np.ones(trace.shape, dtype=bool),
                 min_event_peak_preservation=float(min_event_peak_preservation),
                 min_local_max_ratio=float(min_local_max_ratio),
+                event_polarity=event_restore_polarity,
+            )
+            output, downward_artifact_guard = _repair_downward_denoising_artifacts(
+                trace,
+                pre_amplitude_restore_output,
+                output,
+                fs=fs,
+                enabled=bool(enable_downward_artifact_guard),
             )
         morphology = _event_preservation_metrics(
             trace,
@@ -1395,6 +2266,7 @@ def denoise_trace_gonzalez_full_trace(
             evaluation_mask=np.ones(trace.shape, dtype=bool),
             min_event_peak_preservation=float(min_event_peak_preservation),
             min_local_max_ratio=float(min_local_max_ratio),
+            event_polarity=event_restore_polarity,
         )
         if bool(enable_denoise_safety_gate):
             fallback_reasons.extend(str(reason) for reason in morphology.get("fallback_reasons", []))
@@ -1408,12 +2280,70 @@ def denoise_trace_gonzalez_full_trace(
     return {
         "denoiser_used": method,
         "denoising_method": method,
+        "s7_reproduction_preset": (
+            {
+                "enabled": True,
+                "frequency_cluster_mode": "ward_silhouette_up_to_20_clusters",
+                "ward_max_clusters": _GONZALEZ_S7_WARD_MAX_CLUSTERS,
+                "cluster_selection_strategy": "parsimonious_silhouette",
+                "cluster_selection_relative_score": _GONZALEZ_S7_CLUSTER_SELECTION_RELATIVE_SCORE,
+                "signal_attenuation_range": (
+                    _GONZALEZ_S7_ATTENUATION_MIN,
+                    _GONZALEZ_S7_ATTENUATION_MAX,
+                ),
+                "event_attenuation_range": (
+                    _GONZALEZ_S7_EVENT_ATTENUATION_MIN,
+                    _GONZALEZ_S7_EVENT_ATTENUATION_MAX,
+                ),
+                "event_protected_thresholding": False,
+                "coefficient_threshold_domain": "normalized_magnitude",
+                "threshold_mask_padding_periods": _GONZALEZ_S7_THRESHOLD_MASK_PADDING_PERIODS,
+                "coefficient_event_protection": False,
+                "noise_cluster_rejection": True,
+                "event_template_rejection_mode": "pc1_negative",
+                "event_rejection_application": "coefficient_time_mask",
+                "event_detection": {
+                    "z_threshold": _GONZALEZ_S7_EVENT_DETECTION_Z,
+                    "prominence_z": _GONZALEZ_S7_EVENT_DETECTION_PROMINENCE_Z,
+                    "min_distance_ms": _GONZALEZ_S7_EVENT_DETECTION_MIN_DISTANCE_MS,
+                    "polarity": "positive",
+                    "use_threshold_crossings": False,
+                },
+                "low_frequency_branch_hz": 1.0,
+                "removed_reconstruction_gain_mode": "unit",
+                "post_processing_merges": "disabled",
+                "note": (
+                    "Paper S7 reproduction: dF/F input, Ward/silhouette frequency clustering "
+                    "up to 20 clusters with a broad-domain silhouette rule, 2 SD adaptive "
+                    "thresholding at the paper's 0.5 attenuation endpoint, "
+                    "PC1-negative noisy-event attenuation at the soft 0.5 endpoint, and "
+                    "a 1 Hz low-frequency branch."
+                ),
+            }
+            if uses_s7
+            else {"enabled": False}
+        ),
+        "guarded_artifact_preset": (
+            {
+                "enabled": True,
+                "base_method": "gonzalez_full_trace",
+                "event_restore_polarity": "positive",
+                "downward_artifact_guard": True,
+                "note": (
+                    "Original corrected-trace Gonzalez denoising with positive-event restoration "
+                    "and a local guard for sharp downward artifacts."
+                ),
+            }
+            if uses_guarded
+            else {"enabled": False}
+        ),
         "candidate_used": not fallback_triggered,
         "fallback_triggered": fallback_triggered,
         "fallback_reasons": fallback_reasons,
         "input_normalization": normalization_id,
         "input_normalization_label": normalization_label,
         "normalization_source": "detector_baseline" if uses_dff else None,
+        "normalization_baseline_validation": normalization_baseline_validation,
         "shared_core_note": "Input normalization changes the denoiser input only; the Gonzalez core is shared.",
         "input_output_max_abs_diff": (
             float(np.max(np.abs(output - trace))) if output.shape == trace.shape and output.size else float("nan")
@@ -1433,6 +2363,7 @@ def denoise_trace_gonzalez_full_trace(
             "safety_gate_enabled": bool(enable_denoise_safety_gate),
             "level_preservation_merge": level_restore,
             "amplitude_preservation_merge": amplitude_restore,
+            "downward_artifact_guard": downward_artifact_guard,
             "morphology_preservation": morphology,
         },
         "quantitative_measurement_note": (

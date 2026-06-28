@@ -2,6 +2,14 @@
 __pycache__/
 *.py[cod]
 *.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+.ipynb_checkpoints/
+*.egg-info/
 
 # Virtual environments
 .venv/
@@ -9,9 +17,14 @@ __pycache__/
 venv/
 env/
 
-# Local editor settings
+# Local editor and agent settings
 .vscode/
 .idea/
+.agents/
+.codex/
+.env
+.env.*
+!.env.example
 
 # Build artifacts
 build/
@@ -19,19 +32,66 @@ dist/
 *.spec
 *.obj
 *.log
+*.tmp
+*.bak
+*~
+
+# Native/CMake/Qt build artifacts
+image_processor/native_viewer/build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+.ninja_deps
+.ninja_log
+*.dll
+*.exe
+*.exp
+*.ilk
+*.lib
+*.pdb
+*.manifest
 
 # App/user outputs and local data
 analysis_outputs/
+results/
+Result/
+outputs/
+output/
 exports/
 export/
 *_export/
+logs/
 tmp/
 spike_session.json
+data/
+datasets/
+*.h5
+*.hdf5
+*.mat
+*.npy
+*.npz
+*.tif
+*.tiff
+*.nd2
+*.czi
+*.lif
+*.lsm
+*.oib
+*.oif
+*.raw
+*.bin
+*.avi
+*.mp4
+*.mov
 *.xlsx
 *.xls
 *.csv
 *.png
 *.pdf
+
+# Local one-off research probes with machine-specific paths
+tools/gonzalez_s7_real_trace_probe.py
 
 # OS files
 .DS_Store

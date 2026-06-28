@@ -447,7 +447,7 @@ def test_spike_export_renderers_do_not_draw_marker_dots(monkeypatch) -> None:
     app.processEvents()
 
 
-def test_exporter_black_bar_marker_style_does_not_draw_marker_dots(monkeypatch) -> None:
+def test_exporter_plateau_bar_marker_style_draws_hollow_spike_circles(monkeypatch) -> None:
     app = QApplication.instance() or QApplication([])
     state = _state("trace_a")
     options = RenderOptions(
@@ -462,10 +462,14 @@ def test_exporter_black_bar_marker_style_does_not_draw_marker_dots(monkeypatch) 
         apply_trace_window=False,
     )
 
-    def fail_scatter_item(*_args: object, **_kwargs: object) -> object:
-        raise AssertionError("black bar marker style should not draw marker dots")
+    scatter_calls = []
+    original_scatter_item = exporter_rendering.pg.ScatterPlotItem
 
-    monkeypatch.setattr(exporter_rendering.pg, "ScatterPlotItem", fail_scatter_item)
+    def spy_scatter_item(*args: object, **kwargs: object) -> object:
+        scatter_calls.append(kwargs)
+        return original_scatter_item(*args, **kwargs)
+
+    monkeypatch.setattr(exporter_rendering.pg, "ScatterPlotItem", spy_scatter_item)
 
     assert exporter_rendering.PLATEAU_MARKER_COLORS["long_plateau"] != "#111111"
     assert exporter_rendering.PLATEAU_MARKER_COLORS["short_plateau"] != "#111111"
@@ -497,6 +501,7 @@ def test_exporter_black_bar_marker_style_does_not_draw_marker_dots(monkeypatch) 
     assert not plateau_pix.isNull()
     assert not panel_pix.isNull()
     assert panel_pix.height() >= 300
+    assert any(call.get("size") == exporter_rendering.SPIKE_HOLLOW_MARKER_SIZE for call in scatter_calls)
     app.processEvents()
 
 
@@ -597,10 +602,13 @@ def test_exporter_writes_recording_event_raster_plot(tmp_path: Path) -> None:
     assert manifest["recording_event_rasters"][0]["spike_count"] == 2
 
 
-def test_exporter_black_bar_marker_height_is_capped() -> None:
+def test_exporter_plateau_bar_marker_lane_height_is_capped() -> None:
     levels = exporter_rendering._bar_marker_levels(np.array([0.0, 1000.0], dtype=float))
 
     assert levels is not None
+    assert levels["plateau_spike_bottom"] == levels["spike_bottom"]
+    assert levels["plateau_spike_top"] == levels["spike_top"]
+    assert levels["plateau_y"] < levels["spike_bottom"]
     assert np.isclose(
         levels["spike_top"] - levels["spike_bottom"],
         exporter_rendering.BAR_MARKER_MAX_SIGNAL_HEIGHT,
@@ -611,12 +619,15 @@ def test_exporter_black_bar_marker_height_is_capped() -> None:
     )
 
 
-def test_aligned_panel_bar_height_scales_with_panel_y_span() -> None:
+def test_aligned_panel_marker_lane_scales_with_panel_y_span() -> None:
     small_span = 300.0
     large_span = 450.0
     small_levels = exporter_rendering._aligned_panel_marker_levels(450.0, small_span)
     large_levels = exporter_rendering._aligned_panel_marker_levels(600.0, large_span)
 
+    assert small_levels["plateau_spike_bottom"] == small_levels["spike_bottom"]
+    assert small_levels["plateau_spike_top"] == small_levels["spike_top"]
+    assert small_levels["plateau_y"] < small_levels["spike_bottom"]
     small_height = small_levels["spike_top"] - small_levels["spike_bottom"]
     large_height = large_levels["spike_top"] - large_levels["spike_bottom"]
     small_visual_ratio = small_height / (small_span + exporter_rendering._aligned_panel_marker_lane(small_span))

@@ -3087,7 +3087,7 @@ def detect_spikes(
     }:
         mode = "template_matching"
     if mode not in {"mad", "std", "snr", "template_matching"}:
-        mode = "mad"
+        mode = "std"
     if mode == "template_matching":
         spikes, threshold, detector_signal, template_matching_debug = _detect_spikes_template_matching(
             raw_signal=processed_signal,

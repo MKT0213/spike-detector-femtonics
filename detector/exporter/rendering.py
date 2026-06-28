@@ -46,6 +46,8 @@ _BAR_MARKER_SPIKE_HEIGHT_FRACTION: float = 0.12
 PLATEAU_BAR_LINE_WIDTH: float = 4.2
 ALIGNED_PANEL_PLATEAU_BAR_LINE_WIDTH: float = 3.0
 ALIGNED_PANEL_MARKER_LANE_FRACTION: float = 0.22
+SPIKE_HOLLOW_MARKER_SIZE: float = 8.0
+ALIGNED_PANEL_SPIKE_HOLLOW_MARKER_SIZE: float = 24.0
 
 
 @dataclass
@@ -572,12 +574,14 @@ def _aligned_panel_marker_lane(signal_span: float) -> float:
 def _aligned_panel_marker_levels(marker_base_max: float, signal_span: float) -> Dict[str, float]:
     lane = _aligned_panel_marker_lane(signal_span)
     base = float(marker_base_max)
+    spike_bottom = base + 0.66 * lane
+    spike_top = base + 0.90 * lane
     return {
-        "plateau_y": base + 0.26 * lane,
-        "spike_bottom": base + 0.54 * lane,
-        "spike_top": base + 0.81 * lane,
-        "plateau_spike_bottom": base + 0.67 * lane,
-        "plateau_spike_top": base + 0.94 * lane,
+        "plateau_y": base + 0.25 * lane,
+        "spike_bottom": spike_bottom,
+        "spike_top": spike_top,
+        "plateau_spike_bottom": spike_bottom,
+        "plateau_spike_top": spike_top,
     }
 
 
@@ -937,8 +941,6 @@ def render_recording_aligned_trace_panels(
             plateau_y = marker_levels["plateau_y"]
             spike_bottom = marker_levels["spike_bottom"]
             spike_top = marker_levels["spike_top"]
-            plateau_spike_bottom = marker_levels["plateau_spike_bottom"]
-            plateau_spike_top = marker_levels["plateau_spike_top"]
             plateau_mask = data.mask("plateau")
             if show_bar_plateaus and plateau_mask is not None:
                 for name, source_mask in _plateau_marker_masks(data):
@@ -962,15 +964,13 @@ def render_recording_aligned_trace_panels(
                 for spike in filtered_spikes(data, render_options):
                     idx = int(spike.spike_index)
                     if 0 <= idx < n:
-                        on_plateau = _mask_contains_index(plateau_mask, idx)
-                        y0 = plateau_spike_bottom if on_plateau and show_bar_plateaus else spike_bottom
-                        y1 = plateau_spike_top if on_plateau and show_bar_plateaus else spike_top
-                        ax.vlines(
-                            float(data.time[idx]),
-                            y0,
-                            y1,
-                            colors="#111111",
-                            linewidth=1.8,
+                        ax.scatter(
+                            [float(data.time[idx])],
+                            [0.5 * (float(spike_bottom) + float(spike_top))],
+                            s=ALIGNED_PANEL_SPIKE_HOLLOW_MARKER_SIZE,
+                            facecolors="none",
+                            edgecolors="#111111",
+                            linewidths=1.2,
                             zorder=6,
                         )
                         total_peak_markers += 1
@@ -1328,12 +1328,14 @@ def _bar_marker_levels(signal: np.ndarray) -> Optional[Dict[str, float]]:
     y_max = float(np.max(finite))
     span = max(1.0e-9, y_max - y_min, abs(y_max) * 0.08, 1.0)
     marker_span = _bar_marker_level_span(span)
+    spike_bottom = y_max + 0.28 * marker_span
+    spike_top = y_max + 0.40 * marker_span
     return {
         "plateau_y": y_max + 0.16 * marker_span,
-        "spike_bottom": y_max + 0.12 * marker_span,
-        "spike_top": y_max + 0.24 * marker_span,
-        "plateau_spike_bottom": y_max + 0.22 * marker_span,
-        "plateau_spike_top": y_max + 0.34 * marker_span,
+        "spike_bottom": spike_bottom,
+        "spike_top": spike_top,
+        "plateau_spike_bottom": spike_bottom,
+        "plateau_spike_top": spike_top,
     }
 
 
@@ -1386,7 +1388,8 @@ def _add_bar_marker_annotations(
         return []
 
     marker_y_values: List[float] = []
-    black = pg.mkPen("#111111", width=2.2)
+    spike_x: List[float] = []
+    spike_y: List[float] = []
 
     if show_plateau_bars and plateau_mask is not None:
         source_masks = list(plateau_masks or [("plateau", np.asarray(plateau_mask, dtype=bool))])
@@ -1416,11 +1419,19 @@ def _add_bar_marker_annotations(
             x = float(x_values[spike_idx])
             if not np.isfinite(x):
                 continue
-            on_plateau = _mask_contains_index(plateau_mask, spike_idx)
-            y0 = levels["plateau_spike_bottom"] if on_plateau and show_plateau_bars else levels["spike_bottom"]
-            y1 = levels["plateau_spike_top"] if on_plateau and show_plateau_bars else levels["spike_top"]
-            plot.plot([x, x], [y0, y1], pen=black)
-            marker_y_values.extend([float(y0), float(y1)])
+            spike_x.append(x)
+            spike_y.append(0.5 * (float(levels["spike_bottom"]) + float(levels["spike_top"])))
+            marker_y_values.extend([float(levels["spike_bottom"]), float(levels["spike_top"])])
+        if spike_x:
+            plot.addItem(
+                pg.ScatterPlotItem(
+                    x=spike_x,
+                    y=spike_y,
+                    size=SPIKE_HOLLOW_MARKER_SIZE,
+                    brush=pg.mkBrush(255, 255, 255, 0),
+                    pen=pg.mkPen("#111111", width=1.3),
+                )
+            )
 
     return [np.asarray(marker_y_values, dtype=float)] if marker_y_values else []
 
